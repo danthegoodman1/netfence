@@ -7,13 +7,12 @@
 package apiv1
 
 import (
-	reflect "reflect"
-	sync "sync"
-	unsafe "unsafe"
-
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	durationpb "google.golang.org/protobuf/types/known/durationpb"
+	reflect "reflect"
+	sync "sync"
+	unsafe "unsafe"
 )
 
 const (
@@ -1258,106 +1257,106 @@ var File_v1_control_proto protoreflect.FileDescriptor
 
 const file_v1_control_proto_rawDesc = "" +
 	"\n" +
-	"\x10v1/control.proto\x12\fnetfence.v1\x1a\x1egoogle/protobuf/duration.proto\x1a\x0ev1/types.proto\"\xfe\x01\n" +
-	"\vDaemonEvent\x12/\n" +
-	"\x04sync\x18\x01 \x01(\v2\x19.netfence.v1.SyncRequestH\x00R\x04sync\x12:\n" +
+	"\x10v1/control.proto\x12\vnetfence.v1\x1a\x1egoogle/protobuf/duration.proto\x1a\x0ev1/types.proto\"\xfa\x01\n" +
+	"\vDaemonEvent\x12.\n" +
+	"\x04sync\x18\x01 \x01(\v2\x18.netfence.v1.SyncRequestH\x00R\x04sync\x129\n" +
 	"\n" +
-	"subscribed\x18\x02 \x01(\v2\x18.netfence.v1.SubscribedH\x00R\n" +
-	"subscribed\x12@\n" +
-	"\funsubscribed\x18\x03 \x01(\v2\x1a.netfence.v1.UnsubscribedH\x00R\funsubscribed\x127\n" +
-	"\theartbeat\x18\x04 \x01(\v2\x17.netfence.v1.HeartbeatH\x00R\theartbeatB\a\n" +
-	"\x05event\"\x82\x01\n" +
+	"subscribed\x18\x02 \x01(\v2\x17.netfence.v1.SubscribedH\x00R\n" +
+	"subscribed\x12?\n" +
+	"\funsubscribed\x18\x03 \x01(\v2\x19.netfence.v1.UnsubscribedH\x00R\funsubscribed\x126\n" +
+	"\theartbeat\x18\x04 \x01(\v2\x16.netfence.v1.HeartbeatH\x00R\theartbeatB\a\n" +
+	"\x05event\"\x81\x01\n" +
 	"\vSyncRequest\x12\x1b\n" +
 	"\tdaemon_id\x18\x01 \x01(\tR\bdaemonId\x12\x1a\n" +
-	"\bhostname\x18\x02 \x01(\tR\bhostname\x12:\n" +
-	"\vattachments\x18\x03 \x03(\v2\x18.netfence.v1.AttachmentR\vattachments\"\xc7\x02\n" +
+	"\bhostname\x18\x02 \x01(\tR\bhostname\x129\n" +
+	"\vattachments\x18\x03 \x03(\v2\x17.netfence.v1.AttachmentR\vattachments\"\xc3\x02\n" +
 	"\n" +
 	"Attachment\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x16\n" +
-	"\x06target\x18\x02 \x01(\tR\x06target\x120\n" +
-	"\x04type\x18\x03 \x01(\x0e2\x1c.netfence.v1.AttachmentTypeR\x04type\x12,\n" +
-	"\x04mode\x18\x04 \x01(\x0e2\x18.netfence.v1.PolicyModeR\x04mode\x120\n" +
-	"\bdns_mode\x18\x05 \x01(\x0e2\x15.netfence.v1.DnsModeR\adnsMode\x12B\n" +
-	"\bmetadata\x18\x06 \x03(\v2&.netfence.v1.Attachment.MetadataEntryR\bmetadata\x1a;\n" +
+	"\x06target\x18\x02 \x01(\tR\x06target\x12/\n" +
+	"\x04type\x18\x03 \x01(\x0e2\x1b.netfence.v1.AttachmentTypeR\x04type\x12+\n" +
+	"\x04mode\x18\x04 \x01(\x0e2\x17.netfence.v1.PolicyModeR\x04mode\x12/\n" +
+	"\bdns_mode\x18\x05 \x01(\x0e2\x14.netfence.v1.DnsModeR\adnsMode\x12A\n" +
+	"\bmetadata\x18\x06 \x03(\v2%.netfence.v1.Attachment.MetadataEntryR\bmetadata\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xe8\x02\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xe4\x02\n" +
 	"\n" +
 	"Subscribed\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x16\n" +
-	"\x06target\x18\x02 \x01(\tR\x06target\x120\n" +
-	"\x04type\x18\x03 \x01(\x0e2\x1c.netfence.v1.AttachmentTypeR\x04type\x12,\n" +
-	"\x04mode\x18\x04 \x01(\x0e2\x18.netfence.v1.PolicyModeR\x04mode\x120\n" +
-	"\bdns_mode\x18\x05 \x01(\x0e2\x15.netfence.v1.DnsModeR\adnsMode\x12\x1f\n" +
+	"\x06target\x18\x02 \x01(\tR\x06target\x12/\n" +
+	"\x04type\x18\x03 \x01(\x0e2\x1b.netfence.v1.AttachmentTypeR\x04type\x12+\n" +
+	"\x04mode\x18\x04 \x01(\x0e2\x17.netfence.v1.PolicyModeR\x04mode\x12/\n" +
+	"\bdns_mode\x18\x05 \x01(\x0e2\x14.netfence.v1.DnsModeR\adnsMode\x12\x1f\n" +
 	"\vdns_address\x18\x06 \x01(\tR\n" +
-	"dnsAddress\x12B\n" +
-	"\bmetadata\x18\a \x03(\v2&.netfence.v1.Subscribed.MetadataEntryR\bmetadata\x1a;\n" +
+	"dnsAddress\x12A\n" +
+	"\bmetadata\x18\a \x03(\v2%.netfence.v1.Subscribed.MetadataEntryR\bmetadata\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"m\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"l\n" +
 	"\fUnsubscribed\x12\x0e\n" +
-	"\x02id\x18\x01 \x01(\tR\x02id\x127\n" +
-	"\x06reason\x18\x02 \x01(\x0e2\x1f.netfence.v1.UnsubscribeReasonR\x06reason\x12\x14\n" +
-	"\x05error\x18\x03 \x01(\tR\x05error\"@\n" +
-	"\tHeartbeat\x123\n" +
-	"\x05stats\x18\x01 \x03(\v2\x1d.netfence.v1.AttachmentStatsR\x05stats\"\xd3\x01\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\x126\n" +
+	"\x06reason\x18\x02 \x01(\x0e2\x1e.netfence.v1.UnsubscribeReasonR\x06reason\x12\x14\n" +
+	"\x05error\x18\x03 \x01(\tR\x05error\"?\n" +
+	"\tHeartbeat\x122\n" +
+	"\x05stats\x18\x01 \x03(\v2\x1c.netfence.v1.AttachmentStatsR\x05stats\"\xd3\x01\n" +
 	"\x0fAttachmentStats\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12'\n" +
 	"\x0fpackets_allowed\x18\x02 \x01(\x04R\x0epacketsAllowed\x12'\n" +
 	"\x0fpackets_blocked\x18\x03 \x01(\x04R\x0epacketsBlocked\x12.\n" +
 	"\x13dns_queries_allowed\x18\x04 \x01(\x04R\x11dnsQueriesAllowed\x12.\n" +
-	"\x13dns_queries_blocked\x18\x05 \x01(\x04R\x11dnsQueriesBlocked\"\xc8\x04\n" +
+	"\x13dns_queries_blocked\x18\x05 \x01(\x04R\x11dnsQueriesBlocked\"\xc0\x04\n" +
 	"\x0eControlCommand\x12\x0e\n" +
-	"\x02id\x18\x01 \x01(\tR\x02id\x122\n" +
-	"\bsync_ack\x18\x02 \x01(\v2\x15.netfence.v1.SyncAckH\x00R\asyncAck\x122\n" +
-	"\bset_mode\x18\x03 \x01(\v2\x15.netfence.v1.SetModeH\x00R\asetMode\x128\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\x121\n" +
+	"\bsync_ack\x18\x02 \x01(\v2\x14.netfence.v1.SyncAckH\x00R\asyncAck\x121\n" +
+	"\bset_mode\x18\x03 \x01(\v2\x14.netfence.v1.SetModeH\x00R\asetMode\x127\n" +
 	"\n" +
-	"allow_cidr\x18\x04 \x01(\v2\x17.netfence.v1.CIDREntryH\x00R\tallowCidr\x126\n" +
-	"\tdeny_cidr\x18\x05 \x01(\v2\x17.netfence.v1.CIDREntryH\x00R\bdenyCidr\x12!\n" +
+	"allow_cidr\x18\x04 \x01(\v2\x16.netfence.v1.CIDREntryH\x00R\tallowCidr\x125\n" +
+	"\tdeny_cidr\x18\x05 \x01(\v2\x16.netfence.v1.CIDREntryH\x00R\bdenyCidr\x12!\n" +
 	"\vremove_cidr\x18\x06 \x01(\tH\x00R\n" +
-	"removeCidr\x12;\n" +
-	"\vbulk_update\x18\a \x01(\v2\x18.netfence.v1.BulkUpdateH\x00R\n" +
-	"bulkUpdate\x12<\n" +
-	"\fset_dns_mode\x18\b \x01(\v2\x18.netfence.v1.SetDnsModeH\x00R\n" +
-	"setDnsMode\x12>\n" +
-	"\fallow_domain\x18\t \x01(\v2\x19.netfence.v1.DomainEntryH\x00R\vallowDomain\x12<\n" +
+	"removeCidr\x12:\n" +
+	"\vbulk_update\x18\a \x01(\v2\x17.netfence.v1.BulkUpdateH\x00R\n" +
+	"bulkUpdate\x12;\n" +
+	"\fset_dns_mode\x18\b \x01(\v2\x17.netfence.v1.SetDnsModeH\x00R\n" +
+	"setDnsMode\x12=\n" +
+	"\fallow_domain\x18\t \x01(\v2\x18.netfence.v1.DomainEntryH\x00R\vallowDomain\x12;\n" +
 	"\vdeny_domain\x18\n" +
-	" \x01(\v2\x19.netfence.v1.DomainEntryH\x00R\n" +
+	" \x01(\v2\x18.netfence.v1.DomainEntryH\x00R\n" +
 	"denyDomain\x12%\n" +
 	"\rremove_domain\x18\v \x01(\tH\x00R\fremoveDomainB\t\n" +
 	"\acommand\"\t\n" +
-	"\aSyncAck\"7\n" +
-	"\aSetMode\x12,\n" +
-	"\x04mode\x18\x01 \x01(\x0e2\x18.netfence.v1.PolicyModeR\x04mode\"\xd7\x01\n" +
+	"\aSyncAck\"6\n" +
+	"\aSetMode\x12+\n" +
+	"\x04mode\x18\x01 \x01(\x0e2\x17.netfence.v1.PolicyModeR\x04mode\"\xd3\x01\n" +
 	"\n" +
-	"BulkUpdate\x12,\n" +
-	"\x04mode\x18\x01 \x01(\x0e2\x18.netfence.v1.PolicyModeR\x04mode\x128\n" +
-	"\vallow_cidrs\x18\x02 \x03(\v2\x17.netfence.v1.CIDREntryR\n" +
-	"allowCidrs\x126\n" +
+	"BulkUpdate\x12+\n" +
+	"\x04mode\x18\x01 \x01(\x0e2\x17.netfence.v1.PolicyModeR\x04mode\x127\n" +
+	"\vallow_cidrs\x18\x02 \x03(\v2\x16.netfence.v1.CIDREntryR\n" +
+	"allowCidrs\x125\n" +
 	"\n" +
-	"deny_cidrs\x18\x03 \x03(\v2\x17.netfence.v1.CIDREntryR\tdenyCidrs\x12)\n" +
-	"\x03dns\x18\x04 \x01(\v2\x17.netfence.v1.DnsConfigR\x03dns\"\xdf\x01\n" +
-	"\tDnsConfig\x12)\n" +
-	"\x04mode\x18\x01 \x01(\x0e2\x15.netfence.v1.DnsModeR\x04mode\x12>\n" +
-	"\rallow_domains\x18\x02 \x03(\v2\x19.netfence.v1.DomainEntryR\fallowDomains\x12<\n" +
-	"\fdeny_domains\x18\x03 \x03(\v2\x19.netfence.v1.DomainEntryR\vdenyDomains\x12)\n" +
+	"deny_cidrs\x18\x03 \x03(\v2\x16.netfence.v1.CIDREntryR\tdenyCidrs\x12(\n" +
+	"\x03dns\x18\x04 \x01(\v2\x16.netfence.v1.DnsConfigR\x03dns\"\xdc\x01\n" +
+	"\tDnsConfig\x12(\n" +
+	"\x04mode\x18\x01 \x01(\x0e2\x14.netfence.v1.DnsModeR\x04mode\x12=\n" +
+	"\rallow_domains\x18\x02 \x03(\v2\x18.netfence.v1.DomainEntryR\fallowDomains\x12;\n" +
+	"\fdeny_domains\x18\x03 \x03(\v2\x18.netfence.v1.DomainEntryR\vdenyDomains\x12)\n" +
 	"\x10upstream_servers\x18\x04 \x03(\tR\x0fupstreamServers\"L\n" +
 	"\tCIDREntry\x12\x12\n" +
 	"\x04cidr\x18\x01 \x01(\tR\x04cidr\x12+\n" +
 	"\x03ttl\x18\x02 \x01(\v2\x19.google.protobuf.DurationR\x03ttl\"T\n" +
 	"\vDomainEntry\x12\x16\n" +
 	"\x06domain\x18\x01 \x01(\tR\x06domain\x12-\n" +
-	"\x12include_subdomains\x18\x02 \x01(\bR\x11includeSubdomains\"7\n" +
+	"\x12include_subdomains\x18\x02 \x01(\bR\x11includeSubdomains\"6\n" +
 	"\n" +
-	"SetDnsMode\x12)\n" +
-	"\x04mode\x18\x01 \x01(\x0e2\x15.netfence.v1.DnsModeR\x04mode*\x96\x01\n" +
+	"SetDnsMode\x12(\n" +
+	"\x04mode\x18\x01 \x01(\x0e2\x14.netfence.v1.DnsModeR\x04mode*\x96\x01\n" +
 	"\x11UnsubscribeReason\x12\"\n" +
 	"\x1eUNSUBSCRIBE_REASON_UNSPECIFIED\x10\x00\x12\x1e\n" +
 	"\x1aUNSUBSCRIBE_REASON_REMOVED\x10\x01\x12\x1f\n" +
 	"\x1bUNSUBSCRIBE_REASON_DETACHED\x10\x02\x12\x1c\n" +
-	"\x18UNSUBSCRIBE_REASON_ERROR\x10\x032V\n" +
-	"\fControlPlane\x12F\n" +
-	"\aConnect\x12\x19.netfence.v1.DaemonEvent\x1a\x1c.netfence.v1.ControlCommand(\x010\x01B2Z0github.com/danthegoodman1/netfence/api/v1;apiv1b\x06proto3"
+	"\x18UNSUBSCRIBE_REASON_ERROR\x10\x032T\n" +
+	"\fControlPlane\x12D\n" +
+	"\aConnect\x12\x18.netfence.v1.DaemonEvent\x1a\x1b.netfence.v1.ControlCommand(\x010\x01B1Z/github.com/danthegoodman1/netfence/api/v1;apiv1b\x06proto3"
 
 var (
 	file_v1_control_proto_rawDescOnce sync.Once

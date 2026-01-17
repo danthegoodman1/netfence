@@ -7,13 +7,12 @@
 package apiv1
 
 import (
-	reflect "reflect"
-	sync "sync"
-	unsafe "unsafe"
-
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	emptypb "google.golang.org/protobuf/types/known/emptypb"
+	reflect "reflect"
+	sync "sync"
+	unsafe "unsafe"
 )
 
 const (
@@ -547,13 +546,13 @@ var File_v1_daemon_proto protoreflect.FileDescriptor
 
 const file_v1_daemon_proto_rawDesc = "" +
 	"\n" +
-	"\x0fv1/daemon.proto\x12\fnetfence.v1\x1a\x1bgoogle/protobuf/empty.proto\x1a\x0ev1/types.proto\"\x97\x02\n" +
+	"\x0fv1/daemon.proto\x12\vnetfence.v1\x1a\x1bgoogle/protobuf/empty.proto\x1a\x0ev1/types.proto\"\x95\x02\n" +
 	"\rAttachRequest\x12'\n" +
 	"\x0einterface_name\x18\x01 \x01(\tH\x00R\rinterfaceName\x12!\n" +
 	"\vcgroup_path\x18\x02 \x01(\tH\x00R\n" +
-	"cgroupPath\x12,\n" +
-	"\x04mode\x18\x03 \x01(\x0e2\x18.netfence.v1.PolicyModeR\x04mode\x12E\n" +
-	"\bmetadata\x18\x04 \x03(\v2).netfence.v1.AttachRequest.MetadataEntryR\bmetadata\x1a;\n" +
+	"cgroupPath\x12+\n" +
+	"\x04mode\x18\x03 \x01(\x0e2\x17.netfence.v1.PolicyModeR\x04mode\x12D\n" +
+	"\bmetadata\x18\x04 \x03(\v2(.netfence.v1.AttachRequest.MetadataEntryR\bmetadata\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01B\b\n" +
@@ -563,18 +562,18 @@ const file_v1_daemon_proto_rawDesc = "" +
 	"\vdns_address\x18\x02 \x01(\tR\n" +
 	"dnsAddress\"\x1f\n" +
 	"\rDetachRequest\x12\x0e\n" +
-	"\x02id\x18\x01 \x01(\tR\x02id\"N\n" +
-	"\fListResponse\x12>\n" +
-	"\vattachments\x18\x01 \x03(\v2\x1c.netfence.v1.AttachmentInfoR\vattachments\"\xa2\x04\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\"M\n" +
+	"\fListResponse\x12=\n" +
+	"\vattachments\x18\x01 \x03(\v2\x1b.netfence.v1.AttachmentInfoR\vattachments\"\x9e\x04\n" +
 	"\x0eAttachmentInfo\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x16\n" +
-	"\x06target\x18\x02 \x01(\tR\x06target\x120\n" +
-	"\x04type\x18\x03 \x01(\x0e2\x1c.netfence.v1.AttachmentTypeR\x04type\x12,\n" +
-	"\x04mode\x18\x04 \x01(\x0e2\x18.netfence.v1.PolicyModeR\x04mode\x120\n" +
-	"\bdns_mode\x18\x05 \x01(\x0e2\x15.netfence.v1.DnsModeR\adnsMode\x12\x1f\n" +
+	"\x06target\x18\x02 \x01(\tR\x06target\x12/\n" +
+	"\x04type\x18\x03 \x01(\x0e2\x1b.netfence.v1.AttachmentTypeR\x04type\x12+\n" +
+	"\x04mode\x18\x04 \x01(\x0e2\x17.netfence.v1.PolicyModeR\x04mode\x12/\n" +
+	"\bdns_mode\x18\x05 \x01(\x0e2\x14.netfence.v1.DnsModeR\adnsMode\x12\x1f\n" +
 	"\vdns_address\x18\x06 \x01(\tR\n" +
-	"dnsAddress\x12F\n" +
-	"\bmetadata\x18\a \x03(\v2*.netfence.v1.AttachmentInfo.MetadataEntryR\bmetadata\x12'\n" +
+	"dnsAddress\x12E\n" +
+	"\bmetadata\x18\a \x03(\v2).netfence.v1.AttachmentInfo.MetadataEntryR\bmetadata\x12'\n" +
 	"\x0fpackets_allowed\x18\b \x01(\x04R\x0epacketsAllowed\x12'\n" +
 	"\x0fpackets_blocked\x18\t \x01(\x04R\x0epacketsBlocked\x12.\n" +
 	"\x13dns_queries_allowed\x18\n" +
@@ -582,24 +581,24 @@ const file_v1_daemon_proto_rawDesc = "" +
 	"\x13dns_queries_blocked\x18\v \x01(\x04R\x11dnsQueriesBlocked\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x8f\x02\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x8e\x02\n" +
 	"\fDaemonStatus\x12\x18\n" +
 	"\aversion\x18\x01 \x01(\tR\aversion\x12\x1b\n" +
 	"\tdaemon_id\x18\x02 \x01(\tR\bdaemonId\x12\x1a\n" +
-	"\bhostname\x18\x03 \x01(\tR\bhostname\x12M\n" +
-	"\x13control_plane_state\x18\x04 \x01(\x0e2\x1d.netfence.v1.ConnectionStateR\x11controlPlaneState\x122\n" +
+	"\bhostname\x18\x03 \x01(\tR\bhostname\x12L\n" +
+	"\x13control_plane_state\x18\x04 \x01(\x0e2\x1c.netfence.v1.ConnectionStateR\x11controlPlaneState\x122\n" +
 	"\x15control_plane_address\x18\x05 \x01(\tR\x13controlPlaneAddress\x12)\n" +
 	"\x10attachment_count\x18\x06 \x01(\x05R\x0fattachmentCount*\x97\x01\n" +
 	"\x0fConnectionState\x12 \n" +
 	"\x1cCONNECTION_STATE_UNSPECIFIED\x10\x00\x12!\n" +
 	"\x1dCONNECTION_STATE_DISCONNECTED\x10\x01\x12\x1f\n" +
 	"\x1bCONNECTION_STATE_CONNECTING\x10\x02\x12\x1e\n" +
-	"\x1aCONNECTION_STATE_CONNECTED\x10\x032\x90\x02\n" +
-	"\rDaemonService\x12C\n" +
-	"\x06Attach\x12\x1b.netfence.v1.AttachRequest\x1a\x1c.netfence.v1.AttachResponse\x12=\n" +
-	"\x06Detach\x12\x1b.netfence.v1.DetachRequest\x1a\x16.google.protobuf.Empty\x12:\n" +
-	"\x04List\x12\x16.google.protobuf.Empty\x1a\x1a.netfence.v1.ListResponse\x12?\n" +
-	"\tGetStatus\x12\x16.google.protobuf.Empty\x1a\x1a.netfence.v1.DaemonStatusB2Z0github.com/danthegoodman1/netfence/api/v1;apiv1b\x06proto3"
+	"\x1aCONNECTION_STATE_CONNECTED\x10\x032\x8b\x02\n" +
+	"\rDaemonService\x12A\n" +
+	"\x06Attach\x12\x1a.netfence.v1.AttachRequest\x1a\x1b.netfence.v1.AttachResponse\x12<\n" +
+	"\x06Detach\x12\x1a.netfence.v1.DetachRequest\x1a\x16.google.protobuf.Empty\x129\n" +
+	"\x04List\x12\x16.google.protobuf.Empty\x1a\x19.netfence.v1.ListResponse\x12>\n" +
+	"\tGetStatus\x12\x16.google.protobuf.Empty\x1a\x19.netfence.v1.DaemonStatusB1Z/github.com/danthegoodman1/netfence/api/v1;apiv1b\x06proto3"
 
 var (
 	file_v1_daemon_proto_rawDescOnce sync.Once
