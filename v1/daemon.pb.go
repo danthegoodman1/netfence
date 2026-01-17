@@ -7,13 +7,12 @@
 package apiv1
 
 import (
-	reflect "reflect"
-	sync "sync"
-	unsafe "unsafe"
-
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	emptypb "google.golang.org/protobuf/types/known/emptypb"
+	reflect "reflect"
+	sync "sync"
+	unsafe "unsafe"
 )
 
 const (
@@ -184,7 +183,10 @@ func (*AttachRequest_CgroupPath) isAttachRequest_Target() {}
 type AttachResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Unique identifier for this attachment (use this for detach)
-	Id            string `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	Id string `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	// DNS server address for this attachment (e.g., "127.0.0.1:5353")
+	// Configure the container/VM to use this as its DNS resolver
+	DnsAddress    string `protobuf:"bytes,2,opt,name=dns_address,json=dnsAddress,proto3" json:"dns_address,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -222,6 +224,13 @@ func (*AttachResponse) Descriptor() ([]byte, []int) {
 func (x *AttachResponse) GetId() string {
 	if x != nil {
 		return x.Id
+	}
+	return ""
+}
+
+func (x *AttachResponse) GetDnsAddress() string {
+	if x != nil {
+		return x.DnsAddress
 	}
 	return ""
 }
@@ -324,13 +333,20 @@ type AttachmentInfo struct {
 	// The target (interface name or cgroup path)
 	Target string `protobuf:"bytes,2,opt,name=target,proto3" json:"target,omitempty"`
 	// Type of attachment
-	Type           AttachmentType    `protobuf:"varint,3,opt,name=type,proto3,enum=superebpf.v1.AttachmentType" json:"type,omitempty"`
-	Mode           PolicyMode        `protobuf:"varint,4,opt,name=mode,proto3,enum=superebpf.v1.PolicyMode" json:"mode,omitempty"`
-	Metadata       map[string]string `protobuf:"bytes,5,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	PacketsAllowed uint64            `protobuf:"varint,6,opt,name=packets_allowed,json=packetsAllowed,proto3" json:"packets_allowed,omitempty"`
-	PacketsBlocked uint64            `protobuf:"varint,7,opt,name=packets_blocked,json=packetsBlocked,proto3" json:"packets_blocked,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	Type AttachmentType `protobuf:"varint,3,opt,name=type,proto3,enum=superebpf.v1.AttachmentType" json:"type,omitempty"`
+	// IP filter policy mode
+	Mode PolicyMode `protobuf:"varint,4,opt,name=mode,proto3,enum=superebpf.v1.PolicyMode" json:"mode,omitempty"`
+	// DNS filtering mode
+	DnsMode DnsMode `protobuf:"varint,5,opt,name=dns_mode,json=dnsMode,proto3,enum=superebpf.v1.DnsMode" json:"dns_mode,omitempty"`
+	// DNS server address for this attachment
+	DnsAddress        string            `protobuf:"bytes,6,opt,name=dns_address,json=dnsAddress,proto3" json:"dns_address,omitempty"`
+	Metadata          map[string]string `protobuf:"bytes,7,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	PacketsAllowed    uint64            `protobuf:"varint,8,opt,name=packets_allowed,json=packetsAllowed,proto3" json:"packets_allowed,omitempty"`
+	PacketsBlocked    uint64            `protobuf:"varint,9,opt,name=packets_blocked,json=packetsBlocked,proto3" json:"packets_blocked,omitempty"`
+	DnsQueriesAllowed uint64            `protobuf:"varint,10,opt,name=dns_queries_allowed,json=dnsQueriesAllowed,proto3" json:"dns_queries_allowed,omitempty"`
+	DnsQueriesBlocked uint64            `protobuf:"varint,11,opt,name=dns_queries_blocked,json=dnsQueriesBlocked,proto3" json:"dns_queries_blocked,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *AttachmentInfo) Reset() {
@@ -391,6 +407,20 @@ func (x *AttachmentInfo) GetMode() PolicyMode {
 	return PolicyMode_POLICY_MODE_UNSPECIFIED
 }
 
+func (x *AttachmentInfo) GetDnsMode() DnsMode {
+	if x != nil {
+		return x.DnsMode
+	}
+	return DnsMode_DNS_MODE_UNSPECIFIED
+}
+
+func (x *AttachmentInfo) GetDnsAddress() string {
+	if x != nil {
+		return x.DnsAddress
+	}
+	return ""
+}
+
 func (x *AttachmentInfo) GetMetadata() map[string]string {
 	if x != nil {
 		return x.Metadata
@@ -408,6 +438,20 @@ func (x *AttachmentInfo) GetPacketsAllowed() uint64 {
 func (x *AttachmentInfo) GetPacketsBlocked() uint64 {
 	if x != nil {
 		return x.PacketsBlocked
+	}
+	return 0
+}
+
+func (x *AttachmentInfo) GetDnsQueriesAllowed() uint64 {
+	if x != nil {
+		return x.DnsQueriesAllowed
+	}
+	return 0
+}
+
+func (x *AttachmentInfo) GetDnsQueriesBlocked() uint64 {
+	if x != nil {
+		return x.DnsQueriesBlocked
 	}
 	return 0
 }
@@ -512,21 +556,29 @@ const file_v1_daemon_proto_rawDesc = "" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01B\b\n" +
-	"\x06target\" \n" +
+	"\x06target\"A\n" +
 	"\x0eAttachResponse\x12\x0e\n" +
-	"\x02id\x18\x01 \x01(\tR\x02id\"\x1f\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\x12\x1f\n" +
+	"\vdns_address\x18\x02 \x01(\tR\n" +
+	"dnsAddress\"\x1f\n" +
 	"\rDetachRequest\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\"N\n" +
 	"\fListResponse\x12>\n" +
-	"\vattachments\x18\x01 \x03(\v2\x1c.superebpf.v1.AttachmentInfoR\vattachments\"\xef\x02\n" +
+	"\vattachments\x18\x01 \x03(\v2\x1c.superebpf.v1.AttachmentInfoR\vattachments\"\xa2\x04\n" +
 	"\x0eAttachmentInfo\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x16\n" +
 	"\x06target\x18\x02 \x01(\tR\x06target\x120\n" +
 	"\x04type\x18\x03 \x01(\x0e2\x1c.superebpf.v1.AttachmentTypeR\x04type\x12,\n" +
-	"\x04mode\x18\x04 \x01(\x0e2\x18.superebpf.v1.PolicyModeR\x04mode\x12F\n" +
-	"\bmetadata\x18\x05 \x03(\v2*.superebpf.v1.AttachmentInfo.MetadataEntryR\bmetadata\x12'\n" +
-	"\x0fpackets_allowed\x18\x06 \x01(\x04R\x0epacketsAllowed\x12'\n" +
-	"\x0fpackets_blocked\x18\a \x01(\x04R\x0epacketsBlocked\x1a;\n" +
+	"\x04mode\x18\x04 \x01(\x0e2\x18.superebpf.v1.PolicyModeR\x04mode\x120\n" +
+	"\bdns_mode\x18\x05 \x01(\x0e2\x15.superebpf.v1.DnsModeR\adnsMode\x12\x1f\n" +
+	"\vdns_address\x18\x06 \x01(\tR\n" +
+	"dnsAddress\x12F\n" +
+	"\bmetadata\x18\a \x03(\v2*.superebpf.v1.AttachmentInfo.MetadataEntryR\bmetadata\x12'\n" +
+	"\x0fpackets_allowed\x18\b \x01(\x04R\x0epacketsAllowed\x12'\n" +
+	"\x0fpackets_blocked\x18\t \x01(\x04R\x0epacketsBlocked\x12.\n" +
+	"\x13dns_queries_allowed\x18\n" +
+	" \x01(\x04R\x11dnsQueriesAllowed\x12.\n" +
+	"\x13dns_queries_blocked\x18\v \x01(\x04R\x11dnsQueriesBlocked\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x8f\x02\n" +
@@ -574,7 +626,8 @@ var file_v1_daemon_proto_goTypes = []any{
 	nil,                    // 8: superebpf.v1.AttachmentInfo.MetadataEntry
 	(PolicyMode)(0),        // 9: superebpf.v1.PolicyMode
 	(AttachmentType)(0),    // 10: superebpf.v1.AttachmentType
-	(*emptypb.Empty)(nil),  // 11: google.protobuf.Empty
+	(DnsMode)(0),           // 11: superebpf.v1.DnsMode
+	(*emptypb.Empty)(nil),  // 12: google.protobuf.Empty
 }
 var file_v1_daemon_proto_depIdxs = []int32{
 	9,  // 0: superebpf.v1.AttachRequest.mode:type_name -> superebpf.v1.PolicyMode
@@ -582,21 +635,22 @@ var file_v1_daemon_proto_depIdxs = []int32{
 	5,  // 2: superebpf.v1.ListResponse.attachments:type_name -> superebpf.v1.AttachmentInfo
 	10, // 3: superebpf.v1.AttachmentInfo.type:type_name -> superebpf.v1.AttachmentType
 	9,  // 4: superebpf.v1.AttachmentInfo.mode:type_name -> superebpf.v1.PolicyMode
-	8,  // 5: superebpf.v1.AttachmentInfo.metadata:type_name -> superebpf.v1.AttachmentInfo.MetadataEntry
-	0,  // 6: superebpf.v1.DaemonStatus.control_plane_state:type_name -> superebpf.v1.ConnectionState
-	1,  // 7: superebpf.v1.DaemonService.Attach:input_type -> superebpf.v1.AttachRequest
-	3,  // 8: superebpf.v1.DaemonService.Detach:input_type -> superebpf.v1.DetachRequest
-	11, // 9: superebpf.v1.DaemonService.List:input_type -> google.protobuf.Empty
-	11, // 10: superebpf.v1.DaemonService.GetStatus:input_type -> google.protobuf.Empty
-	2,  // 11: superebpf.v1.DaemonService.Attach:output_type -> superebpf.v1.AttachResponse
-	11, // 12: superebpf.v1.DaemonService.Detach:output_type -> google.protobuf.Empty
-	4,  // 13: superebpf.v1.DaemonService.List:output_type -> superebpf.v1.ListResponse
-	6,  // 14: superebpf.v1.DaemonService.GetStatus:output_type -> superebpf.v1.DaemonStatus
-	11, // [11:15] is the sub-list for method output_type
-	7,  // [7:11] is the sub-list for method input_type
-	7,  // [7:7] is the sub-list for extension type_name
-	7,  // [7:7] is the sub-list for extension extendee
-	0,  // [0:7] is the sub-list for field type_name
+	11, // 5: superebpf.v1.AttachmentInfo.dns_mode:type_name -> superebpf.v1.DnsMode
+	8,  // 6: superebpf.v1.AttachmentInfo.metadata:type_name -> superebpf.v1.AttachmentInfo.MetadataEntry
+	0,  // 7: superebpf.v1.DaemonStatus.control_plane_state:type_name -> superebpf.v1.ConnectionState
+	1,  // 8: superebpf.v1.DaemonService.Attach:input_type -> superebpf.v1.AttachRequest
+	3,  // 9: superebpf.v1.DaemonService.Detach:input_type -> superebpf.v1.DetachRequest
+	12, // 10: superebpf.v1.DaemonService.List:input_type -> google.protobuf.Empty
+	12, // 11: superebpf.v1.DaemonService.GetStatus:input_type -> google.protobuf.Empty
+	2,  // 12: superebpf.v1.DaemonService.Attach:output_type -> superebpf.v1.AttachResponse
+	12, // 13: superebpf.v1.DaemonService.Detach:output_type -> google.protobuf.Empty
+	4,  // 14: superebpf.v1.DaemonService.List:output_type -> superebpf.v1.ListResponse
+	6,  // 15: superebpf.v1.DaemonService.GetStatus:output_type -> superebpf.v1.DaemonStatus
+	12, // [12:16] is the sub-list for method output_type
+	8,  // [8:12] is the sub-list for method input_type
+	8,  // [8:8] is the sub-list for extension type_name
+	8,  // [8:8] is the sub-list for extension extendee
+	0,  // [0:8] is the sub-list for field type_name
 }
 
 func init() { file_v1_daemon_proto_init() }

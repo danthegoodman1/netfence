@@ -23,3 +23,16 @@ enum AttachmentType {
   ATTACHMENT_TYPE_TC = 1;
   ATTACHMENT_TYPE_CGROUP = 2;
 }
+
+// DnsMode defines the DNS filtering behavior.
+enum DnsMode {
+  DNS_MODE_UNSPECIFIED = 0;
+  // Disabled - no DNS interception, pure IP filtering
+  DNS_MODE_DISABLED = 1;
+  // Allowlist - only resolve allowed domains, block all else
+  DNS_MODE_ALLOWLIST = 2;
+  // Denylist - block denied domains, allow all else
+  DNS_MODE_DENYLIST = 3;
+  // Proxy - forward all queries to control plane for decision
+  DNS_MODE_PROXY = 4;
+}

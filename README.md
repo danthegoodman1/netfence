@@ -10,31 +10,33 @@ Make this a pre-made control daemon and eBPF program, and the user just manages 
 
 - Attach eBPF filters to network interfaces (TC) or cgroups
 - Policy modes: disabled, allowlist, denylist, block-all
-- IPv4 and IPv6 CIDR support
-- TTLs on CIDRs (daemon auto-expires)
+- IPv4 and IPv6 CIDR support with optional TTLs
+- Per-attachment DNS server with domain allowlist/denylist
+- Domain rules support subdomains with specificity-based matching (more specific rules win)
+- Resolved domains auto-populate IP filter
 - Metadata on attachments for associating with VM ID, tenant, etc.
-
-## Future
-
-- Subdomains/patterns
-- Sever existing connections on rule change
-- CoreDNS plugin or standalone DNS server with API
 
 # Design
 
 ## Architecture
 
 ```
-+------------------+         +-------------------+
-|  Your Control    |<------->|  Daemon           |
-|  Plane (gRPC)    |  stream |  (per host)       |
-+------------------+         +-------------------+
-                                    |
-                             +------+------+
-                             |             |
-                          TC Filter    Cgroup Filter
-                          (veth, eth)  (containers)
++------------------+         +-------------------------+
+|  Your Control    |<------->|  Daemon (per host)      |
+|  Plane (gRPC)    |  stream |                         |
++------------------+         |  +-------------------+  |
+                             |  | DNS Server        |  |
+                             |  | (per-attachment)  |  |
+                             |  +-------------------+  |
+                             +-------------------------+
+                                        |
+                                 +------+------+
+                                 |             |
+                              TC Filter    Cgroup Filter
+                              (veth, eth)  (containers)
 ```
+
+Each attachment gets a unique DNS address (port) provisioned by the daemon. Containers/VMs should be configured to use their assigned DNS address.
 
 ## Per host
 
@@ -70,10 +72,10 @@ Implement `ControlPlane.Connect` RPC - a bidirectional stream:
 
 **Send to daemon:**
 - `SyncAck` after receiving SyncRequest
-- `SetMode{mode}` - change policy mode
-- `AllowCIDR{cidr, ttl}` - add to allowlist
-- `DenyCIDR{cidr, ttl}` - add to denylist
-- `RemoveCIDR{cidr}` - remove from lists
-- `BulkUpdate{mode, allow_cidrs, deny_cidrs}` - full state sync
+- `SetMode{mode}` - change IP filter policy mode
+- `AllowCIDR{cidr, ttl}` / `DenyCIDR` / `RemoveCIDR`
+- `SetDnsMode{mode}` - change DNS filtering mode
+- `AllowDomain{domain}` / `DenyDomain` / `RemoveDomain`
+- `BulkUpdate{mode, cidrs, dns_config}` - full state sync
 
 Use the metadata from `Subscribed` to identify which VM/tenant/container this attachment belongs to, then push appropriate rules.

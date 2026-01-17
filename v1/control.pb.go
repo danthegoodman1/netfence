@@ -271,10 +271,12 @@ type Attachment struct {
 	Target string `protobuf:"bytes,2,opt,name=target,proto3" json:"target,omitempty"`
 	// Type of attachment
 	Type AttachmentType `protobuf:"varint,3,opt,name=type,proto3,enum=superebpf.v1.AttachmentType" json:"type,omitempty"`
-	// Current policy mode
+	// Current IP filter policy mode
 	Mode PolicyMode `protobuf:"varint,4,opt,name=mode,proto3,enum=superebpf.v1.PolicyMode" json:"mode,omitempty"`
+	// Current DNS filtering mode
+	DnsMode DnsMode `protobuf:"varint,5,opt,name=dns_mode,json=dnsMode,proto3,enum=superebpf.v1.DnsMode" json:"dns_mode,omitempty"`
 	// User-defined metadata (VM ID, tenant, etc.)
-	Metadata      map[string]string `protobuf:"bytes,5,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	Metadata      map[string]string `protobuf:"bytes,6,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -337,6 +339,13 @@ func (x *Attachment) GetMode() PolicyMode {
 	return PolicyMode_POLICY_MODE_UNSPECIFIED
 }
 
+func (x *Attachment) GetDnsMode() DnsMode {
+	if x != nil {
+		return x.DnsMode
+	}
+	return DnsMode_DNS_MODE_UNSPECIFIED
+}
+
 func (x *Attachment) GetMetadata() map[string]string {
 	if x != nil {
 		return x.Metadata
@@ -353,10 +362,15 @@ type Subscribed struct {
 	Target string `protobuf:"bytes,2,opt,name=target,proto3" json:"target,omitempty"`
 	// Type of attachment
 	Type AttachmentType `protobuf:"varint,3,opt,name=type,proto3,enum=superebpf.v1.AttachmentType" json:"type,omitempty"`
-	// Initial policy mode
+	// Initial IP filter policy mode
 	Mode PolicyMode `protobuf:"varint,4,opt,name=mode,proto3,enum=superebpf.v1.PolicyMode" json:"mode,omitempty"`
+	// Initial DNS filtering mode
+	DnsMode DnsMode `protobuf:"varint,5,opt,name=dns_mode,json=dnsMode,proto3,enum=superebpf.v1.DnsMode" json:"dns_mode,omitempty"`
+	// DNS server address for this attachment (e.g., "10.0.0.1:53")
+	// Containers should use this as their DNS resolver
+	DnsAddress string `protobuf:"bytes,6,opt,name=dns_address,json=dnsAddress,proto3" json:"dns_address,omitempty"`
 	// User-defined metadata for associating with VM ID, tenant, etc.
-	Metadata      map[string]string `protobuf:"bytes,5,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	Metadata      map[string]string `protobuf:"bytes,7,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -417,6 +431,20 @@ func (x *Subscribed) GetMode() PolicyMode {
 		return x.Mode
 	}
 	return PolicyMode_POLICY_MODE_UNSPECIFIED
+}
+
+func (x *Subscribed) GetDnsMode() DnsMode {
+	if x != nil {
+		return x.DnsMode
+	}
+	return DnsMode_DNS_MODE_UNSPECIFIED
+}
+
+func (x *Subscribed) GetDnsAddress() string {
+	if x != nil {
+		return x.DnsAddress
+	}
+	return ""
 }
 
 func (x *Subscribed) GetMetadata() map[string]string {
@@ -537,12 +565,14 @@ func (x *Heartbeat) GetStats() []*AttachmentStats {
 
 // AttachmentStats reports statistics for a single attachment.
 type AttachmentStats struct {
-	state          protoimpl.MessageState `protogen:"open.v1"`
-	Id             string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
-	PacketsAllowed uint64                 `protobuf:"varint,2,opt,name=packets_allowed,json=packetsAllowed,proto3" json:"packets_allowed,omitempty"`
-	PacketsBlocked uint64                 `protobuf:"varint,3,opt,name=packets_blocked,json=packetsBlocked,proto3" json:"packets_blocked,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	state             protoimpl.MessageState `protogen:"open.v1"`
+	Id                string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	PacketsAllowed    uint64                 `protobuf:"varint,2,opt,name=packets_allowed,json=packetsAllowed,proto3" json:"packets_allowed,omitempty"`
+	PacketsBlocked    uint64                 `protobuf:"varint,3,opt,name=packets_blocked,json=packetsBlocked,proto3" json:"packets_blocked,omitempty"`
+	DnsQueriesAllowed uint64                 `protobuf:"varint,4,opt,name=dns_queries_allowed,json=dnsQueriesAllowed,proto3" json:"dns_queries_allowed,omitempty"`
+	DnsQueriesBlocked uint64                 `protobuf:"varint,5,opt,name=dns_queries_blocked,json=dnsQueriesBlocked,proto3" json:"dns_queries_blocked,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *AttachmentStats) Reset() {
@@ -596,6 +626,20 @@ func (x *AttachmentStats) GetPacketsBlocked() uint64 {
 	return 0
 }
 
+func (x *AttachmentStats) GetDnsQueriesAllowed() uint64 {
+	if x != nil {
+		return x.DnsQueriesAllowed
+	}
+	return 0
+}
+
+func (x *AttachmentStats) GetDnsQueriesBlocked() uint64 {
+	if x != nil {
+		return x.DnsQueriesBlocked
+	}
+	return 0
+}
+
 // ControlCommand represents commands sent from the control plane to the daemon.
 type ControlCommand struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -609,6 +653,10 @@ type ControlCommand struct {
 	//	*ControlCommand_DenyCidr
 	//	*ControlCommand_RemoveCidr
 	//	*ControlCommand_BulkUpdate
+	//	*ControlCommand_SetDnsMode
+	//	*ControlCommand_AllowDomain
+	//	*ControlCommand_DenyDomain
+	//	*ControlCommand_RemoveDomain
 	Command       isControlCommand_Command `protobuf_oneof:"command"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -676,7 +724,7 @@ func (x *ControlCommand) GetSetMode() *SetMode {
 	return nil
 }
 
-func (x *ControlCommand) GetAllowCidr() *AllowCIDR {
+func (x *ControlCommand) GetAllowCidr() *CIDREntry {
 	if x != nil {
 		if x, ok := x.Command.(*ControlCommand_AllowCidr); ok {
 			return x.AllowCidr
@@ -685,7 +733,7 @@ func (x *ControlCommand) GetAllowCidr() *AllowCIDR {
 	return nil
 }
 
-func (x *ControlCommand) GetDenyCidr() *DenyCIDR {
+func (x *ControlCommand) GetDenyCidr() *CIDREntry {
 	if x != nil {
 		if x, ok := x.Command.(*ControlCommand_DenyCidr); ok {
 			return x.DenyCidr
@@ -694,13 +742,13 @@ func (x *ControlCommand) GetDenyCidr() *DenyCIDR {
 	return nil
 }
 
-func (x *ControlCommand) GetRemoveCidr() *RemoveCIDR {
+func (x *ControlCommand) GetRemoveCidr() string {
 	if x != nil {
 		if x, ok := x.Command.(*ControlCommand_RemoveCidr); ok {
 			return x.RemoveCidr
 		}
 	}
-	return nil
+	return ""
 }
 
 func (x *ControlCommand) GetBulkUpdate() *BulkUpdate {
@@ -710,6 +758,42 @@ func (x *ControlCommand) GetBulkUpdate() *BulkUpdate {
 		}
 	}
 	return nil
+}
+
+func (x *ControlCommand) GetSetDnsMode() *SetDnsMode {
+	if x != nil {
+		if x, ok := x.Command.(*ControlCommand_SetDnsMode); ok {
+			return x.SetDnsMode
+		}
+	}
+	return nil
+}
+
+func (x *ControlCommand) GetAllowDomain() *DomainEntry {
+	if x != nil {
+		if x, ok := x.Command.(*ControlCommand_AllowDomain); ok {
+			return x.AllowDomain
+		}
+	}
+	return nil
+}
+
+func (x *ControlCommand) GetDenyDomain() *DomainEntry {
+	if x != nil {
+		if x, ok := x.Command.(*ControlCommand_DenyDomain); ok {
+			return x.DenyDomain
+		}
+	}
+	return nil
+}
+
+func (x *ControlCommand) GetRemoveDomain() string {
+	if x != nil {
+		if x, ok := x.Command.(*ControlCommand_RemoveDomain); ok {
+			return x.RemoveDomain
+		}
+	}
+	return ""
 }
 
 type isControlCommand_Command interface {
@@ -722,28 +806,48 @@ type ControlCommand_SyncAck struct {
 }
 
 type ControlCommand_SetMode struct {
-	// Change the policy mode
+	// Change the IP filter policy mode
 	SetMode *SetMode `protobuf:"bytes,3,opt,name=set_mode,json=setMode,proto3,oneof"`
 }
 
 type ControlCommand_AllowCidr struct {
 	// Add a CIDR to the allowlist
-	AllowCidr *AllowCIDR `protobuf:"bytes,4,opt,name=allow_cidr,json=allowCidr,proto3,oneof"`
+	AllowCidr *CIDREntry `protobuf:"bytes,4,opt,name=allow_cidr,json=allowCidr,proto3,oneof"`
 }
 
 type ControlCommand_DenyCidr struct {
 	// Add a CIDR to the denylist
-	DenyCidr *DenyCIDR `protobuf:"bytes,5,opt,name=deny_cidr,json=denyCidr,proto3,oneof"`
+	DenyCidr *CIDREntry `protobuf:"bytes,5,opt,name=deny_cidr,json=denyCidr,proto3,oneof"`
 }
 
 type ControlCommand_RemoveCidr struct {
 	// Remove a CIDR from allow/deny lists
-	RemoveCidr *RemoveCIDR `protobuf:"bytes,6,opt,name=remove_cidr,json=removeCidr,proto3,oneof"`
+	RemoveCidr string `protobuf:"bytes,6,opt,name=remove_cidr,json=removeCidr,proto3,oneof"`
 }
 
 type ControlCommand_BulkUpdate struct {
 	// Bulk update - set complete state for an attachment
 	BulkUpdate *BulkUpdate `protobuf:"bytes,7,opt,name=bulk_update,json=bulkUpdate,proto3,oneof"`
+}
+
+type ControlCommand_SetDnsMode struct {
+	// Change the DNS mode
+	SetDnsMode *SetDnsMode `protobuf:"bytes,8,opt,name=set_dns_mode,json=setDnsMode,proto3,oneof"`
+}
+
+type ControlCommand_AllowDomain struct {
+	// Add a domain to the DNS allowlist
+	AllowDomain *DomainEntry `protobuf:"bytes,9,opt,name=allow_domain,json=allowDomain,proto3,oneof"`
+}
+
+type ControlCommand_DenyDomain struct {
+	// Add a domain to the DNS denylist
+	DenyDomain *DomainEntry `protobuf:"bytes,10,opt,name=deny_domain,json=denyDomain,proto3,oneof"`
+}
+
+type ControlCommand_RemoveDomain struct {
+	// Remove a domain from DNS allow/deny lists
+	RemoveDomain string `protobuf:"bytes,11,opt,name=remove_domain,json=removeDomain,proto3,oneof"`
 }
 
 func (*ControlCommand_SyncAck) isControlCommand_Command() {}
@@ -757,6 +861,14 @@ func (*ControlCommand_DenyCidr) isControlCommand_Command() {}
 func (*ControlCommand_RemoveCidr) isControlCommand_Command() {}
 
 func (*ControlCommand_BulkUpdate) isControlCommand_Command() {}
+
+func (*ControlCommand_SetDnsMode) isControlCommand_Command() {}
+
+func (*ControlCommand_AllowDomain) isControlCommand_Command() {}
+
+func (*ControlCommand_DenyDomain) isControlCommand_Command() {}
+
+func (*ControlCommand_RemoveDomain) isControlCommand_Command() {}
 
 // SyncAck acknowledges that the control plane has processed the SyncRequest.
 type SyncAck struct {
@@ -840,179 +952,25 @@ func (x *SetMode) GetMode() PolicyMode {
 	return PolicyMode_POLICY_MODE_UNSPECIFIED
 }
 
-// AllowCIDR adds a CIDR to the allowlist.
-type AllowCIDR struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
-	// IPv4 or IPv6 CIDR (e.g., "10.0.0.0/8", "2001:db8::/32", or single IP "1.2.3.4")
-	Cidr string `protobuf:"bytes,1,opt,name=cidr,proto3" json:"cidr,omitempty"`
-	// Optional TTL - daemon will automatically remove after this duration.
-	// Zero or unset means no expiration.
-	Ttl           *durationpb.Duration `protobuf:"bytes,2,opt,name=ttl,proto3" json:"ttl,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *AllowCIDR) Reset() {
-	*x = AllowCIDR{}
-	mi := &file_v1_control_proto_msgTypes[10]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *AllowCIDR) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*AllowCIDR) ProtoMessage() {}
-
-func (x *AllowCIDR) ProtoReflect() protoreflect.Message {
-	mi := &file_v1_control_proto_msgTypes[10]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use AllowCIDR.ProtoReflect.Descriptor instead.
-func (*AllowCIDR) Descriptor() ([]byte, []int) {
-	return file_v1_control_proto_rawDescGZIP(), []int{10}
-}
-
-func (x *AllowCIDR) GetCidr() string {
-	if x != nil {
-		return x.Cidr
-	}
-	return ""
-}
-
-func (x *AllowCIDR) GetTtl() *durationpb.Duration {
-	if x != nil {
-		return x.Ttl
-	}
-	return nil
-}
-
-// DenyCIDR adds a CIDR to the denylist.
-type DenyCIDR struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
-	// IPv4 or IPv6 CIDR
-	Cidr string `protobuf:"bytes,1,opt,name=cidr,proto3" json:"cidr,omitempty"`
-	// Optional TTL for automatic expiration
-	Ttl           *durationpb.Duration `protobuf:"bytes,2,opt,name=ttl,proto3" json:"ttl,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *DenyCIDR) Reset() {
-	*x = DenyCIDR{}
-	mi := &file_v1_control_proto_msgTypes[11]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *DenyCIDR) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*DenyCIDR) ProtoMessage() {}
-
-func (x *DenyCIDR) ProtoReflect() protoreflect.Message {
-	mi := &file_v1_control_proto_msgTypes[11]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use DenyCIDR.ProtoReflect.Descriptor instead.
-func (*DenyCIDR) Descriptor() ([]byte, []int) {
-	return file_v1_control_proto_rawDescGZIP(), []int{11}
-}
-
-func (x *DenyCIDR) GetCidr() string {
-	if x != nil {
-		return x.Cidr
-	}
-	return ""
-}
-
-func (x *DenyCIDR) GetTtl() *durationpb.Duration {
-	if x != nil {
-		return x.Ttl
-	}
-	return nil
-}
-
-// RemoveCIDR removes a CIDR from both allow and deny lists.
-type RemoveCIDR struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Cidr          string                 `protobuf:"bytes,1,opt,name=cidr,proto3" json:"cidr,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *RemoveCIDR) Reset() {
-	*x = RemoveCIDR{}
-	mi := &file_v1_control_proto_msgTypes[12]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *RemoveCIDR) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*RemoveCIDR) ProtoMessage() {}
-
-func (x *RemoveCIDR) ProtoReflect() protoreflect.Message {
-	mi := &file_v1_control_proto_msgTypes[12]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use RemoveCIDR.ProtoReflect.Descriptor instead.
-func (*RemoveCIDR) Descriptor() ([]byte, []int) {
-	return file_v1_control_proto_rawDescGZIP(), []int{12}
-}
-
-func (x *RemoveCIDR) GetCidr() string {
-	if x != nil {
-		return x.Cidr
-	}
-	return ""
-}
-
 // BulkUpdate sets the complete state for an attachment.
 // Clears existing rules and replaces with the provided state.
 type BulkUpdate struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Policy mode to set
+	// IP filter policy mode
 	Mode PolicyMode `protobuf:"varint,1,opt,name=mode,proto3,enum=superebpf.v1.PolicyMode" json:"mode,omitempty"`
 	// CIDRs to allow
 	AllowCidrs []*CIDREntry `protobuf:"bytes,2,rep,name=allow_cidrs,json=allowCidrs,proto3" json:"allow_cidrs,omitempty"`
 	// CIDRs to deny
-	DenyCidrs     []*CIDREntry `protobuf:"bytes,3,rep,name=deny_cidrs,json=denyCidrs,proto3" json:"deny_cidrs,omitempty"`
+	DenyCidrs []*CIDREntry `protobuf:"bytes,3,rep,name=deny_cidrs,json=denyCidrs,proto3" json:"deny_cidrs,omitempty"`
+	// DNS configuration
+	Dns           *DnsConfig `protobuf:"bytes,4,opt,name=dns,proto3" json:"dns,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *BulkUpdate) Reset() {
 	*x = BulkUpdate{}
-	mi := &file_v1_control_proto_msgTypes[13]
+	mi := &file_v1_control_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1024,7 +982,7 @@ func (x *BulkUpdate) String() string {
 func (*BulkUpdate) ProtoMessage() {}
 
 func (x *BulkUpdate) ProtoReflect() protoreflect.Message {
-	mi := &file_v1_control_proto_msgTypes[13]
+	mi := &file_v1_control_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1037,7 +995,7 @@ func (x *BulkUpdate) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BulkUpdate.ProtoReflect.Descriptor instead.
 func (*BulkUpdate) Descriptor() ([]byte, []int) {
-	return file_v1_control_proto_rawDescGZIP(), []int{13}
+	return file_v1_control_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *BulkUpdate) GetMode() PolicyMode {
@@ -1061,6 +1019,87 @@ func (x *BulkUpdate) GetDenyCidrs() []*CIDREntry {
 	return nil
 }
 
+func (x *BulkUpdate) GetDns() *DnsConfig {
+	if x != nil {
+		return x.Dns
+	}
+	return nil
+}
+
+// DnsConfig contains the complete DNS filtering configuration.
+type DnsConfig struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// DNS filtering mode
+	Mode DnsMode `protobuf:"varint,1,opt,name=mode,proto3,enum=superebpf.v1.DnsMode" json:"mode,omitempty"`
+	// Domains to allow (when mode is ALLOWLIST or to override in DENYLIST)
+	AllowDomains []*DomainEntry `protobuf:"bytes,2,rep,name=allow_domains,json=allowDomains,proto3" json:"allow_domains,omitempty"`
+	// Domains to deny (when mode is DENYLIST or to override in ALLOWLIST)
+	DenyDomains []*DomainEntry `protobuf:"bytes,3,rep,name=deny_domains,json=denyDomains,proto3" json:"deny_domains,omitempty"`
+	// Upstream DNS servers to use for resolution (optional, uses system default
+	// if empty)
+	UpstreamServers []string `protobuf:"bytes,4,rep,name=upstream_servers,json=upstreamServers,proto3" json:"upstream_servers,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *DnsConfig) Reset() {
+	*x = DnsConfig{}
+	mi := &file_v1_control_proto_msgTypes[11]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DnsConfig) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DnsConfig) ProtoMessage() {}
+
+func (x *DnsConfig) ProtoReflect() protoreflect.Message {
+	mi := &file_v1_control_proto_msgTypes[11]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DnsConfig.ProtoReflect.Descriptor instead.
+func (*DnsConfig) Descriptor() ([]byte, []int) {
+	return file_v1_control_proto_rawDescGZIP(), []int{11}
+}
+
+func (x *DnsConfig) GetMode() DnsMode {
+	if x != nil {
+		return x.Mode
+	}
+	return DnsMode_DNS_MODE_UNSPECIFIED
+}
+
+func (x *DnsConfig) GetAllowDomains() []*DomainEntry {
+	if x != nil {
+		return x.AllowDomains
+	}
+	return nil
+}
+
+func (x *DnsConfig) GetDenyDomains() []*DomainEntry {
+	if x != nil {
+		return x.DenyDomains
+	}
+	return nil
+}
+
+func (x *DnsConfig) GetUpstreamServers() []string {
+	if x != nil {
+		return x.UpstreamServers
+	}
+	return nil
+}
+
 // CIDREntry represents a CIDR with optional TTL.
 type CIDREntry struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -1072,7 +1111,7 @@ type CIDREntry struct {
 
 func (x *CIDREntry) Reset() {
 	*x = CIDREntry{}
-	mi := &file_v1_control_proto_msgTypes[14]
+	mi := &file_v1_control_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1084,7 +1123,7 @@ func (x *CIDREntry) String() string {
 func (*CIDREntry) ProtoMessage() {}
 
 func (x *CIDREntry) ProtoReflect() protoreflect.Message {
-	mi := &file_v1_control_proto_msgTypes[14]
+	mi := &file_v1_control_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1097,7 +1136,7 @@ func (x *CIDREntry) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CIDREntry.ProtoReflect.Descriptor instead.
 func (*CIDREntry) Descriptor() ([]byte, []int) {
-	return file_v1_control_proto_rawDescGZIP(), []int{14}
+	return file_v1_control_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *CIDREntry) GetCidr() string {
@@ -1112,6 +1151,106 @@ func (x *CIDREntry) GetTtl() *durationpb.Duration {
 		return x.Ttl
 	}
 	return nil
+}
+
+// DomainEntry represents a domain with optional settings.
+type DomainEntry struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The domain (e.g., "example.com")
+	Domain string `protobuf:"bytes,1,opt,name=domain,proto3" json:"domain,omitempty"`
+	// Whether to include subdomains (e.g., "*.example.com")
+	IncludeSubdomains bool `protobuf:"varint,2,opt,name=include_subdomains,json=includeSubdomains,proto3" json:"include_subdomains,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
+}
+
+func (x *DomainEntry) Reset() {
+	*x = DomainEntry{}
+	mi := &file_v1_control_proto_msgTypes[13]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DomainEntry) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DomainEntry) ProtoMessage() {}
+
+func (x *DomainEntry) ProtoReflect() protoreflect.Message {
+	mi := &file_v1_control_proto_msgTypes[13]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DomainEntry.ProtoReflect.Descriptor instead.
+func (*DomainEntry) Descriptor() ([]byte, []int) {
+	return file_v1_control_proto_rawDescGZIP(), []int{13}
+}
+
+func (x *DomainEntry) GetDomain() string {
+	if x != nil {
+		return x.Domain
+	}
+	return ""
+}
+
+func (x *DomainEntry) GetIncludeSubdomains() bool {
+	if x != nil {
+		return x.IncludeSubdomains
+	}
+	return false
+}
+
+// SetDnsMode changes the DNS filtering mode.
+type SetDnsMode struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Mode          DnsMode                `protobuf:"varint,1,opt,name=mode,proto3,enum=superebpf.v1.DnsMode" json:"mode,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SetDnsMode) Reset() {
+	*x = SetDnsMode{}
+	mi := &file_v1_control_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SetDnsMode) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SetDnsMode) ProtoMessage() {}
+
+func (x *SetDnsMode) ProtoReflect() protoreflect.Message {
+	mi := &file_v1_control_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SetDnsMode.ProtoReflect.Descriptor instead.
+func (*SetDnsMode) Descriptor() ([]byte, []int) {
+	return file_v1_control_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *SetDnsMode) GetMode() DnsMode {
+	if x != nil {
+		return x.Mode
+	}
+	return DnsMode_DNS_MODE_UNSPECIFIED
 }
 
 var File_v1_control_proto protoreflect.FileDescriptor
@@ -1130,24 +1269,28 @@ const file_v1_control_proto_rawDesc = "" +
 	"\vSyncRequest\x12\x1b\n" +
 	"\tdaemon_id\x18\x01 \x01(\tR\bdaemonId\x12\x1a\n" +
 	"\bhostname\x18\x02 \x01(\tR\bhostname\x12:\n" +
-	"\vattachments\x18\x03 \x03(\v2\x18.superebpf.v1.AttachmentR\vattachments\"\x95\x02\n" +
+	"\vattachments\x18\x03 \x03(\v2\x18.superebpf.v1.AttachmentR\vattachments\"\xc7\x02\n" +
 	"\n" +
 	"Attachment\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x16\n" +
 	"\x06target\x18\x02 \x01(\tR\x06target\x120\n" +
 	"\x04type\x18\x03 \x01(\x0e2\x1c.superebpf.v1.AttachmentTypeR\x04type\x12,\n" +
-	"\x04mode\x18\x04 \x01(\x0e2\x18.superebpf.v1.PolicyModeR\x04mode\x12B\n" +
-	"\bmetadata\x18\x05 \x03(\v2&.superebpf.v1.Attachment.MetadataEntryR\bmetadata\x1a;\n" +
+	"\x04mode\x18\x04 \x01(\x0e2\x18.superebpf.v1.PolicyModeR\x04mode\x120\n" +
+	"\bdns_mode\x18\x05 \x01(\x0e2\x15.superebpf.v1.DnsModeR\adnsMode\x12B\n" +
+	"\bmetadata\x18\x06 \x03(\v2&.superebpf.v1.Attachment.MetadataEntryR\bmetadata\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x95\x02\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xe8\x02\n" +
 	"\n" +
 	"Subscribed\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x16\n" +
 	"\x06target\x18\x02 \x01(\tR\x06target\x120\n" +
 	"\x04type\x18\x03 \x01(\x0e2\x1c.superebpf.v1.AttachmentTypeR\x04type\x12,\n" +
-	"\x04mode\x18\x04 \x01(\x0e2\x18.superebpf.v1.PolicyModeR\x04mode\x12B\n" +
-	"\bmetadata\x18\x05 \x03(\v2&.superebpf.v1.Subscribed.MetadataEntryR\bmetadata\x1a;\n" +
+	"\x04mode\x18\x04 \x01(\x0e2\x18.superebpf.v1.PolicyModeR\x04mode\x120\n" +
+	"\bdns_mode\x18\x05 \x01(\x0e2\x15.superebpf.v1.DnsModeR\adnsMode\x12\x1f\n" +
+	"\vdns_address\x18\x06 \x01(\tR\n" +
+	"dnsAddress\x12B\n" +
+	"\bmetadata\x18\a \x03(\v2&.superebpf.v1.Subscribed.MetadataEntryR\bmetadata\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"m\n" +
@@ -1156,45 +1299,57 @@ const file_v1_control_proto_rawDesc = "" +
 	"\x06reason\x18\x02 \x01(\x0e2\x1f.superebpf.v1.UnsubscribeReasonR\x06reason\x12\x14\n" +
 	"\x05error\x18\x03 \x01(\tR\x05error\"@\n" +
 	"\tHeartbeat\x123\n" +
-	"\x05stats\x18\x01 \x03(\v2\x1d.superebpf.v1.AttachmentStatsR\x05stats\"s\n" +
+	"\x05stats\x18\x01 \x03(\v2\x1d.superebpf.v1.AttachmentStatsR\x05stats\"\xd3\x01\n" +
 	"\x0fAttachmentStats\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12'\n" +
 	"\x0fpackets_allowed\x18\x02 \x01(\x04R\x0epacketsAllowed\x12'\n" +
-	"\x0fpackets_blocked\x18\x03 \x01(\x04R\x0epacketsBlocked\"\xfe\x02\n" +
+	"\x0fpackets_blocked\x18\x03 \x01(\x04R\x0epacketsBlocked\x12.\n" +
+	"\x13dns_queries_allowed\x18\x04 \x01(\x04R\x11dnsQueriesAllowed\x12.\n" +
+	"\x13dns_queries_blocked\x18\x05 \x01(\x04R\x11dnsQueriesBlocked\"\xc8\x04\n" +
 	"\x0eControlCommand\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x122\n" +
 	"\bsync_ack\x18\x02 \x01(\v2\x15.superebpf.v1.SyncAckH\x00R\asyncAck\x122\n" +
 	"\bset_mode\x18\x03 \x01(\v2\x15.superebpf.v1.SetModeH\x00R\asetMode\x128\n" +
 	"\n" +
-	"allow_cidr\x18\x04 \x01(\v2\x17.superebpf.v1.AllowCIDRH\x00R\tallowCidr\x125\n" +
-	"\tdeny_cidr\x18\x05 \x01(\v2\x16.superebpf.v1.DenyCIDRH\x00R\bdenyCidr\x12;\n" +
-	"\vremove_cidr\x18\x06 \x01(\v2\x18.superebpf.v1.RemoveCIDRH\x00R\n" +
+	"allow_cidr\x18\x04 \x01(\v2\x17.superebpf.v1.CIDREntryH\x00R\tallowCidr\x126\n" +
+	"\tdeny_cidr\x18\x05 \x01(\v2\x17.superebpf.v1.CIDREntryH\x00R\bdenyCidr\x12!\n" +
+	"\vremove_cidr\x18\x06 \x01(\tH\x00R\n" +
 	"removeCidr\x12;\n" +
 	"\vbulk_update\x18\a \x01(\v2\x18.superebpf.v1.BulkUpdateH\x00R\n" +
-	"bulkUpdateB\t\n" +
+	"bulkUpdate\x12<\n" +
+	"\fset_dns_mode\x18\b \x01(\v2\x18.superebpf.v1.SetDnsModeH\x00R\n" +
+	"setDnsMode\x12>\n" +
+	"\fallow_domain\x18\t \x01(\v2\x19.superebpf.v1.DomainEntryH\x00R\vallowDomain\x12<\n" +
+	"\vdeny_domain\x18\n" +
+	" \x01(\v2\x19.superebpf.v1.DomainEntryH\x00R\n" +
+	"denyDomain\x12%\n" +
+	"\rremove_domain\x18\v \x01(\tH\x00R\fremoveDomainB\t\n" +
 	"\acommand\"\t\n" +
 	"\aSyncAck\"7\n" +
 	"\aSetMode\x12,\n" +
-	"\x04mode\x18\x01 \x01(\x0e2\x18.superebpf.v1.PolicyModeR\x04mode\"L\n" +
-	"\tAllowCIDR\x12\x12\n" +
-	"\x04cidr\x18\x01 \x01(\tR\x04cidr\x12+\n" +
-	"\x03ttl\x18\x02 \x01(\v2\x19.google.protobuf.DurationR\x03ttl\"K\n" +
-	"\bDenyCIDR\x12\x12\n" +
-	"\x04cidr\x18\x01 \x01(\tR\x04cidr\x12+\n" +
-	"\x03ttl\x18\x02 \x01(\v2\x19.google.protobuf.DurationR\x03ttl\" \n" +
-	"\n" +
-	"RemoveCIDR\x12\x12\n" +
-	"\x04cidr\x18\x01 \x01(\tR\x04cidr\"\xac\x01\n" +
+	"\x04mode\x18\x01 \x01(\x0e2\x18.superebpf.v1.PolicyModeR\x04mode\"\xd7\x01\n" +
 	"\n" +
 	"BulkUpdate\x12,\n" +
 	"\x04mode\x18\x01 \x01(\x0e2\x18.superebpf.v1.PolicyModeR\x04mode\x128\n" +
 	"\vallow_cidrs\x18\x02 \x03(\v2\x17.superebpf.v1.CIDREntryR\n" +
 	"allowCidrs\x126\n" +
 	"\n" +
-	"deny_cidrs\x18\x03 \x03(\v2\x17.superebpf.v1.CIDREntryR\tdenyCidrs\"L\n" +
+	"deny_cidrs\x18\x03 \x03(\v2\x17.superebpf.v1.CIDREntryR\tdenyCidrs\x12)\n" +
+	"\x03dns\x18\x04 \x01(\v2\x17.superebpf.v1.DnsConfigR\x03dns\"\xdf\x01\n" +
+	"\tDnsConfig\x12)\n" +
+	"\x04mode\x18\x01 \x01(\x0e2\x15.superebpf.v1.DnsModeR\x04mode\x12>\n" +
+	"\rallow_domains\x18\x02 \x03(\v2\x19.superebpf.v1.DomainEntryR\fallowDomains\x12<\n" +
+	"\fdeny_domains\x18\x03 \x03(\v2\x19.superebpf.v1.DomainEntryR\vdenyDomains\x12)\n" +
+	"\x10upstream_servers\x18\x04 \x03(\tR\x0fupstreamServers\"L\n" +
 	"\tCIDREntry\x12\x12\n" +
 	"\x04cidr\x18\x01 \x01(\tR\x04cidr\x12+\n" +
-	"\x03ttl\x18\x02 \x01(\v2\x19.google.protobuf.DurationR\x03ttl*\x96\x01\n" +
+	"\x03ttl\x18\x02 \x01(\v2\x19.google.protobuf.DurationR\x03ttl\"T\n" +
+	"\vDomainEntry\x12\x16\n" +
+	"\x06domain\x18\x01 \x01(\tR\x06domain\x12-\n" +
+	"\x12include_subdomains\x18\x02 \x01(\bR\x11includeSubdomains\"7\n" +
+	"\n" +
+	"SetDnsMode\x12)\n" +
+	"\x04mode\x18\x01 \x01(\x0e2\x15.superebpf.v1.DnsModeR\x04mode*\x96\x01\n" +
 	"\x11UnsubscribeReason\x12\"\n" +
 	"\x1eUNSUBSCRIBE_REASON_UNSPECIFIED\x10\x00\x12\x1e\n" +
 	"\x1aUNSUBSCRIBE_REASON_REMOVED\x10\x01\x12\x1f\n" +
@@ -1229,16 +1384,17 @@ var file_v1_control_proto_goTypes = []any{
 	(*ControlCommand)(nil),      // 8: superebpf.v1.ControlCommand
 	(*SyncAck)(nil),             // 9: superebpf.v1.SyncAck
 	(*SetMode)(nil),             // 10: superebpf.v1.SetMode
-	(*AllowCIDR)(nil),           // 11: superebpf.v1.AllowCIDR
-	(*DenyCIDR)(nil),            // 12: superebpf.v1.DenyCIDR
-	(*RemoveCIDR)(nil),          // 13: superebpf.v1.RemoveCIDR
-	(*BulkUpdate)(nil),          // 14: superebpf.v1.BulkUpdate
-	(*CIDREntry)(nil),           // 15: superebpf.v1.CIDREntry
+	(*BulkUpdate)(nil),          // 11: superebpf.v1.BulkUpdate
+	(*DnsConfig)(nil),           // 12: superebpf.v1.DnsConfig
+	(*CIDREntry)(nil),           // 13: superebpf.v1.CIDREntry
+	(*DomainEntry)(nil),         // 14: superebpf.v1.DomainEntry
+	(*SetDnsMode)(nil),          // 15: superebpf.v1.SetDnsMode
 	nil,                         // 16: superebpf.v1.Attachment.MetadataEntry
 	nil,                         // 17: superebpf.v1.Subscribed.MetadataEntry
 	(AttachmentType)(0),         // 18: superebpf.v1.AttachmentType
 	(PolicyMode)(0),             // 19: superebpf.v1.PolicyMode
-	(*durationpb.Duration)(nil), // 20: google.protobuf.Duration
+	(DnsMode)(0),                // 20: superebpf.v1.DnsMode
+	(*durationpb.Duration)(nil), // 21: google.protobuf.Duration
 }
 var file_v1_control_proto_depIdxs = []int32{
 	2,  // 0: superebpf.v1.DaemonEvent.sync:type_name -> superebpf.v1.SyncRequest
@@ -1248,32 +1404,39 @@ var file_v1_control_proto_depIdxs = []int32{
 	3,  // 4: superebpf.v1.SyncRequest.attachments:type_name -> superebpf.v1.Attachment
 	18, // 5: superebpf.v1.Attachment.type:type_name -> superebpf.v1.AttachmentType
 	19, // 6: superebpf.v1.Attachment.mode:type_name -> superebpf.v1.PolicyMode
-	16, // 7: superebpf.v1.Attachment.metadata:type_name -> superebpf.v1.Attachment.MetadataEntry
-	18, // 8: superebpf.v1.Subscribed.type:type_name -> superebpf.v1.AttachmentType
-	19, // 9: superebpf.v1.Subscribed.mode:type_name -> superebpf.v1.PolicyMode
-	17, // 10: superebpf.v1.Subscribed.metadata:type_name -> superebpf.v1.Subscribed.MetadataEntry
-	0,  // 11: superebpf.v1.Unsubscribed.reason:type_name -> superebpf.v1.UnsubscribeReason
-	7,  // 12: superebpf.v1.Heartbeat.stats:type_name -> superebpf.v1.AttachmentStats
-	9,  // 13: superebpf.v1.ControlCommand.sync_ack:type_name -> superebpf.v1.SyncAck
-	10, // 14: superebpf.v1.ControlCommand.set_mode:type_name -> superebpf.v1.SetMode
-	11, // 15: superebpf.v1.ControlCommand.allow_cidr:type_name -> superebpf.v1.AllowCIDR
-	12, // 16: superebpf.v1.ControlCommand.deny_cidr:type_name -> superebpf.v1.DenyCIDR
-	13, // 17: superebpf.v1.ControlCommand.remove_cidr:type_name -> superebpf.v1.RemoveCIDR
-	14, // 18: superebpf.v1.ControlCommand.bulk_update:type_name -> superebpf.v1.BulkUpdate
-	19, // 19: superebpf.v1.SetMode.mode:type_name -> superebpf.v1.PolicyMode
-	20, // 20: superebpf.v1.AllowCIDR.ttl:type_name -> google.protobuf.Duration
-	20, // 21: superebpf.v1.DenyCIDR.ttl:type_name -> google.protobuf.Duration
-	19, // 22: superebpf.v1.BulkUpdate.mode:type_name -> superebpf.v1.PolicyMode
-	15, // 23: superebpf.v1.BulkUpdate.allow_cidrs:type_name -> superebpf.v1.CIDREntry
-	15, // 24: superebpf.v1.BulkUpdate.deny_cidrs:type_name -> superebpf.v1.CIDREntry
-	20, // 25: superebpf.v1.CIDREntry.ttl:type_name -> google.protobuf.Duration
-	1,  // 26: superebpf.v1.ControlPlane.Connect:input_type -> superebpf.v1.DaemonEvent
-	8,  // 27: superebpf.v1.ControlPlane.Connect:output_type -> superebpf.v1.ControlCommand
-	27, // [27:28] is the sub-list for method output_type
-	26, // [26:27] is the sub-list for method input_type
-	26, // [26:26] is the sub-list for extension type_name
-	26, // [26:26] is the sub-list for extension extendee
-	0,  // [0:26] is the sub-list for field type_name
+	20, // 7: superebpf.v1.Attachment.dns_mode:type_name -> superebpf.v1.DnsMode
+	16, // 8: superebpf.v1.Attachment.metadata:type_name -> superebpf.v1.Attachment.MetadataEntry
+	18, // 9: superebpf.v1.Subscribed.type:type_name -> superebpf.v1.AttachmentType
+	19, // 10: superebpf.v1.Subscribed.mode:type_name -> superebpf.v1.PolicyMode
+	20, // 11: superebpf.v1.Subscribed.dns_mode:type_name -> superebpf.v1.DnsMode
+	17, // 12: superebpf.v1.Subscribed.metadata:type_name -> superebpf.v1.Subscribed.MetadataEntry
+	0,  // 13: superebpf.v1.Unsubscribed.reason:type_name -> superebpf.v1.UnsubscribeReason
+	7,  // 14: superebpf.v1.Heartbeat.stats:type_name -> superebpf.v1.AttachmentStats
+	9,  // 15: superebpf.v1.ControlCommand.sync_ack:type_name -> superebpf.v1.SyncAck
+	10, // 16: superebpf.v1.ControlCommand.set_mode:type_name -> superebpf.v1.SetMode
+	13, // 17: superebpf.v1.ControlCommand.allow_cidr:type_name -> superebpf.v1.CIDREntry
+	13, // 18: superebpf.v1.ControlCommand.deny_cidr:type_name -> superebpf.v1.CIDREntry
+	11, // 19: superebpf.v1.ControlCommand.bulk_update:type_name -> superebpf.v1.BulkUpdate
+	15, // 20: superebpf.v1.ControlCommand.set_dns_mode:type_name -> superebpf.v1.SetDnsMode
+	14, // 21: superebpf.v1.ControlCommand.allow_domain:type_name -> superebpf.v1.DomainEntry
+	14, // 22: superebpf.v1.ControlCommand.deny_domain:type_name -> superebpf.v1.DomainEntry
+	19, // 23: superebpf.v1.SetMode.mode:type_name -> superebpf.v1.PolicyMode
+	19, // 24: superebpf.v1.BulkUpdate.mode:type_name -> superebpf.v1.PolicyMode
+	13, // 25: superebpf.v1.BulkUpdate.allow_cidrs:type_name -> superebpf.v1.CIDREntry
+	13, // 26: superebpf.v1.BulkUpdate.deny_cidrs:type_name -> superebpf.v1.CIDREntry
+	12, // 27: superebpf.v1.BulkUpdate.dns:type_name -> superebpf.v1.DnsConfig
+	20, // 28: superebpf.v1.DnsConfig.mode:type_name -> superebpf.v1.DnsMode
+	14, // 29: superebpf.v1.DnsConfig.allow_domains:type_name -> superebpf.v1.DomainEntry
+	14, // 30: superebpf.v1.DnsConfig.deny_domains:type_name -> superebpf.v1.DomainEntry
+	21, // 31: superebpf.v1.CIDREntry.ttl:type_name -> google.protobuf.Duration
+	20, // 32: superebpf.v1.SetDnsMode.mode:type_name -> superebpf.v1.DnsMode
+	1,  // 33: superebpf.v1.ControlPlane.Connect:input_type -> superebpf.v1.DaemonEvent
+	8,  // 34: superebpf.v1.ControlPlane.Connect:output_type -> superebpf.v1.ControlCommand
+	34, // [34:35] is the sub-list for method output_type
+	33, // [33:34] is the sub-list for method input_type
+	33, // [33:33] is the sub-list for extension type_name
+	33, // [33:33] is the sub-list for extension extendee
+	0,  // [0:33] is the sub-list for field type_name
 }
 
 func init() { file_v1_control_proto_init() }
@@ -1295,6 +1458,10 @@ func file_v1_control_proto_init() {
 		(*ControlCommand_DenyCidr)(nil),
 		(*ControlCommand_RemoveCidr)(nil),
 		(*ControlCommand_BulkUpdate)(nil),
+		(*ControlCommand_SetDnsMode)(nil),
+		(*ControlCommand_AllowDomain)(nil),
+		(*ControlCommand_DenyDomain)(nil),
+		(*ControlCommand_RemoveDomain)(nil),
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{

@@ -56,10 +56,12 @@ message Attachment {
   string target = 2;
   // Type of attachment
   AttachmentType type = 3;
-  // Current policy mode
+  // Current IP filter policy mode
   PolicyMode mode = 4;
+  // Current DNS filtering mode
+  DnsMode dns_mode = 5;
   // User-defined metadata (VM ID, tenant, etc.)
-  map<string, string> metadata = 5;
+  map<string, string> metadata = 6;
 }
 
 // Subscribed notifies that a new filter attachment is now managed.
@@ -70,10 +72,15 @@ message Subscribed {
   string target = 2;
   // Type of attachment
   AttachmentType type = 3;
-  // Initial policy mode
+  // Initial IP filter policy mode
   PolicyMode mode = 4;
+  // Initial DNS filtering mode
+  DnsMode dns_mode = 5;
+  // DNS server address for this attachment (e.g., "10.0.0.1:53")
+  // Containers should use this as their DNS resolver
+  string dns_address = 6;
   // User-defined metadata for associating with VM ID, tenant, etc.
-  map<string, string> metadata = 5;
+  map<string, string> metadata = 7;
 }
 
 // Unsubscribed notifies that an attachment is no longer managed.
@@ -98,15 +105,15 @@ enum UnsubscribeReason {
 }
 
 // Heartbeat is sent periodically to keep the connection alive and report stats.
-message Heartbeat {
-  repeated AttachmentStats stats = 1;
-}
+message Heartbeat { repeated AttachmentStats stats = 1; }
 
 // AttachmentStats reports statistics for a single attachment.
 message AttachmentStats {
   string id = 1;
   uint64 packets_allowed = 2;
   uint64 packets_blocked = 3;
+  uint64 dns_queries_allowed = 4;
+  uint64 dns_queries_blocked = 5;
 }
 
 // ControlCommand represents commands sent from the control plane to the daemon.
@@ -117,16 +124,24 @@ message ControlCommand {
   oneof command {
     // Acknowledge sync (sent after receiving SyncRequest)
     SyncAck sync_ack = 2;
-    // Change the policy mode
+    // Change the IP filter policy mode
     SetMode set_mode = 3;
     // Add a CIDR to the allowlist
-    AllowCIDR allow_cidr = 4;
+    CIDREntry allow_cidr = 4;
     // Add a CIDR to the denylist
-    DenyCIDR deny_cidr = 5;
+    CIDREntry deny_cidr = 5;
     // Remove a CIDR from allow/deny lists
-    RemoveCIDR remove_cidr = 6;
+    string remove_cidr = 6;
     // Bulk update - set complete state for an attachment
     BulkUpdate bulk_update = 7;
+    // Change the DNS mode
+    SetDnsMode set_dns_mode = 8;
+    // Add a domain to the DNS allowlist
+    DomainEntry allow_domain = 9;
+    // Add a domain to the DNS denylist
+    DomainEntry deny_domain = 10;
+    // Remove a domain from DNS allow/deny lists
+    string remove_domain = 11;
   }
 }
 
@@ -136,35 +151,30 @@ message SyncAck {}
 // SetMode changes the policy mode for an attachment.
 message SetMode { PolicyMode mode = 1; }
 
-// AllowCIDR adds a CIDR to the allowlist.
-message AllowCIDR {
-  // IPv4 or IPv6 CIDR (e.g., "10.0.0.0/8", "2001:db8::/32", or single IP "1.2.3.4")
-  string cidr = 1;
-  // Optional TTL - daemon will automatically remove after this duration.
-  // Zero or unset means no expiration.
-  google.protobuf.Duration ttl = 2;
-}
-
-// DenyCIDR adds a CIDR to the denylist.
-message DenyCIDR {
-  // IPv4 or IPv6 CIDR
-  string cidr = 1;
-  // Optional TTL for automatic expiration
-  google.protobuf.Duration ttl = 2;
-}
-
-// RemoveCIDR removes a CIDR from both allow and deny lists.
-message RemoveCIDR { string cidr = 1; }
-
 // BulkUpdate sets the complete state for an attachment.
 // Clears existing rules and replaces with the provided state.
 message BulkUpdate {
-  // Policy mode to set
+  // IP filter policy mode
   PolicyMode mode = 1;
   // CIDRs to allow
   repeated CIDREntry allow_cidrs = 2;
   // CIDRs to deny
   repeated CIDREntry deny_cidrs = 3;
+  // DNS configuration
+  DnsConfig dns = 4;
+}
+
+// DnsConfig contains the complete DNS filtering configuration.
+message DnsConfig {
+  // DNS filtering mode
+  DnsMode mode = 1;
+  // Domains to allow (when mode is ALLOWLIST or to override in DENYLIST)
+  repeated DomainEntry allow_domains = 2;
+  // Domains to deny (when mode is DENYLIST or to override in ALLOWLIST)
+  repeated DomainEntry deny_domains = 3;
+  // Upstream DNS servers to use for resolution (optional, uses system default
+  // if empty)
+  repeated string upstream_servers = 4;
 }
 
 // CIDREntry represents a CIDR with optional TTL.
@@ -172,3 +182,14 @@ message CIDREntry {
   string cidr = 1;
   google.protobuf.Duration ttl = 2;
 }
+
+// DomainEntry represents a domain with optional settings.
+message DomainEntry {
+  // The domain (e.g., "example.com")
+  string domain = 1;
+  // Whether to include subdomains (e.g., "*.example.com")
+  bool include_subdomains = 2;
+}
+
+// SetDnsMode changes the DNS filtering mode.
+message SetDnsMode { DnsMode mode = 1; }

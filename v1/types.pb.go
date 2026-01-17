@@ -131,6 +131,66 @@ func (AttachmentType) EnumDescriptor() ([]byte, []int) {
 	return file_v1_types_proto_rawDescGZIP(), []int{1}
 }
 
+// DnsMode defines the DNS filtering behavior.
+type DnsMode int32
+
+const (
+	DnsMode_DNS_MODE_UNSPECIFIED DnsMode = 0
+	// Disabled - no DNS interception, pure IP filtering
+	DnsMode_DNS_MODE_DISABLED DnsMode = 1
+	// Allowlist - only resolve allowed domains, block all else
+	DnsMode_DNS_MODE_ALLOWLIST DnsMode = 2
+	// Denylist - block denied domains, allow all else
+	DnsMode_DNS_MODE_DENYLIST DnsMode = 3
+	// Proxy - forward all queries to control plane for decision
+	DnsMode_DNS_MODE_PROXY DnsMode = 4
+)
+
+// Enum value maps for DnsMode.
+var (
+	DnsMode_name = map[int32]string{
+		0: "DNS_MODE_UNSPECIFIED",
+		1: "DNS_MODE_DISABLED",
+		2: "DNS_MODE_ALLOWLIST",
+		3: "DNS_MODE_DENYLIST",
+		4: "DNS_MODE_PROXY",
+	}
+	DnsMode_value = map[string]int32{
+		"DNS_MODE_UNSPECIFIED": 0,
+		"DNS_MODE_DISABLED":    1,
+		"DNS_MODE_ALLOWLIST":   2,
+		"DNS_MODE_DENYLIST":    3,
+		"DNS_MODE_PROXY":       4,
+	}
+)
+
+func (x DnsMode) Enum() *DnsMode {
+	p := new(DnsMode)
+	*p = x
+	return p
+}
+
+func (x DnsMode) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (DnsMode) Descriptor() protoreflect.EnumDescriptor {
+	return file_v1_types_proto_enumTypes[2].Descriptor()
+}
+
+func (DnsMode) Type() protoreflect.EnumType {
+	return &file_v1_types_proto_enumTypes[2]
+}
+
+func (x DnsMode) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use DnsMode.Descriptor instead.
+func (DnsMode) EnumDescriptor() ([]byte, []int) {
+	return file_v1_types_proto_rawDescGZIP(), []int{2}
+}
+
 var File_v1_types_proto protoreflect.FileDescriptor
 
 const file_v1_types_proto_rawDesc = "" +
@@ -146,7 +206,13 @@ const file_v1_types_proto_rawDesc = "" +
 	"\x0eAttachmentType\x12\x1f\n" +
 	"\x1bATTACHMENT_TYPE_UNSPECIFIED\x10\x00\x12\x16\n" +
 	"\x12ATTACHMENT_TYPE_TC\x10\x01\x12\x1a\n" +
-	"\x16ATTACHMENT_TYPE_CGROUP\x10\x02B2Z0github.com/danthegoodman1/superebpf/api/v1;apiv1b\x06proto3"
+	"\x16ATTACHMENT_TYPE_CGROUP\x10\x02*}\n" +
+	"\aDnsMode\x12\x18\n" +
+	"\x14DNS_MODE_UNSPECIFIED\x10\x00\x12\x15\n" +
+	"\x11DNS_MODE_DISABLED\x10\x01\x12\x16\n" +
+	"\x12DNS_MODE_ALLOWLIST\x10\x02\x12\x15\n" +
+	"\x11DNS_MODE_DENYLIST\x10\x03\x12\x12\n" +
+	"\x0eDNS_MODE_PROXY\x10\x04B2Z0github.com/danthegoodman1/superebpf/api/v1;apiv1b\x06proto3"
 
 var (
 	file_v1_types_proto_rawDescOnce sync.Once
@@ -160,10 +226,11 @@ func file_v1_types_proto_rawDescGZIP() []byte {
 	return file_v1_types_proto_rawDescData
 }
 
-var file_v1_types_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
+var file_v1_types_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
 var file_v1_types_proto_goTypes = []any{
 	(PolicyMode)(0),     // 0: superebpf.v1.PolicyMode
 	(AttachmentType)(0), // 1: superebpf.v1.AttachmentType
+	(DnsMode)(0),        // 2: superebpf.v1.DnsMode
 }
 var file_v1_types_proto_depIdxs = []int32{
 	0, // [0:0] is the sub-list for method output_type
@@ -183,7 +250,7 @@ func file_v1_types_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_v1_types_proto_rawDesc), len(file_v1_types_proto_rawDesc)),
-			NumEnums:      2,
+			NumEnums:      3,
 			NumMessages:   0,
 			NumExtensions: 0,
 			NumServices:   0,
