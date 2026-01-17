@@ -7,11 +7,12 @@
 package apiv1
 
 import (
-	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
-	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	reflect "reflect"
 	sync "sync"
 	unsafe "unsafe"
+
+	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
+	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 )
 
 const (
@@ -195,7 +196,7 @@ var File_v1_types_proto protoreflect.FileDescriptor
 
 const file_v1_types_proto_rawDesc = "" +
 	"\n" +
-	"\x0ev1/types.proto\x12\fsuperebpf.v1*\x93\x01\n" +
+	"\x0ev1/types.proto\x12\fnetfence.v1*\x93\x01\n" +
 	"\n" +
 	"PolicyMode\x12\x1b\n" +
 	"\x17POLICY_MODE_UNSPECIFIED\x10\x00\x12\x18\n" +
@@ -212,7 +213,7 @@ const file_v1_types_proto_rawDesc = "" +
 	"\x11DNS_MODE_DISABLED\x10\x01\x12\x16\n" +
 	"\x12DNS_MODE_ALLOWLIST\x10\x02\x12\x15\n" +
 	"\x11DNS_MODE_DENYLIST\x10\x03\x12\x12\n" +
-	"\x0eDNS_MODE_PROXY\x10\x04B2Z0github.com/danthegoodman1/superebpf/api/v1;apiv1b\x06proto3"
+	"\x0eDNS_MODE_PROXY\x10\x04B2Z0github.com/danthegoodman1/netfence/api/v1;apiv1b\x06proto3"
 
 var (
 	file_v1_types_proto_rawDescOnce sync.Once
@@ -228,9 +229,9 @@ func file_v1_types_proto_rawDescGZIP() []byte {
 
 var file_v1_types_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
 var file_v1_types_proto_goTypes = []any{
-	(PolicyMode)(0),     // 0: superebpf.v1.PolicyMode
-	(AttachmentType)(0), // 1: superebpf.v1.AttachmentType
-	(DnsMode)(0),        // 2: superebpf.v1.DnsMode
+	(PolicyMode)(0),     // 0: netfence.v1.PolicyMode
+	(AttachmentType)(0), // 1: netfence.v1.AttachmentType
+	(DnsMode)(0),        // 2: netfence.v1.DnsMode
 }
 var file_v1_types_proto_depIdxs = []int32{
 	0, // [0:0] is the sub-list for method output_type

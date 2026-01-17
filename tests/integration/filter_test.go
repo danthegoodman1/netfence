@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/danthegoodman1/superebpf/pkg/filter"
+	"github.com/danthegoodman1/netfence/pkg/filter"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -129,7 +129,7 @@ func TestCgroupBlockAll(t *testing.T) {
 	cleanup := startTestServer(t)
 	defer cleanup()
 
-	cgroupPath, cgroupCleanup := setupTestCgroup(t, "superebpf-blockall-test")
+	cgroupPath, cgroupCleanup := setupTestCgroup(t, "netfence-blockall-test")
 	defer cgroupCleanup()
 
 	// Verify connections work without filter
@@ -164,7 +164,7 @@ func TestCgroupDisabled(t *testing.T) {
 	cleanup := startTestServer(t)
 	defer cleanup()
 
-	cgroupPath, cgroupCleanup := setupTestCgroup(t, "superebpf-disabled-test")
+	cgroupPath, cgroupCleanup := setupTestCgroup(t, "netfence-disabled-test")
 	defer cgroupCleanup()
 
 	f, err := filter.NewCgroupFilter(cgroupPath, filter.ModeDisabled)
@@ -190,7 +190,7 @@ func TestCgroupAllowlist(t *testing.T) {
 	cleanup := startTestServer(t)
 	defer cleanup()
 
-	cgroupPath, cgroupCleanup := setupTestCgroup(t, "superebpf-allowlist-test")
+	cgroupPath, cgroupCleanup := setupTestCgroup(t, "netfence-allowlist-test")
 	defer cgroupCleanup()
 
 	f, err := filter.NewCgroupFilter(cgroupPath, filter.ModeAllowlist)
@@ -261,7 +261,7 @@ func TestCgroupDenylist(t *testing.T) {
 		t.Skip("test requires root")
 	}
 
-	cgroupPath, cgroupCleanup := setupTestCgroup(t, "superebpf-denylist-test")
+	cgroupPath, cgroupCleanup := setupTestCgroup(t, "netfence-denylist-test")
 	defer cgroupCleanup()
 
 	f, err := filter.NewCgroupFilter(cgroupPath, filter.ModeDenylist)
@@ -322,7 +322,7 @@ func TestCgroupCIDR(t *testing.T) {
 		t.Skip("test requires root")
 	}
 
-	cgroupPath, cgroupCleanup := setupTestCgroup(t, "superebpf-cidr-test")
+	cgroupPath, cgroupCleanup := setupTestCgroup(t, "netfence-cidr-test")
 	defer cgroupCleanup()
 
 	f, err := filter.NewCgroupFilter(cgroupPath, filter.ModeDenylist)
@@ -378,7 +378,7 @@ func TestCgroupModeSwitch(t *testing.T) {
 	cleanup := startTestServer(t)
 	defer cleanup()
 
-	cgroupPath, cgroupCleanup := setupTestCgroup(t, "superebpf-modeswitch-test")
+	cgroupPath, cgroupCleanup := setupTestCgroup(t, "netfence-modeswitch-test")
 	defer cgroupCleanup()
 
 	f, err := filter.NewCgroupFilter(cgroupPath, filter.ModeDisabled)
@@ -408,7 +408,7 @@ func TestTCFilterLoad(t *testing.T) {
 		t.Skip("test requires root")
 	}
 
-	ifaceName := "superebpf-test0"
+	ifaceName := "netfence-test0"
 	require.NoError(t, createDummyInterface(ifaceName))
 	defer deleteDummyInterface(ifaceName)
 
@@ -426,7 +426,7 @@ func TestTCFilterModes(t *testing.T) {
 		t.Skip("test requires root")
 	}
 
-	ifaceName := "superebpf-test0"
+	ifaceName := "netfence-test0"
 	require.NoError(t, createDummyInterface(ifaceName))
 	defer deleteDummyInterface(ifaceName)
 
@@ -456,7 +456,7 @@ func TestTCFilterIPManagement(t *testing.T) {
 		t.Skip("test requires root")
 	}
 
-	ifaceName := "superebpf-test0"
+	ifaceName := "netfence-test0"
 	require.NoError(t, createDummyInterface(ifaceName))
 	defer deleteDummyInterface(ifaceName)
 

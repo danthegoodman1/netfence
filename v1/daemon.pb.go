@@ -7,12 +7,13 @@
 package apiv1
 
 import (
-	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
-	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
-	emptypb "google.golang.org/protobuf/types/known/emptypb"
 	reflect "reflect"
 	sync "sync"
 	unsafe "unsafe"
+
+	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
+	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
+	emptypb "google.golang.org/protobuf/types/known/emptypb"
 )
 
 const (
@@ -84,7 +85,7 @@ type AttachRequest struct {
 	//	*AttachRequest_CgroupPath
 	Target isAttachRequest_Target `protobuf_oneof:"target"`
 	// Initial policy mode (defaults to DISABLED if not specified)
-	Mode PolicyMode `protobuf:"varint,3,opt,name=mode,proto3,enum=superebpf.v1.PolicyMode" json:"mode,omitempty"`
+	Mode PolicyMode `protobuf:"varint,3,opt,name=mode,proto3,enum=netfence.v1.PolicyMode" json:"mode,omitempty"`
 	// User-defined metadata (VM ID, tenant, container ID, etc.)
 	// This is passed to the control plane with the subscription.
 	Metadata      map[string]string `protobuf:"bytes,4,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
@@ -333,11 +334,11 @@ type AttachmentInfo struct {
 	// The target (interface name or cgroup path)
 	Target string `protobuf:"bytes,2,opt,name=target,proto3" json:"target,omitempty"`
 	// Type of attachment
-	Type AttachmentType `protobuf:"varint,3,opt,name=type,proto3,enum=superebpf.v1.AttachmentType" json:"type,omitempty"`
+	Type AttachmentType `protobuf:"varint,3,opt,name=type,proto3,enum=netfence.v1.AttachmentType" json:"type,omitempty"`
 	// IP filter policy mode
-	Mode PolicyMode `protobuf:"varint,4,opt,name=mode,proto3,enum=superebpf.v1.PolicyMode" json:"mode,omitempty"`
+	Mode PolicyMode `protobuf:"varint,4,opt,name=mode,proto3,enum=netfence.v1.PolicyMode" json:"mode,omitempty"`
 	// DNS filtering mode
-	DnsMode DnsMode `protobuf:"varint,5,opt,name=dns_mode,json=dnsMode,proto3,enum=superebpf.v1.DnsMode" json:"dns_mode,omitempty"`
+	DnsMode DnsMode `protobuf:"varint,5,opt,name=dns_mode,json=dnsMode,proto3,enum=netfence.v1.DnsMode" json:"dns_mode,omitempty"`
 	// DNS server address for this attachment
 	DnsAddress        string            `protobuf:"bytes,6,opt,name=dns_address,json=dnsAddress,proto3" json:"dns_address,omitempty"`
 	Metadata          map[string]string `protobuf:"bytes,7,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
@@ -463,7 +464,7 @@ type DaemonStatus struct {
 	DaemonId string                 `protobuf:"bytes,2,opt,name=daemon_id,json=daemonId,proto3" json:"daemon_id,omitempty"`
 	Hostname string                 `protobuf:"bytes,3,opt,name=hostname,proto3" json:"hostname,omitempty"`
 	// Control plane connection state
-	ControlPlaneState   ConnectionState `protobuf:"varint,4,opt,name=control_plane_state,json=controlPlaneState,proto3,enum=superebpf.v1.ConnectionState" json:"control_plane_state,omitempty"`
+	ControlPlaneState   ConnectionState `protobuf:"varint,4,opt,name=control_plane_state,json=controlPlaneState,proto3,enum=netfence.v1.ConnectionState" json:"control_plane_state,omitempty"`
 	ControlPlaneAddress string          `protobuf:"bytes,5,opt,name=control_plane_address,json=controlPlaneAddress,proto3" json:"control_plane_address,omitempty"`
 	AttachmentCount     int32           `protobuf:"varint,6,opt,name=attachment_count,json=attachmentCount,proto3" json:"attachment_count,omitempty"`
 	unknownFields       protoimpl.UnknownFields
@@ -546,13 +547,13 @@ var File_v1_daemon_proto protoreflect.FileDescriptor
 
 const file_v1_daemon_proto_rawDesc = "" +
 	"\n" +
-	"\x0fv1/daemon.proto\x12\fsuperebpf.v1\x1a\x1bgoogle/protobuf/empty.proto\x1a\x0ev1/types.proto\"\x97\x02\n" +
+	"\x0fv1/daemon.proto\x12\fnetfence.v1\x1a\x1bgoogle/protobuf/empty.proto\x1a\x0ev1/types.proto\"\x97\x02\n" +
 	"\rAttachRequest\x12'\n" +
 	"\x0einterface_name\x18\x01 \x01(\tH\x00R\rinterfaceName\x12!\n" +
 	"\vcgroup_path\x18\x02 \x01(\tH\x00R\n" +
 	"cgroupPath\x12,\n" +
-	"\x04mode\x18\x03 \x01(\x0e2\x18.superebpf.v1.PolicyModeR\x04mode\x12E\n" +
-	"\bmetadata\x18\x04 \x03(\v2).superebpf.v1.AttachRequest.MetadataEntryR\bmetadata\x1a;\n" +
+	"\x04mode\x18\x03 \x01(\x0e2\x18.netfence.v1.PolicyModeR\x04mode\x12E\n" +
+	"\bmetadata\x18\x04 \x03(\v2).netfence.v1.AttachRequest.MetadataEntryR\bmetadata\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01B\b\n" +
@@ -564,16 +565,16 @@ const file_v1_daemon_proto_rawDesc = "" +
 	"\rDetachRequest\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\"N\n" +
 	"\fListResponse\x12>\n" +
-	"\vattachments\x18\x01 \x03(\v2\x1c.superebpf.v1.AttachmentInfoR\vattachments\"\xa2\x04\n" +
+	"\vattachments\x18\x01 \x03(\v2\x1c.netfence.v1.AttachmentInfoR\vattachments\"\xa2\x04\n" +
 	"\x0eAttachmentInfo\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x16\n" +
 	"\x06target\x18\x02 \x01(\tR\x06target\x120\n" +
-	"\x04type\x18\x03 \x01(\x0e2\x1c.superebpf.v1.AttachmentTypeR\x04type\x12,\n" +
-	"\x04mode\x18\x04 \x01(\x0e2\x18.superebpf.v1.PolicyModeR\x04mode\x120\n" +
-	"\bdns_mode\x18\x05 \x01(\x0e2\x15.superebpf.v1.DnsModeR\adnsMode\x12\x1f\n" +
+	"\x04type\x18\x03 \x01(\x0e2\x1c.netfence.v1.AttachmentTypeR\x04type\x12,\n" +
+	"\x04mode\x18\x04 \x01(\x0e2\x18.netfence.v1.PolicyModeR\x04mode\x120\n" +
+	"\bdns_mode\x18\x05 \x01(\x0e2\x15.netfence.v1.DnsModeR\adnsMode\x12\x1f\n" +
 	"\vdns_address\x18\x06 \x01(\tR\n" +
 	"dnsAddress\x12F\n" +
-	"\bmetadata\x18\a \x03(\v2*.superebpf.v1.AttachmentInfo.MetadataEntryR\bmetadata\x12'\n" +
+	"\bmetadata\x18\a \x03(\v2*.netfence.v1.AttachmentInfo.MetadataEntryR\bmetadata\x12'\n" +
 	"\x0fpackets_allowed\x18\b \x01(\x04R\x0epacketsAllowed\x12'\n" +
 	"\x0fpackets_blocked\x18\t \x01(\x04R\x0epacketsBlocked\x12.\n" +
 	"\x13dns_queries_allowed\x18\n" +
@@ -586,7 +587,7 @@ const file_v1_daemon_proto_rawDesc = "" +
 	"\aversion\x18\x01 \x01(\tR\aversion\x12\x1b\n" +
 	"\tdaemon_id\x18\x02 \x01(\tR\bdaemonId\x12\x1a\n" +
 	"\bhostname\x18\x03 \x01(\tR\bhostname\x12M\n" +
-	"\x13control_plane_state\x18\x04 \x01(\x0e2\x1d.superebpf.v1.ConnectionStateR\x11controlPlaneState\x122\n" +
+	"\x13control_plane_state\x18\x04 \x01(\x0e2\x1d.netfence.v1.ConnectionStateR\x11controlPlaneState\x122\n" +
 	"\x15control_plane_address\x18\x05 \x01(\tR\x13controlPlaneAddress\x12)\n" +
 	"\x10attachment_count\x18\x06 \x01(\x05R\x0fattachmentCount*\x97\x01\n" +
 	"\x0fConnectionState\x12 \n" +
@@ -595,10 +596,10 @@ const file_v1_daemon_proto_rawDesc = "" +
 	"\x1bCONNECTION_STATE_CONNECTING\x10\x02\x12\x1e\n" +
 	"\x1aCONNECTION_STATE_CONNECTED\x10\x032\x90\x02\n" +
 	"\rDaemonService\x12C\n" +
-	"\x06Attach\x12\x1b.superebpf.v1.AttachRequest\x1a\x1c.superebpf.v1.AttachResponse\x12=\n" +
-	"\x06Detach\x12\x1b.superebpf.v1.DetachRequest\x1a\x16.google.protobuf.Empty\x12:\n" +
-	"\x04List\x12\x16.google.protobuf.Empty\x1a\x1a.superebpf.v1.ListResponse\x12?\n" +
-	"\tGetStatus\x12\x16.google.protobuf.Empty\x1a\x1a.superebpf.v1.DaemonStatusB2Z0github.com/danthegoodman1/superebpf/api/v1;apiv1b\x06proto3"
+	"\x06Attach\x12\x1b.netfence.v1.AttachRequest\x1a\x1c.netfence.v1.AttachResponse\x12=\n" +
+	"\x06Detach\x12\x1b.netfence.v1.DetachRequest\x1a\x16.google.protobuf.Empty\x12:\n" +
+	"\x04List\x12\x16.google.protobuf.Empty\x1a\x1a.netfence.v1.ListResponse\x12?\n" +
+	"\tGetStatus\x12\x16.google.protobuf.Empty\x1a\x1a.netfence.v1.DaemonStatusB2Z0github.com/danthegoodman1/netfence/api/v1;apiv1b\x06proto3"
 
 var (
 	file_v1_daemon_proto_rawDescOnce sync.Once
@@ -615,37 +616,37 @@ func file_v1_daemon_proto_rawDescGZIP() []byte {
 var file_v1_daemon_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
 var file_v1_daemon_proto_msgTypes = make([]protoimpl.MessageInfo, 8)
 var file_v1_daemon_proto_goTypes = []any{
-	(ConnectionState)(0),   // 0: superebpf.v1.ConnectionState
-	(*AttachRequest)(nil),  // 1: superebpf.v1.AttachRequest
-	(*AttachResponse)(nil), // 2: superebpf.v1.AttachResponse
-	(*DetachRequest)(nil),  // 3: superebpf.v1.DetachRequest
-	(*ListResponse)(nil),   // 4: superebpf.v1.ListResponse
-	(*AttachmentInfo)(nil), // 5: superebpf.v1.AttachmentInfo
-	(*DaemonStatus)(nil),   // 6: superebpf.v1.DaemonStatus
-	nil,                    // 7: superebpf.v1.AttachRequest.MetadataEntry
-	nil,                    // 8: superebpf.v1.AttachmentInfo.MetadataEntry
-	(PolicyMode)(0),        // 9: superebpf.v1.PolicyMode
-	(AttachmentType)(0),    // 10: superebpf.v1.AttachmentType
-	(DnsMode)(0),           // 11: superebpf.v1.DnsMode
+	(ConnectionState)(0),   // 0: netfence.v1.ConnectionState
+	(*AttachRequest)(nil),  // 1: netfence.v1.AttachRequest
+	(*AttachResponse)(nil), // 2: netfence.v1.AttachResponse
+	(*DetachRequest)(nil),  // 3: netfence.v1.DetachRequest
+	(*ListResponse)(nil),   // 4: netfence.v1.ListResponse
+	(*AttachmentInfo)(nil), // 5: netfence.v1.AttachmentInfo
+	(*DaemonStatus)(nil),   // 6: netfence.v1.DaemonStatus
+	nil,                    // 7: netfence.v1.AttachRequest.MetadataEntry
+	nil,                    // 8: netfence.v1.AttachmentInfo.MetadataEntry
+	(PolicyMode)(0),        // 9: netfence.v1.PolicyMode
+	(AttachmentType)(0),    // 10: netfence.v1.AttachmentType
+	(DnsMode)(0),           // 11: netfence.v1.DnsMode
 	(*emptypb.Empty)(nil),  // 12: google.protobuf.Empty
 }
 var file_v1_daemon_proto_depIdxs = []int32{
-	9,  // 0: superebpf.v1.AttachRequest.mode:type_name -> superebpf.v1.PolicyMode
-	7,  // 1: superebpf.v1.AttachRequest.metadata:type_name -> superebpf.v1.AttachRequest.MetadataEntry
-	5,  // 2: superebpf.v1.ListResponse.attachments:type_name -> superebpf.v1.AttachmentInfo
-	10, // 3: superebpf.v1.AttachmentInfo.type:type_name -> superebpf.v1.AttachmentType
-	9,  // 4: superebpf.v1.AttachmentInfo.mode:type_name -> superebpf.v1.PolicyMode
-	11, // 5: superebpf.v1.AttachmentInfo.dns_mode:type_name -> superebpf.v1.DnsMode
-	8,  // 6: superebpf.v1.AttachmentInfo.metadata:type_name -> superebpf.v1.AttachmentInfo.MetadataEntry
-	0,  // 7: superebpf.v1.DaemonStatus.control_plane_state:type_name -> superebpf.v1.ConnectionState
-	1,  // 8: superebpf.v1.DaemonService.Attach:input_type -> superebpf.v1.AttachRequest
-	3,  // 9: superebpf.v1.DaemonService.Detach:input_type -> superebpf.v1.DetachRequest
-	12, // 10: superebpf.v1.DaemonService.List:input_type -> google.protobuf.Empty
-	12, // 11: superebpf.v1.DaemonService.GetStatus:input_type -> google.protobuf.Empty
-	2,  // 12: superebpf.v1.DaemonService.Attach:output_type -> superebpf.v1.AttachResponse
-	12, // 13: superebpf.v1.DaemonService.Detach:output_type -> google.protobuf.Empty
-	4,  // 14: superebpf.v1.DaemonService.List:output_type -> superebpf.v1.ListResponse
-	6,  // 15: superebpf.v1.DaemonService.GetStatus:output_type -> superebpf.v1.DaemonStatus
+	9,  // 0: netfence.v1.AttachRequest.mode:type_name -> netfence.v1.PolicyMode
+	7,  // 1: netfence.v1.AttachRequest.metadata:type_name -> netfence.v1.AttachRequest.MetadataEntry
+	5,  // 2: netfence.v1.ListResponse.attachments:type_name -> netfence.v1.AttachmentInfo
+	10, // 3: netfence.v1.AttachmentInfo.type:type_name -> netfence.v1.AttachmentType
+	9,  // 4: netfence.v1.AttachmentInfo.mode:type_name -> netfence.v1.PolicyMode
+	11, // 5: netfence.v1.AttachmentInfo.dns_mode:type_name -> netfence.v1.DnsMode
+	8,  // 6: netfence.v1.AttachmentInfo.metadata:type_name -> netfence.v1.AttachmentInfo.MetadataEntry
+	0,  // 7: netfence.v1.DaemonStatus.control_plane_state:type_name -> netfence.v1.ConnectionState
+	1,  // 8: netfence.v1.DaemonService.Attach:input_type -> netfence.v1.AttachRequest
+	3,  // 9: netfence.v1.DaemonService.Detach:input_type -> netfence.v1.DetachRequest
+	12, // 10: netfence.v1.DaemonService.List:input_type -> google.protobuf.Empty
+	12, // 11: netfence.v1.DaemonService.GetStatus:input_type -> google.protobuf.Empty
+	2,  // 12: netfence.v1.DaemonService.Attach:output_type -> netfence.v1.AttachResponse
+	12, // 13: netfence.v1.DaemonService.Detach:output_type -> google.protobuf.Empty
+	4,  // 14: netfence.v1.DaemonService.List:output_type -> netfence.v1.ListResponse
+	6,  // 15: netfence.v1.DaemonService.GetStatus:output_type -> netfence.v1.DaemonStatus
 	12, // [12:16] is the sub-list for method output_type
 	8,  // [8:12] is the sub-list for method input_type
 	8,  // [8:8] is the sub-list for extension type_name

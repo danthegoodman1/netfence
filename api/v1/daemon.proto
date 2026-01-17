@@ -1,14 +1,14 @@
 syntax = "proto3";
 
-package superebpf.v1;
+package netfence.v1;
 
-option go_package = "github.com/danthegoodman1/superebpf/api/v1;apiv1";
+option go_package = "github.com/danthegoodman1/netfence/api/v1;apiv1";
 
 import "google/protobuf/empty.proto";
 import "v1/types.proto";
 
 // DaemonService is the local API exposed by the daemon.
-// This runs on a local socket (e.g., unix:///var/run/superebpf.sock).
+// This runs on a local socket (e.g., unix:///var/run/netfence.sock).
 // Use this to attach/detach filters from your orchestration system.
 service DaemonService {
   // Attach attaches an eBPF filter and subscribes it to the control plane.

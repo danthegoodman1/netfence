@@ -8,6 +8,7 @@ package apiv1
 
 import (
 	context "context"
+
 	grpc "google.golang.org/grpc"
 	codes "google.golang.org/grpc/codes"
 	status "google.golang.org/grpc/status"
@@ -20,10 +21,10 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	DaemonService_Attach_FullMethodName    = "/superebpf.v1.DaemonService/Attach"
-	DaemonService_Detach_FullMethodName    = "/superebpf.v1.DaemonService/Detach"
-	DaemonService_List_FullMethodName      = "/superebpf.v1.DaemonService/List"
-	DaemonService_GetStatus_FullMethodName = "/superebpf.v1.DaemonService/GetStatus"
+	DaemonService_Attach_FullMethodName    = "/netfence.v1.DaemonService/Attach"
+	DaemonService_Detach_FullMethodName    = "/netfence.v1.DaemonService/Detach"
+	DaemonService_List_FullMethodName      = "/netfence.v1.DaemonService/List"
+	DaemonService_GetStatus_FullMethodName = "/netfence.v1.DaemonService/GetStatus"
 )
 
 // DaemonServiceClient is the client API for DaemonService service.
@@ -31,7 +32,7 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
 // DaemonService is the local API exposed by the daemon.
-// This runs on a local socket (e.g., unix:///var/run/superebpf.sock).
+// This runs on a local socket (e.g., unix:///var/run/netfence.sock).
 // Use this to attach/detach filters from your orchestration system.
 type DaemonServiceClient interface {
 	// Attach attaches an eBPF filter and subscribes it to the control plane.
@@ -97,7 +98,7 @@ func (c *daemonServiceClient) GetStatus(ctx context.Context, in *emptypb.Empty, 
 // for forward compatibility.
 //
 // DaemonService is the local API exposed by the daemon.
-// This runs on a local socket (e.g., unix:///var/run/superebpf.sock).
+// This runs on a local socket (e.g., unix:///var/run/netfence.sock).
 // Use this to attach/detach filters from your orchestration system.
 type DaemonServiceServer interface {
 	// Attach attaches an eBPF filter and subscribes it to the control plane.
@@ -227,7 +228,7 @@ func _DaemonService_GetStatus_Handler(srv interface{}, ctx context.Context, dec 
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
 var DaemonService_ServiceDesc = grpc.ServiceDesc{
-	ServiceName: "superebpf.v1.DaemonService",
+	ServiceName: "netfence.v1.DaemonService",
 	HandlerType: (*DaemonServiceServer)(nil),
 	Methods: []grpc.MethodDesc{
 		{

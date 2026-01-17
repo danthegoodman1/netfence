@@ -1,4 +1,4 @@
-module github.com/danthegoodman1/superebpf
+module github.com/danthegoodman1/netfence
 
 go 1.25.5
 

@@ -8,6 +8,7 @@ package apiv1
 
 import (
 	context "context"
+
 	grpc "google.golang.org/grpc"
 	codes "google.golang.org/grpc/codes"
 	status "google.golang.org/grpc/status"
@@ -19,7 +20,7 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	ControlPlane_Connect_FullMethodName = "/superebpf.v1.ControlPlane/Connect"
+	ControlPlane_Connect_FullMethodName = "/netfence.v1.ControlPlane/Connect"
 )
 
 // ControlPlaneClient is the client API for ControlPlane service.
@@ -126,7 +127,7 @@ type ControlPlane_ConnectServer = grpc.BidiStreamingServer[DaemonEvent, ControlC
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
 var ControlPlane_ServiceDesc = grpc.ServiceDesc{
-	ServiceName: "superebpf.v1.ControlPlane",
+	ServiceName: "netfence.v1.ControlPlane",
 	HandlerType: (*ControlPlaneServer)(nil),
 	Methods:     []grpc.MethodDesc{},
 	Streams: []grpc.StreamDesc{

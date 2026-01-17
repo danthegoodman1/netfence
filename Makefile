@@ -1,4 +1,4 @@
-# Makefile for superebpf
+# Makefile for netfence
 
 .PHONY: all generate build test test-docker clean help
 

@@ -1,8 +1,8 @@
 syntax = "proto3";
 
-package superebpf.v1;
+package netfence.v1;
 
-option go_package = "github.com/danthegoodman1/superebpf/api/v1;apiv1";
+option go_package = "github.com/danthegoodman1/netfence/api/v1;apiv1";
 
 import "google/protobuf/duration.proto";
 import "v1/types.proto";
