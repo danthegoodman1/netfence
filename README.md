@@ -1,4 +1,4 @@
-# Super eBPF
+# Netfence
 
 A control plane for network filters per-interface/cgroup so you can give each VM or container its own egress filtering policy.
 
