@@ -1,0 +1,89 @@
+syntax = "proto3";
+
+package superebpf.v1;
+
+option go_package = "github.com/danthegoodman1/superebpf/api/v1;apiv1";
+
+import "google/protobuf/empty.proto";
+import "v1/types.proto";
+
+// DaemonService is the local API exposed by the daemon.
+// This runs on a local socket (e.g., unix:///var/run/superebpf.sock).
+// Use this to attach/detach filters from your orchestration system.
+service DaemonService {
+  // Attach attaches an eBPF filter and subscribes it to the control plane.
+  rpc Attach(AttachRequest) returns (AttachResponse);
+
+  // Detach removes the eBPF filter and unsubscribes from the control plane.
+  rpc Detach(DetachRequest) returns (google.protobuf.Empty);
+
+  // List returns all currently attached filters.
+  rpc List(google.protobuf.Empty) returns (ListResponse);
+
+  // GetStatus returns the current daemon status.
+  rpc GetStatus(google.protobuf.Empty) returns (DaemonStatus);
+}
+
+// AttachRequest specifies what to attach the eBPF filter to.
+message AttachRequest {
+  oneof target {
+    // Network interface name for TC attachment (e.g., "eth0", "veth123")
+    string interface_name = 1;
+    // Cgroup path for cgroup attachment (e.g., "/sys/fs/cgroup/user.slice/...")
+    string cgroup_path = 2;
+  }
+  // Initial policy mode (defaults to DISABLED if not specified)
+  PolicyMode mode = 3;
+  // User-defined metadata (VM ID, tenant, container ID, etc.)
+  // This is passed to the control plane with the subscription.
+  map<string, string> metadata = 4;
+}
+
+// AttachResponse confirms attachment.
+message AttachResponse {
+  // Unique identifier for this attachment (use this for detach)
+  string id = 1;
+}
+
+// DetachRequest specifies which attachment to remove.
+message DetachRequest {
+  // Attachment ID (from AttachResponse)
+  string id = 1;
+}
+
+// ListResponse contains all active attachments.
+message ListResponse {
+  repeated AttachmentInfo attachments = 1;
+}
+
+// AttachmentInfo contains details about an active attachment.
+message AttachmentInfo {
+  string id = 1;
+  // The target (interface name or cgroup path)
+  string target = 2;
+  // Type of attachment
+  AttachmentType type = 3;
+  PolicyMode mode = 4;
+  map<string, string> metadata = 5;
+  uint64 packets_allowed = 6;
+  uint64 packets_blocked = 7;
+}
+
+// DaemonStatus contains the current state of the daemon.
+message DaemonStatus {
+  string version = 1;
+  string daemon_id = 2;
+  string hostname = 3;
+  // Control plane connection state
+  ConnectionState control_plane_state = 4;
+  string control_plane_address = 5;
+  int32 attachment_count = 6;
+}
+
+// ConnectionState represents the control plane connection status.
+enum ConnectionState {
+  CONNECTION_STATE_UNSPECIFIED = 0;
+  CONNECTION_STATE_DISCONNECTED = 1;
+  CONNECTION_STATE_CONNECTING = 2;
+  CONNECTION_STATE_CONNECTED = 3;
+}

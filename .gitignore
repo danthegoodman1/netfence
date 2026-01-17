@@ -1,1 +1,30 @@
-target/
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Go workspace file
+go.work
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Generated BPF files (regenerate with `make generate`)
+pkg/filter/*_bpfel.go
+pkg/filter/*_bpfeb.go
+pkg/filter/*.o
+
+# OS files
+.DS_Store
+Thumbs.db

@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+package superebpf.v1;
+
+option go_package = "github.com/danthegoodman1/superebpf/api/v1;apiv1";
+
+// PolicyMode defines the filtering behavior.
+enum PolicyMode {
+  POLICY_MODE_UNSPECIFIED = 0;
+  // Disabled - all traffic allowed, filter is a no-op
+  POLICY_MODE_DISABLED = 1;
+  // Allowlist - only allow traffic to IPs in the allowlist, block all else
+  POLICY_MODE_ALLOWLIST = 2;
+  // Block all - block all outbound traffic
+  POLICY_MODE_BLOCK_ALL = 3;
+  // Denylist - block traffic to IPs in the denylist, allow all else
+  POLICY_MODE_DENYLIST = 4;
+}
+
+// AttachmentType indicates how the filter is attached.
+enum AttachmentType {
+  ATTACHMENT_TYPE_UNSPECIFIED = 0;
+  ATTACHMENT_TYPE_TC = 1;
+  ATTACHMENT_TYPE_CGROUP = 2;
+}

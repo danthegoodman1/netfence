@@ -1,0 +1,174 @@
+syntax = "proto3";
+
+package superebpf.v1;
+
+option go_package = "github.com/danthegoodman1/superebpf/api/v1;apiv1";
+
+import "google/protobuf/duration.proto";
+import "v1/types.proto";
+
+// ControlPlane is the service that users implement on their control plane
+// server. The daemon connects to this service and maintains a bidirectional
+// stream.
+service ControlPlane {
+  // Connect establishes a bidirectional stream between the daemon and control
+  // plane.
+  //
+  // Flow:
+  // 1. Daemon connects and sends SyncRequest with current attachments
+  // 2. Control plane sends SyncAck
+  // 3. Daemon sends Subscribed when local orchestration attaches filters
+  // 4. Control plane sends filter commands (AllowCIDR, SetMode, etc.)
+  // 5. Daemon sends Unsubscribed when attachments are detached/removed
+  rpc Connect(stream DaemonEvent) returns (stream ControlCommand);
+}
+
+// DaemonEvent represents events sent from the daemon to the control plane.
+message DaemonEvent {
+  oneof event {
+    // Initial sync request sent on connect/reconnect
+    SyncRequest sync = 1;
+    // Notification that a new attachment is now subscribed
+    Subscribed subscribed = 2;
+    // Notification that an attachment has been unsubscribed
+    Unsubscribed unsubscribed = 3;
+    // Periodic heartbeat with optional stats
+    Heartbeat heartbeat = 4;
+  }
+}
+
+// SyncRequest is sent when the daemon connects or reconnects.
+// It lists all current attachments so the control plane can resync.
+message SyncRequest {
+  // Daemon instance identifier (stable across restarts)
+  string daemon_id = 1;
+  // Hostname for identification
+  string hostname = 2;
+  // All current attachments managed by this daemon
+  repeated Attachment attachments = 3;
+}
+
+// Attachment describes a filter attachment managed by the daemon.
+message Attachment {
+  // Unique identifier for this attachment
+  string id = 1;
+  // The target (interface name or cgroup path)
+  string target = 2;
+  // Type of attachment
+  AttachmentType type = 3;
+  // Current policy mode
+  PolicyMode mode = 4;
+  // User-defined metadata (VM ID, tenant, etc.)
+  map<string, string> metadata = 5;
+}
+
+// Subscribed notifies that a new filter attachment is now managed.
+message Subscribed {
+  // Unique identifier for this attachment
+  string id = 1;
+  // The target (interface name or cgroup path)
+  string target = 2;
+  // Type of attachment
+  AttachmentType type = 3;
+  // Initial policy mode
+  PolicyMode mode = 4;
+  // User-defined metadata for associating with VM ID, tenant, etc.
+  map<string, string> metadata = 5;
+}
+
+// Unsubscribed notifies that an attachment is no longer managed.
+message Unsubscribed {
+  // The attachment that was removed
+  string id = 1;
+  // Reason for removal
+  UnsubscribeReason reason = 2;
+  // Error message if reason is ERROR
+  string error = 3;
+}
+
+// UnsubscribeReason explains why an attachment was unsubscribed.
+enum UnsubscribeReason {
+  UNSUBSCRIBE_REASON_UNSPECIFIED = 0;
+  // Target no longer exists in the system (interface removed, cgroup gone)
+  UNSUBSCRIBE_REASON_REMOVED = 1;
+  // Explicit detach request via local API
+  UNSUBSCRIBE_REASON_DETACHED = 2;
+  // Error maintaining the eBPF attachment
+  UNSUBSCRIBE_REASON_ERROR = 3;
+}
+
+// Heartbeat is sent periodically to keep the connection alive and report stats.
+message Heartbeat {
+  repeated AttachmentStats stats = 1;
+}
+
+// AttachmentStats reports statistics for a single attachment.
+message AttachmentStats {
+  string id = 1;
+  uint64 packets_allowed = 2;
+  uint64 packets_blocked = 3;
+}
+
+// ControlCommand represents commands sent from the control plane to the daemon.
+message ControlCommand {
+  // Target attachment ID
+  string id = 1;
+
+  oneof command {
+    // Acknowledge sync (sent after receiving SyncRequest)
+    SyncAck sync_ack = 2;
+    // Change the policy mode
+    SetMode set_mode = 3;
+    // Add a CIDR to the allowlist
+    AllowCIDR allow_cidr = 4;
+    // Add a CIDR to the denylist
+    DenyCIDR deny_cidr = 5;
+    // Remove a CIDR from allow/deny lists
+    RemoveCIDR remove_cidr = 6;
+    // Bulk update - set complete state for an attachment
+    BulkUpdate bulk_update = 7;
+  }
+}
+
+// SyncAck acknowledges that the control plane has processed the SyncRequest.
+message SyncAck {}
+
+// SetMode changes the policy mode for an attachment.
+message SetMode { PolicyMode mode = 1; }
+
+// AllowCIDR adds a CIDR to the allowlist.
+message AllowCIDR {
+  // IPv4 or IPv6 CIDR (e.g., "10.0.0.0/8", "2001:db8::/32", or single IP "1.2.3.4")
+  string cidr = 1;
+  // Optional TTL - daemon will automatically remove after this duration.
+  // Zero or unset means no expiration.
+  google.protobuf.Duration ttl = 2;
+}
+
+// DenyCIDR adds a CIDR to the denylist.
+message DenyCIDR {
+  // IPv4 or IPv6 CIDR
+  string cidr = 1;
+  // Optional TTL for automatic expiration
+  google.protobuf.Duration ttl = 2;
+}
+
+// RemoveCIDR removes a CIDR from both allow and deny lists.
+message RemoveCIDR { string cidr = 1; }
+
+// BulkUpdate sets the complete state for an attachment.
+// Clears existing rules and replaces with the provided state.
+message BulkUpdate {
+  // Policy mode to set
+  PolicyMode mode = 1;
+  // CIDRs to allow
+  repeated CIDREntry allow_cidrs = 2;
+  // CIDRs to deny
+  repeated CIDREntry deny_cidrs = 3;
+}
+
+// CIDREntry represents a CIDR with optional TTL.
+message CIDREntry {
+  string cidr = 1;
+  google.protobuf.Duration ttl = 2;
+}

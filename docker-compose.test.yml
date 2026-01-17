@@ -1,0 +1,62 @@
+# Docker Compose for running eBPF tests
+# Works on Mac (Docker Desktop) and Linux
+#
+# Usage:
+#   docker compose -f docker-compose.test.yml up --build
+
+services:
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    privileged: true
+    cap_add:
+      - SYS_ADMIN
+      - NET_ADMIN
+      - BPF
+    volumes:
+      # Mount BPF filesystem
+      - /sys/fs/bpf:/sys/fs/bpf
+    environment:
+      - CGO_ENABLED=0
+    networks:
+      - test-net
+
+  # Optional: run specific test suites
+  test-cgroup:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    privileged: true
+    cap_add:
+      - SYS_ADMIN
+      - NET_ADMIN
+      - BPF
+    volumes:
+      - /sys/fs/bpf:/sys/fs/bpf
+    command: ["go", "test", "-v", "-run", "TestCgroup", "./tests/integration/..."]
+    networks:
+      - test-net
+    profiles:
+      - cgroup
+
+  test-tc:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    privileged: true
+    cap_add:
+      - SYS_ADMIN
+      - NET_ADMIN
+      - BPF
+    volumes:
+      - /sys/fs/bpf:/sys/fs/bpf
+    command: ["go", "test", "-v", "-run", "TestTC", "./tests/integration/..."]
+    networks:
+      - test-net
+    profiles:
+      - tc
+
+networks:
+  test-net:
+    driver: bridge
