@@ -4,7 +4,7 @@ _Like Envoy xDS, but for VM/container firewalls._
 
 Netfence runs as a daemon on your VM/container hosts and automatically injects filter programs into cgroups and network interfaces, with a built-in DNS server that resolves allowed domains and populates the IP allowlist.
 
-Netfence daemons connect to a central control plane that you implement via gRPC to coordinate what interfaces/cgroups to synchronize allowlists/denylists with your backend.
+Netfence daemons connect to a central control plane that you implement via gRPC synchronize allowlists/denylists with your backend.
 
 Your control plane pushes network rules like `ALLOW pypi.org` or `ALLOW registry.npmjs.org` to attached interfaces/cgroups. When a workload queries DNS, Netfence resolves it, adds the IPs to the eBPF filter, and drops everything else before it leaves the host without any performance penalty.
 
