@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -31,7 +32,7 @@ type Server struct {
 	portPool    map[int]bool
 	attachments map[string]*attachmentState
 
-	cpClient *ControlPlaneClient
+	cpClient atomic.Pointer[ControlPlaneClient]
 }
 
 type attachmentState struct {
@@ -82,7 +83,7 @@ func NewServer(cfg *config.Config, st *store.Store, logger zerolog.Logger, versi
 }
 
 func (s *Server) SetControlPlaneClient(cp *ControlPlaneClient) {
-	s.cpClient = cp
+	s.cpClient.Store(cp)
 }
 
 func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (*apiv1.AttachResponse, error) {
@@ -135,8 +136,8 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (*apiv1.A
 	// Start DNS server for this attachment
 	// TODO: Pass actual filter once eBPF integration is complete
 	var proxyFunc DnsProxyFunc
-	if s.cpClient != nil {
-		proxyFunc = s.cpClient.MakeProxyFunc(id)
+	if cpClient := s.cpClient.Load(); cpClient != nil {
+		proxyFunc = cpClient.MakeProxyFunc(id)
 	}
 	dnsServer := NewDNSServer(id, dnsAddr, s.cfg.DNS.Upstream, s.logger, nil, proxyFunc)
 	if err := dnsServer.Start(); err != nil {
@@ -154,8 +155,8 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (*apiv1.A
 		Str("dns_address", dnsAddr).
 		Msg("attached filter")
 
-	if s.cpClient != nil {
-		s.cpClient.SendSubscribed(&apiv1.Subscribed{
+	if cpClient := s.cpClient.Load(); cpClient != nil {
+		cpClient.SendSubscribed(&apiv1.Subscribed{
 			Id:         id,
 			Target:     target,
 			Type:       attachType,
@@ -203,8 +204,8 @@ func (s *Server) Detach(ctx context.Context, req *apiv1.DetachRequest) (*emptypb
 		Str("target", state.info.Target).
 		Msg("detached filter")
 
-	if s.cpClient != nil {
-		s.cpClient.SendUnsubscribed(&apiv1.Unsubscribed{
+	if cpClient := s.cpClient.Load(); cpClient != nil {
+		cpClient.SendUnsubscribed(&apiv1.Unsubscribed{
 			Id:     req.Id,
 			Reason: apiv1.UnsubscribeReason_UNSUBSCRIBE_REASON_DETACHED,
 		})
@@ -258,8 +259,8 @@ func (s *Server) GetStatus(ctx context.Context, _ *emptypb.Empty) (*apiv1.Daemon
 
 	cpState := apiv1.ConnectionState_CONNECTION_STATE_DISCONNECTED
 	cpAddr := ""
-	if s.cpClient != nil {
-		cpState = s.cpClient.State()
+	if cpClient := s.cpClient.Load(); cpClient != nil {
+		cpState = cpClient.State()
 		cpAddr = s.cfg.ControlPlane.URL
 	}
 

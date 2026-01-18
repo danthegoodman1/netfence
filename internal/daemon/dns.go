@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"fmt"
 	"net"
 	"strings"
 	"sync"
@@ -35,8 +36,9 @@ type DNSServer struct {
 	allowedDomains map[string]bool // domain -> includeSubdomains
 	deniedDomains  map[string]bool // domain -> includeSubdomains
 
-	server *dns.Server
-	conn   net.PacketConn
+	serverMu sync.Mutex
+	server   *dns.Server
+	conn     net.PacketConn
 
 	queriesAllowed atomic.Uint64
 	queriesBlocked atomic.Uint64
@@ -57,6 +59,13 @@ func NewDNSServer(attachmentID, listenAddr, upstream string, logger zerolog.Logg
 }
 
 func (s *DNSServer) Start() error {
+	s.serverMu.Lock()
+	defer s.serverMu.Unlock()
+
+	if s.server != nil {
+		return fmt.Errorf("DNS server already started")
+	}
+
 	conn, err := net.ListenPacket("udp", s.listenAddr)
 	if err != nil {
 		return err
@@ -79,13 +88,18 @@ func (s *DNSServer) Start() error {
 }
 
 func (s *DNSServer) Stop() error {
+	s.serverMu.Lock()
+	defer s.serverMu.Unlock()
+
 	if s.server != nil {
 		if err := s.server.Shutdown(); err != nil {
 			return err
 		}
+		s.server = nil
 	}
 	if s.conn != nil {
 		s.conn.Close()
+		s.conn = nil
 	}
 	return nil
 }
