@@ -3,7 +3,7 @@
 
 FROM golang:1.25.5-trixie
 
-# Install build dependencies for BPF
+# Install build dependencies for BPF and CGO (sqlite3)
 RUN apt-get update && apt-get install -y \
     clang \
     llvm \
@@ -15,6 +15,8 @@ RUN apt-get update && apt-get install -y \
     curl \
     netcat-openbsd \
     make \
+    gcc \
+    libsqlite3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Create symlink for asm headers (needed for BPF compilation)
@@ -35,8 +37,11 @@ COPY . .
 # Generate BPF objects
 RUN go generate ./pkg/filter/...
 
+# Enable CGO for sqlite3
+ENV CGO_ENABLED=1
+
 # Build the test binary
 RUN go test -c -o /test-runner ./tests/integration/...
 
-# Default command runs tests
-CMD ["go", "test", "-v", "./tests/integration/..."]
+# Default command runs tests with 30s timeout
+CMD ["go", "test", "-v", "-timeout", "30s", "./tests/integration/..."]
