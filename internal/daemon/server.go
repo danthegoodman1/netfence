@@ -173,6 +173,22 @@ func (s *Server) Start() error {
 
 func (s *Server) Stop() {
 	s.watcher.Stop()
+
+	s.mu.Lock()
+	attachments := make([]*attachmentState, 0, len(s.attachments))
+	for _, state := range s.attachments {
+		attachments = append(attachments, state)
+	}
+	s.mu.Unlock()
+
+	for _, state := range attachments {
+		if state.dns != nil {
+			state.dns.Stop()
+		}
+		if state.filter != nil {
+			state.filter.Close()
+		}
+	}
 }
 
 func (s *Server) handleTargetRemoved(target string) {
