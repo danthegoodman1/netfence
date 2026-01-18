@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/spf13/viper"
 )
@@ -25,6 +26,10 @@ type DNSConfig struct {
 
 type ControlPlaneConfig struct {
 	URL string `mapstructure:"url"`
+	// SubscribeAckTimeout is how long to wait for the control plane to acknowledge
+	// a new subscription with initial config. If the timeout is reached, the
+	// attachment is detached. Set to 0 to disable (attach proceeds without waiting).
+	SubscribeAckTimeout time.Duration `mapstructure:"subscribe_ack_timeout"`
 }
 
 func Load(configPath string) (*Config, error) {
@@ -36,6 +41,7 @@ func Load(configPath string) (*Config, error) {
 	v.SetDefault("dns.upstream", "8.8.8.8:53")
 	v.SetDefault("log_level", "info")
 	v.SetDefault("socket", "/var/run/netfence.sock")
+	v.SetDefault("control_plane.subscribe_ack_timeout", 5*time.Second)
 
 	v.SetEnvPrefix("NETFENCE")
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))

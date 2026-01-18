@@ -250,20 +250,19 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (*apiv1.A
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	port, err := s.allocatePort()
 	if err != nil {
+		s.mu.Unlock()
 		return nil, err
 	}
 
 	id := uuid.Must(uuid.NewV7()).String()
 	dnsAddr := fmt.Sprintf("%s:%d", s.cfg.DNS.ListenAddr, port)
 
-	mode := req.Mode
-	if mode == apiv1.PolicyMode_POLICY_MODE_UNSPECIFIED {
-		mode = apiv1.PolicyMode_POLICY_MODE_DISABLED
-	}
+	// Always start in DISABLED mode - the control plane provides the initial
+	// configuration via SubscribedAck
+	mode := apiv1.PolicyMode_POLICY_MODE_DISABLED
 
 	attachment := &store.Attachment{
 		ID:         id,
@@ -278,6 +277,7 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (*apiv1.A
 
 	if err := s.store.SaveAttachment(attachment); err != nil {
 		s.releasePort(port)
+		s.mu.Unlock()
 		return nil, fmt.Errorf("saving attachment: %w", err)
 	}
 
@@ -285,6 +285,7 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (*apiv1.A
 	if err != nil {
 		s.releasePort(port)
 		s.store.DeleteAttachment(id)
+		s.mu.Unlock()
 		return nil, fmt.Errorf("creating eBPF filter: %w", err)
 	}
 
@@ -299,6 +300,7 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (*apiv1.A
 		}
 		s.releasePort(port)
 		s.store.DeleteAttachment(id)
+		s.mu.Unlock()
 		return nil, fmt.Errorf("starting DNS server: %w", err)
 	}
 
@@ -321,8 +323,11 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (*apiv1.A
 		Str("dns_address", dnsAddr).
 		Msg("attached filter")
 
-	if cpClient := s.cpClient.Load(); cpClient != nil {
-		cpClient.SendSubscribed(&apiv1.Subscribed{
+	cpClient := s.cpClient.Load()
+	s.mu.Unlock()
+
+	if cpClient != nil {
+		sub := &apiv1.Subscribed{
 			Id:         id,
 			Target:     target,
 			Type:       attachType,
@@ -330,7 +335,14 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (*apiv1.A
 			DnsMode:    apiv1.DnsMode_DNS_MODE_DISABLED,
 			DnsAddress: dnsAddr,
 			Metadata:   req.Metadata,
-		})
+		}
+
+		_, err := cpClient.SubscribeAndWait(ctx, sub)
+		if err != nil {
+			s.logger.Error().Err(err).Str("id", id).Msg("control plane subscription failed, detaching")
+			s.cleanupAttachment(id, target, attachType, port, dnsServer, ebpfFilter)
+			return nil, fmt.Errorf("control plane subscription failed: %w", err)
+		}
 	}
 
 	return &apiv1.AttachResponse{
@@ -632,6 +644,37 @@ func (s *Server) RemoveDeniedCIDR(id string, cidr *net.IPNet) error {
 		return state.filter.RemoveDeniedIP(cidr)
 	}
 	return nil
+}
+
+func (s *Server) cleanupAttachment(id, target string, attachType apiv1.AttachmentType, port int, dnsServer *DNSServer, ebpfFilter filter.Filter) {
+	s.mu.Lock()
+	// Check if attachment still exists - it may have already been cleaned up
+	// by the target watcher if the interface/cgroup was removed while we were
+	// waiting for SubscribedAck
+	_, exists := s.attachments[id]
+	if !exists {
+		s.mu.Unlock()
+		return
+	}
+
+	s.releasePort(port)
+	switch attachType {
+	case apiv1.AttachmentType_ATTACHMENT_TYPE_TC:
+		s.watcher.UnwatchInterface(target)
+	case apiv1.AttachmentType_ATTACHMENT_TYPE_CGROUP:
+		s.watcher.UnwatchCgroup(target)
+	}
+	delete(s.attachments, id)
+	delete(s.targetIndex, target)
+	s.mu.Unlock()
+
+	if dnsServer != nil {
+		dnsServer.Stop()
+	}
+	if ebpfFilter != nil {
+		ebpfFilter.Close()
+	}
+	s.store.DeleteAttachment(id)
 }
 
 func (s *Server) allocatePort() (int, error) {

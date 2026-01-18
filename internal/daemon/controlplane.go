@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
@@ -13,11 +14,18 @@ import (
 	apiv1 "github.com/danthegoodman1/netfence/v1"
 )
 
+// SubscribedAckResult contains the result of waiting for a SubscribedAck.
+type SubscribedAckResult struct {
+	Ack *apiv1.SubscribedAck
+	Err error
+}
+
 type ControlPlaneClient struct {
-	url      string
-	server   *Server
-	logger   zerolog.Logger
-	metadata map[string]string
+	url                 string
+	server              *Server
+	logger              zerolog.Logger
+	metadata            map[string]string
+	subscribeAckTimeout time.Duration
 
 	mu     sync.RWMutex
 	state  apiv1.ConnectionState
@@ -27,16 +35,23 @@ type ControlPlaneClient struct {
 	cancel context.CancelFunc
 
 	sendCh chan *apiv1.DaemonEvent
+
+	// pendingAcks tracks subscriptions waiting for SubscribedAck responses.
+	// Key is attachment ID, value is the channel to send the result on.
+	pendingAcksMu sync.Mutex
+	pendingAcks   map[string]chan SubscribedAckResult
 }
 
-func NewControlPlaneClient(url string, server *Server, logger zerolog.Logger, metadata map[string]string) *ControlPlaneClient {
+func NewControlPlaneClient(url string, server *Server, logger zerolog.Logger, metadata map[string]string, subscribeAckTimeout time.Duration) *ControlPlaneClient {
 	return &ControlPlaneClient{
-		url:      url,
-		server:   server,
-		logger:   logger.With().Str("component", "controlplane").Logger(),
-		metadata: metadata,
-		state:    apiv1.ConnectionState_CONNECTION_STATE_DISCONNECTED,
-		sendCh:   make(chan *apiv1.DaemonEvent, 100),
+		url:                 url,
+		server:              server,
+		logger:              logger.With().Str("component", "controlplane").Logger(),
+		metadata:            metadata,
+		subscribeAckTimeout: subscribeAckTimeout,
+		state:               apiv1.ConnectionState_CONNECTION_STATE_DISCONNECTED,
+		sendCh:              make(chan *apiv1.DaemonEvent, 100),
+		pendingAcks:         make(map[string]chan SubscribedAckResult),
 	}
 }
 
@@ -266,18 +281,69 @@ func (c *ControlPlaneClient) handleCommand(cmd *apiv1.ControlCommand) {
 			c.logger.Error().Err(err).Str("id", cmd.Id).Msg("failed to remove domain")
 		}
 
+	case *apiv1.ControlCommand_SubscribedAck:
+		c.logger.Debug().Str("id", cmd.Id).Msg("received subscribed ack")
+		c.pendingAcksMu.Lock()
+		if ch, ok := c.pendingAcks[cmd.Id]; ok {
+			select {
+			case ch <- SubscribedAckResult{Ack: v.SubscribedAck}:
+			default:
+			}
+			delete(c.pendingAcks, cmd.Id)
+		}
+		c.pendingAcksMu.Unlock()
+		c.applySubscribedAck(cmd.Id, v.SubscribedAck)
+
 	default:
 		c.logger.Warn().Str("id", cmd.Id).Msg("received unknown command")
 	}
 }
 
-func (c *ControlPlaneClient) SendSubscribed(sub *apiv1.Subscribed) {
+// SubscribeAndWait sends a Subscribed event and waits for the control plane to
+// acknowledge it with initial configuration. Returns the ack, or an error if
+// the timeout is reached or the connection is lost.
+//
+// If subscribeAckTimeout is 0, this returns immediately without waiting.
+func (c *ControlPlaneClient) SubscribeAndWait(ctx context.Context, sub *apiv1.Subscribed) (*apiv1.SubscribedAck, error) {
+	if c.subscribeAckTimeout == 0 {
+		select {
+		case c.sendCh <- &apiv1.DaemonEvent{
+			Event: &apiv1.DaemonEvent_Subscribed{Subscribed: sub},
+		}:
+			return nil, nil
+		default:
+			return nil, fmt.Errorf("send channel full")
+		}
+	}
+
+	resultCh := make(chan SubscribedAckResult, 1)
+
+	c.pendingAcksMu.Lock()
+	c.pendingAcks[sub.Id] = resultCh
+	c.pendingAcksMu.Unlock()
+
 	select {
 	case c.sendCh <- &apiv1.DaemonEvent{
 		Event: &apiv1.DaemonEvent_Subscribed{Subscribed: sub},
 	}:
 	default:
-		c.logger.Warn().Str("id", sub.Id).Msg("send channel full, dropping subscribed event")
+		c.pendingAcksMu.Lock()
+		delete(c.pendingAcks, sub.Id)
+		c.pendingAcksMu.Unlock()
+		return nil, fmt.Errorf("send channel full")
+	}
+
+	timeoutCtx, cancel := context.WithTimeout(ctx, c.subscribeAckTimeout)
+	defer cancel()
+
+	select {
+	case result := <-resultCh:
+		return result.Ack, result.Err
+	case <-timeoutCtx.Done():
+		c.pendingAcksMu.Lock()
+		delete(c.pendingAcks, sub.Id)
+		c.pendingAcksMu.Unlock()
+		return nil, fmt.Errorf("timeout waiting for subscribed ack from control plane")
 	}
 }
 
@@ -314,6 +380,53 @@ func (c *ControlPlaneClient) MakeProxyFunc(attachmentID string) DnsProxyFunc {
 		}
 
 		return resp.Allow, resp.AddToFilter, resp.Ips, nil
+	}
+}
+
+func (c *ControlPlaneClient) applySubscribedAck(id string, ack *apiv1.SubscribedAck) {
+	if ack == nil {
+		return
+	}
+	if err := c.server.SetFilterMode(id, ack.Mode); err != nil {
+		c.logger.Error().Err(err).Str("id", id).Msg("failed to set filter mode from subscribed ack")
+	}
+
+	for _, entry := range ack.AllowCidrs {
+		cidr, err := filter.ParseCIDR(entry.Cidr)
+		if err != nil {
+			c.logger.Error().Err(err).Str("id", id).Str("cidr", entry.Cidr).Msg("failed to parse allow CIDR in subscribed ack")
+			continue
+		}
+		if err := c.server.AllowCIDR(id, cidr); err != nil {
+			c.logger.Error().Err(err).Str("id", id).Str("cidr", entry.Cidr).Msg("failed to allow CIDR in subscribed ack")
+		}
+	}
+
+	for _, entry := range ack.DenyCidrs {
+		cidr, err := filter.ParseCIDR(entry.Cidr)
+		if err != nil {
+			c.logger.Error().Err(err).Str("id", id).Str("cidr", entry.Cidr).Msg("failed to parse deny CIDR in subscribed ack")
+			continue
+		}
+		if err := c.server.DenyCIDR(id, cidr); err != nil {
+			c.logger.Error().Err(err).Str("id", id).Str("cidr", entry.Cidr).Msg("failed to deny CIDR in subscribed ack")
+		}
+	}
+
+	if ack.Dns != nil {
+		if err := c.server.SetDnsMode(id, ack.Dns.Mode); err != nil {
+			c.logger.Error().Err(err).Str("id", id).Msg("failed to set DNS mode in subscribed ack")
+		}
+		for _, entry := range ack.Dns.AllowDomains {
+			if err := c.server.AllowDomain(id, entry.Domain, entry.IncludeSubdomains); err != nil {
+				c.logger.Error().Err(err).Str("id", id).Str("domain", entry.Domain).Msg("failed to allow domain in subscribed ack")
+			}
+		}
+		for _, entry := range ack.Dns.DenyDomains {
+			if err := c.server.DenyDomain(id, entry.Domain, entry.IncludeSubdomains); err != nil {
+				c.logger.Error().Err(err).Str("id", id).Str("domain", entry.Domain).Msg("failed to deny domain in subscribed ack")
+			}
+		}
 	}
 }
 

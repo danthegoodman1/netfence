@@ -84,11 +84,9 @@ type AttachRequest struct {
 	//	*AttachRequest_InterfaceName
 	//	*AttachRequest_CgroupPath
 	Target isAttachRequest_Target `protobuf_oneof:"target"`
-	// Initial policy mode (defaults to DISABLED if not specified)
-	Mode PolicyMode `protobuf:"varint,3,opt,name=mode,proto3,enum=netfence.v1.PolicyMode" json:"mode,omitempty"`
 	// User-defined metadata (VM ID, tenant, container ID, etc.)
 	// This is passed to the control plane with the subscription.
-	Metadata      map[string]string `protobuf:"bytes,4,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	Metadata      map[string]string `protobuf:"bytes,3,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -146,13 +144,6 @@ func (x *AttachRequest) GetCgroupPath() string {
 		}
 	}
 	return ""
-}
-
-func (x *AttachRequest) GetMode() PolicyMode {
-	if x != nil {
-		return x.Mode
-	}
-	return PolicyMode_POLICY_MODE_UNSPECIFIED
 }
 
 func (x *AttachRequest) GetMetadata() map[string]string {
@@ -629,13 +620,12 @@ var File_v1_daemon_proto protoreflect.FileDescriptor
 
 const file_v1_daemon_proto_rawDesc = "" +
 	"\n" +
-	"\x0fv1/daemon.proto\x12\vnetfence.v1\x1a\x1bgoogle/protobuf/empty.proto\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x0ev1/types.proto\"\x95\x02\n" +
+	"\x0fv1/daemon.proto\x12\vnetfence.v1\x1a\x1bgoogle/protobuf/empty.proto\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x0ev1/types.proto\"\xe8\x01\n" +
 	"\rAttachRequest\x12'\n" +
 	"\x0einterface_name\x18\x01 \x01(\tH\x00R\rinterfaceName\x12!\n" +
 	"\vcgroup_path\x18\x02 \x01(\tH\x00R\n" +
-	"cgroupPath\x12+\n" +
-	"\x04mode\x18\x03 \x01(\x0e2\x17.netfence.v1.PolicyModeR\x04mode\x12D\n" +
-	"\bmetadata\x18\x04 \x03(\v2(.netfence.v1.AttachRequest.MetadataEntryR\bmetadata\x1a;\n" +
+	"cgroupPath\x12D\n" +
+	"\bmetadata\x18\x03 \x03(\v2(.netfence.v1.AttachRequest.MetadataEntryR\bmetadata\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01B\b\n" +
@@ -717,35 +707,34 @@ var file_v1_daemon_proto_goTypes = []any{
 	(*DaemonStatus)(nil),          // 7: netfence.v1.DaemonStatus
 	nil,                           // 8: netfence.v1.AttachRequest.MetadataEntry
 	nil,                           // 9: netfence.v1.AttachmentInfo.MetadataEntry
-	(PolicyMode)(0),               // 10: netfence.v1.PolicyMode
-	(AttachmentType)(0),           // 11: netfence.v1.AttachmentType
+	(AttachmentType)(0),           // 10: netfence.v1.AttachmentType
+	(PolicyMode)(0),               // 11: netfence.v1.PolicyMode
 	(DnsMode)(0),                  // 12: netfence.v1.DnsMode
 	(*timestamppb.Timestamp)(nil), // 13: google.protobuf.Timestamp
 	(*emptypb.Empty)(nil),         // 14: google.protobuf.Empty
 }
 var file_v1_daemon_proto_depIdxs = []int32{
-	10, // 0: netfence.v1.AttachRequest.mode:type_name -> netfence.v1.PolicyMode
-	8,  // 1: netfence.v1.AttachRequest.metadata:type_name -> netfence.v1.AttachRequest.MetadataEntry
-	6,  // 2: netfence.v1.ListResponse.attachments:type_name -> netfence.v1.AttachmentInfo
-	11, // 3: netfence.v1.AttachmentInfo.type:type_name -> netfence.v1.AttachmentType
-	10, // 4: netfence.v1.AttachmentInfo.mode:type_name -> netfence.v1.PolicyMode
-	12, // 5: netfence.v1.AttachmentInfo.dns_mode:type_name -> netfence.v1.DnsMode
-	9,  // 6: netfence.v1.AttachmentInfo.metadata:type_name -> netfence.v1.AttachmentInfo.MetadataEntry
-	13, // 7: netfence.v1.AttachmentInfo.attached_at:type_name -> google.protobuf.Timestamp
-	0,  // 8: netfence.v1.DaemonStatus.control_plane_state:type_name -> netfence.v1.ConnectionState
-	1,  // 9: netfence.v1.DaemonService.Attach:input_type -> netfence.v1.AttachRequest
-	3,  // 10: netfence.v1.DaemonService.Detach:input_type -> netfence.v1.DetachRequest
-	4,  // 11: netfence.v1.DaemonService.List:input_type -> netfence.v1.ListRequest
-	14, // 12: netfence.v1.DaemonService.GetStatus:input_type -> google.protobuf.Empty
-	2,  // 13: netfence.v1.DaemonService.Attach:output_type -> netfence.v1.AttachResponse
-	14, // 14: netfence.v1.DaemonService.Detach:output_type -> google.protobuf.Empty
-	5,  // 15: netfence.v1.DaemonService.List:output_type -> netfence.v1.ListResponse
-	7,  // 16: netfence.v1.DaemonService.GetStatus:output_type -> netfence.v1.DaemonStatus
-	13, // [13:17] is the sub-list for method output_type
-	9,  // [9:13] is the sub-list for method input_type
-	9,  // [9:9] is the sub-list for extension type_name
-	9,  // [9:9] is the sub-list for extension extendee
-	0,  // [0:9] is the sub-list for field type_name
+	8,  // 0: netfence.v1.AttachRequest.metadata:type_name -> netfence.v1.AttachRequest.MetadataEntry
+	6,  // 1: netfence.v1.ListResponse.attachments:type_name -> netfence.v1.AttachmentInfo
+	10, // 2: netfence.v1.AttachmentInfo.type:type_name -> netfence.v1.AttachmentType
+	11, // 3: netfence.v1.AttachmentInfo.mode:type_name -> netfence.v1.PolicyMode
+	12, // 4: netfence.v1.AttachmentInfo.dns_mode:type_name -> netfence.v1.DnsMode
+	9,  // 5: netfence.v1.AttachmentInfo.metadata:type_name -> netfence.v1.AttachmentInfo.MetadataEntry
+	13, // 6: netfence.v1.AttachmentInfo.attached_at:type_name -> google.protobuf.Timestamp
+	0,  // 7: netfence.v1.DaemonStatus.control_plane_state:type_name -> netfence.v1.ConnectionState
+	1,  // 8: netfence.v1.DaemonService.Attach:input_type -> netfence.v1.AttachRequest
+	3,  // 9: netfence.v1.DaemonService.Detach:input_type -> netfence.v1.DetachRequest
+	4,  // 10: netfence.v1.DaemonService.List:input_type -> netfence.v1.ListRequest
+	14, // 11: netfence.v1.DaemonService.GetStatus:input_type -> google.protobuf.Empty
+	2,  // 12: netfence.v1.DaemonService.Attach:output_type -> netfence.v1.AttachResponse
+	14, // 13: netfence.v1.DaemonService.Detach:output_type -> google.protobuf.Empty
+	5,  // 14: netfence.v1.DaemonService.List:output_type -> netfence.v1.ListResponse
+	7,  // 15: netfence.v1.DaemonService.GetStatus:output_type -> netfence.v1.DaemonStatus
+	12, // [12:16] is the sub-list for method output_type
+	8,  // [8:12] is the sub-list for method input_type
+	8,  // [8:8] is the sub-list for extension type_name
+	8,  // [8:8] is the sub-list for extension extendee
+	0,  // [0:8] is the sub-list for field type_name
 }
 
 func init() { file_v1_daemon_proto_init() }

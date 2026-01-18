@@ -84,12 +84,13 @@ netfenced attach --interface veth123 --metadata vm_id=abc
 # Attach to a cgroup
 netfenced attach --cgroup /sys/fs/cgroup/... --metadata container_id=xyz
 
-# Attach with initial policy mode
-netfenced attach --interface eth0 --mode allowlist --metadata tenant=acme,env=prod
+# Attach with metadata
+netfenced attach --interface eth0 --metadata tenant=acme,env=prod
 ```
 
 - Daemon attaches eBPF filter to the target
-- Daemon sends `Subscribed{id, target, type, metadata}` to control plane
+- Daemon sends `Subscribed{id, target, type, metadata}` to control plane and waits for `SubscribedAck` with initial config (mode, CIDRs, DNS rules)
+- If the control plane doesn't respond within the timeout (default 5s, configurable via `control_plane.subscribe_ack_timeout`), the attachment is rolled back and the attach call fails
 - Daemon watches for target removal and sends `Unsubscribed` automatically
 
 **RPC:**
@@ -123,10 +124,11 @@ Implement `ControlPlane.Connect` RPC - a bidirectional stream:
 
 **Send to daemon:**
 - `SyncAck` after receiving SyncRequest
+- `SubscribedAck{mode, cidrs, dns_config}` after receiving Subscribed (required - daemon waits for this)
 - `SetMode{mode}` - change IP filter policy mode
 - `AllowCIDR{cidr, ttl}` / `DenyCIDR` / `RemoveCIDR`
 - `SetDnsMode{mode}` - change DNS filtering mode
 - `AllowDomain{domain}` / `DenyDomain` / `RemoveDomain`
 - `BulkUpdate{mode, cidrs, dns_config}` - full state sync
 
-Use the metadata from `Subscribed` to identify which VM/tenant/container this attachment belongs to, then push appropriate rules.
+When the daemon receives `Subscribed`, it blocks waiting for `SubscribedAck` before returning success to the caller. This ensures the attachment has its initial configuration before traffic flows. Use the metadata to identify which VM/tenant/container this attachment belongs to and respond with the appropriate initial rules.

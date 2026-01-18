@@ -149,11 +149,31 @@ message ControlCommand {
     DomainEntry deny_domain = 10;
     // Remove a domain from DNS allow/deny lists
     string remove_domain = 11;
+    // Acknowledge subscription with initial config (sent after receiving Subscribed)
+    SubscribedAck subscribed_ack = 12;
   }
 }
 
 // SyncAck acknowledges that the control plane has processed the SyncRequest.
 message SyncAck {}
+
+// SubscribedAck acknowledges a Subscribed event and provides initial configuration.
+//
+// Design note: This is sent over the bidirectional stream (rather than a separate
+// unary RPC) to ensure the same control plane node that holds the stream connection
+// is the one that receives the subscription and responds. In a horizontally scaled
+// control plane, a separate unary RPC could be load-balanced to a different node
+// that doesn't have the stream, requiring cross-node coordination.
+message SubscribedAck {
+  // Initial IP filter policy mode
+  PolicyMode mode = 1;
+  // Initial CIDRs to allow
+  repeated CIDREntry allow_cidrs = 2;
+  // Initial CIDRs to deny
+  repeated CIDREntry deny_cidrs = 3;
+  // Initial DNS configuration
+  DnsConfig dns = 4;
+}
 
 // SetMode changes the policy mode for an attachment.
 message SetMode { PolicyMode mode = 1; }

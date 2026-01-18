@@ -71,7 +71,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 	defer cancel()
 
 	if cfg.ControlPlane.URL != "" {
-		cpClient := daemon.NewControlPlaneClient(cfg.ControlPlane.URL, server, logger, cfg.Metadata)
+		cpClient := daemon.NewControlPlaneClient(cfg.ControlPlane.URL, server, logger, cfg.Metadata, cfg.ControlPlane.SubscribeAckTimeout)
 		server.SetControlPlaneClient(cpClient)
 		go cpClient.Run(ctx)
 	}

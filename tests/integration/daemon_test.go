@@ -94,7 +94,6 @@ func TestDaemonAttachCgroup(t *testing.T) {
 	ctx := context.Background()
 	resp, err := ts.server.Attach(ctx, &apiv1.AttachRequest{
 		Target: &apiv1.AttachRequest_CgroupPath{CgroupPath: cgroupPath},
-		Mode:   apiv1.PolicyMode_POLICY_MODE_DISABLED,
 	})
 	require.NoError(t, err, "attach should succeed")
 	require.NotEmpty(t, resp.Id, "should return attachment ID")
@@ -130,7 +129,6 @@ func TestDaemonAttachInterface(t *testing.T) {
 	ctx := context.Background()
 	resp, err := ts.server.Attach(ctx, &apiv1.AttachRequest{
 		Target: &apiv1.AttachRequest_InterfaceName{InterfaceName: ifaceName},
-		Mode:   apiv1.PolicyMode_POLICY_MODE_DISABLED,
 	})
 	require.NoError(t, err, "attach should succeed")
 	require.NotEmpty(t, resp.Id, "should return attachment ID")
@@ -165,7 +163,6 @@ func TestDaemonManualDetachCgroup(t *testing.T) {
 	ctx := context.Background()
 	resp, err := ts.server.Attach(ctx, &apiv1.AttachRequest{
 		Target: &apiv1.AttachRequest_CgroupPath{CgroupPath: cgroupPath},
-		Mode:   apiv1.PolicyMode_POLICY_MODE_DISABLED,
 	})
 	require.NoError(t, err)
 
@@ -204,7 +201,6 @@ func TestDaemonManualDetachInterface(t *testing.T) {
 	ctx := context.Background()
 	resp, err := ts.server.Attach(ctx, &apiv1.AttachRequest{
 		Target: &apiv1.AttachRequest_InterfaceName{InterfaceName: ifaceName},
-		Mode:   apiv1.PolicyMode_POLICY_MODE_DISABLED,
 	})
 	require.NoError(t, err)
 
@@ -243,7 +239,6 @@ func TestDaemonAutoRemoveCgroup(t *testing.T) {
 	ctx := context.Background()
 	resp, err := ts.server.Attach(ctx, &apiv1.AttachRequest{
 		Target: &apiv1.AttachRequest_CgroupPath{CgroupPath: cgroupPath},
-		Mode:   apiv1.PolicyMode_POLICY_MODE_DISABLED,
 	})
 	require.NoError(t, err)
 
@@ -289,7 +284,6 @@ func TestDaemonAutoRemoveInterface(t *testing.T) {
 	ctx := context.Background()
 	resp, err := ts.server.Attach(ctx, &apiv1.AttachRequest{
 		Target: &apiv1.AttachRequest_InterfaceName{InterfaceName: ifaceName},
-		Mode:   apiv1.PolicyMode_POLICY_MODE_DISABLED,
 	})
 	require.NoError(t, err)
 
@@ -336,7 +330,6 @@ func TestDaemonDNSServerResponds(t *testing.T) {
 	ctx := context.Background()
 	resp, err := ts.server.Attach(ctx, &apiv1.AttachRequest{
 		Target: &apiv1.AttachRequest_CgroupPath{CgroupPath: cgroupPath},
-		Mode:   apiv1.PolicyMode_POLICY_MODE_DISABLED,
 	})
 	require.NoError(t, err)
 

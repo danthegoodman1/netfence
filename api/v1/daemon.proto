@@ -33,11 +33,9 @@ message AttachRequest {
     // Cgroup path for cgroup attachment (e.g., "/sys/fs/cgroup/user.slice/...")
     string cgroup_path = 2;
   }
-  // Initial policy mode (defaults to DISABLED if not specified)
-  PolicyMode mode = 3;
   // User-defined metadata (VM ID, tenant, container ID, etc.)
   // This is passed to the control plane with the subscription.
-  map<string, string> metadata = 4;
+  map<string, string> metadata = 3;
 }
 
 // AttachResponse confirms attachment.

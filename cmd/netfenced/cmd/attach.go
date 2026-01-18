@@ -17,7 +17,6 @@ import (
 var (
 	interfaceName string
 	cgroupPath    string
-	policyMode    string
 	metadata      []string
 )
 
@@ -26,17 +25,19 @@ var attachCmd = &cobra.Command{
 	Short: "Attach an eBPF filter to an interface or cgroup",
 	Long: `Attach an eBPF filter to a network interface (TC) or cgroup.
 
+The filter starts in DISABLED mode. The control plane provides the initial
+configuration (mode, allowed CIDRs, DNS rules) via SubscribedAck.
+
 Examples:
   netfenced attach --interface eth0
   netfenced attach --cgroup /sys/fs/cgroup/user.slice/... --metadata vm_id=abc123
-  netfenced attach --interface veth123 --mode allowlist --metadata tenant=acme,env=prod`,
+  netfenced attach --interface veth123 --metadata tenant=acme,env=prod`,
 	RunE: runAttach,
 }
 
 func init() {
 	attachCmd.Flags().StringVarP(&interfaceName, "interface", "i", "", "network interface name (TC attachment)")
 	attachCmd.Flags().StringVarP(&cgroupPath, "cgroup", "g", "", "cgroup path (cgroup attachment)")
-	attachCmd.Flags().StringVarP(&policyMode, "mode", "m", "disabled", "policy mode: disabled, allowlist, denylist, block-all")
 	attachCmd.Flags().StringSliceVar(&metadata, "metadata", nil, "metadata key=value pairs")
 	rootCmd.AddCommand(attachCmd)
 }
@@ -56,7 +57,6 @@ func runAttach(cmd *cobra.Command, args []string) error {
 	defer conn.Close()
 
 	req := &apiv1.AttachRequest{
-		Mode:     parsePolicyModeFlag(policyMode),
 		Metadata: parseMetadata(metadata),
 	}
 
@@ -104,19 +104,4 @@ func parseMetadata(pairs []string) map[string]string {
 		}
 	}
 	return m
-}
-
-func parsePolicyModeFlag(s string) apiv1.PolicyMode {
-	switch strings.ToLower(s) {
-	case "disabled":
-		return apiv1.PolicyMode_POLICY_MODE_DISABLED
-	case "allowlist":
-		return apiv1.PolicyMode_POLICY_MODE_ALLOWLIST
-	case "denylist":
-		return apiv1.PolicyMode_POLICY_MODE_DENYLIST
-	case "block-all", "blockall":
-		return apiv1.PolicyMode_POLICY_MODE_BLOCK_ALL
-	default:
-		return apiv1.PolicyMode_POLICY_MODE_DISABLED
-	}
 }
