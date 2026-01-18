@@ -5,6 +5,7 @@ package netfence.v1;
 option go_package = "github.com/danthegoodman1/netfence/api/v1;apiv1";
 
 import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
 import "v1/types.proto";
 
 // DaemonService is the local API exposed by the daemon.
@@ -17,8 +18,8 @@ service DaemonService {
   // Detach removes the eBPF filter and unsubscribes from the control plane.
   rpc Detach(DetachRequest) returns (google.protobuf.Empty);
 
-  // List returns all currently attached filters.
-  rpc List(google.protobuf.Empty) returns (ListResponse);
+  // List returns attached filters with pagination (sorted by attach time).
+  rpc List(ListRequest) returns (ListResponse);
 
   // GetStatus returns the current daemon status.
   rpc GetStatus(google.protobuf.Empty) returns (DaemonStatus);
@@ -54,9 +55,21 @@ message DetachRequest {
   string id = 1;
 }
 
-// ListResponse contains all active attachments.
+// ListRequest specifies pagination parameters.
+message ListRequest {
+  // Maximum number of attachments to return (default: 100, max: 1000)
+  int32 page_size = 1;
+  // Page token from a previous ListResponse for fetching the next page
+  string page_token = 2;
+}
+
+// ListResponse contains active attachments with pagination.
 message ListResponse {
   repeated AttachmentInfo attachments = 1;
+  // Token to retrieve the next page (empty if no more results)
+  string next_page_token = 2;
+  // Total number of attachments (across all pages)
+  int32 total_count = 3;
 }
 
 // AttachmentInfo contains details about an active attachment.
@@ -77,6 +90,8 @@ message AttachmentInfo {
   uint64 packets_blocked = 9;
   uint64 dns_queries_allowed = 10;
   uint64 dns_queries_blocked = 11;
+  // When the filter was attached (used for stable pagination ordering)
+  google.protobuf.Timestamp attached_at = 12;
 }
 
 // DaemonStatus contains the current state of the daemon.

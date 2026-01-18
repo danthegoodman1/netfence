@@ -10,6 +10,7 @@ import (
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	emptypb "google.golang.org/protobuf/types/known/emptypb"
+	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
 	reflect "reflect"
 	sync "sync"
 	unsafe "unsafe"
@@ -281,17 +282,76 @@ func (x *DetachRequest) GetId() string {
 	return ""
 }
 
-// ListResponse contains all active attachments.
+// ListRequest specifies pagination parameters.
+type ListRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Maximum number of attachments to return (default: 100, max: 1000)
+	PageSize int32 `protobuf:"varint,1,opt,name=page_size,json=pageSize,proto3" json:"page_size,omitempty"`
+	// Page token from a previous ListResponse for fetching the next page
+	PageToken     string `protobuf:"bytes,2,opt,name=page_token,json=pageToken,proto3" json:"page_token,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListRequest) Reset() {
+	*x = ListRequest{}
+	mi := &file_v1_daemon_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListRequest) ProtoMessage() {}
+
+func (x *ListRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_v1_daemon_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListRequest.ProtoReflect.Descriptor instead.
+func (*ListRequest) Descriptor() ([]byte, []int) {
+	return file_v1_daemon_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *ListRequest) GetPageSize() int32 {
+	if x != nil {
+		return x.PageSize
+	}
+	return 0
+}
+
+func (x *ListRequest) GetPageToken() string {
+	if x != nil {
+		return x.PageToken
+	}
+	return ""
+}
+
+// ListResponse contains active attachments with pagination.
 type ListResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Attachments   []*AttachmentInfo      `protobuf:"bytes,1,rep,name=attachments,proto3" json:"attachments,omitempty"`
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	Attachments []*AttachmentInfo      `protobuf:"bytes,1,rep,name=attachments,proto3" json:"attachments,omitempty"`
+	// Token to retrieve the next page (empty if no more results)
+	NextPageToken string `protobuf:"bytes,2,opt,name=next_page_token,json=nextPageToken,proto3" json:"next_page_token,omitempty"`
+	// Total number of attachments (across all pages)
+	TotalCount    int32 `protobuf:"varint,3,opt,name=total_count,json=totalCount,proto3" json:"total_count,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *ListResponse) Reset() {
 	*x = ListResponse{}
-	mi := &file_v1_daemon_proto_msgTypes[3]
+	mi := &file_v1_daemon_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -303,7 +363,7 @@ func (x *ListResponse) String() string {
 func (*ListResponse) ProtoMessage() {}
 
 func (x *ListResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_v1_daemon_proto_msgTypes[3]
+	mi := &file_v1_daemon_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -316,7 +376,7 @@ func (x *ListResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListResponse.ProtoReflect.Descriptor instead.
 func (*ListResponse) Descriptor() ([]byte, []int) {
-	return file_v1_daemon_proto_rawDescGZIP(), []int{3}
+	return file_v1_daemon_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *ListResponse) GetAttachments() []*AttachmentInfo {
@@ -324,6 +384,20 @@ func (x *ListResponse) GetAttachments() []*AttachmentInfo {
 		return x.Attachments
 	}
 	return nil
+}
+
+func (x *ListResponse) GetNextPageToken() string {
+	if x != nil {
+		return x.NextPageToken
+	}
+	return ""
+}
+
+func (x *ListResponse) GetTotalCount() int32 {
+	if x != nil {
+		return x.TotalCount
+	}
+	return 0
 }
 
 // AttachmentInfo contains details about an active attachment.
@@ -345,13 +419,15 @@ type AttachmentInfo struct {
 	PacketsBlocked    uint64            `protobuf:"varint,9,opt,name=packets_blocked,json=packetsBlocked,proto3" json:"packets_blocked,omitempty"`
 	DnsQueriesAllowed uint64            `protobuf:"varint,10,opt,name=dns_queries_allowed,json=dnsQueriesAllowed,proto3" json:"dns_queries_allowed,omitempty"`
 	DnsQueriesBlocked uint64            `protobuf:"varint,11,opt,name=dns_queries_blocked,json=dnsQueriesBlocked,proto3" json:"dns_queries_blocked,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	// When the filter was attached (used for stable pagination ordering)
+	AttachedAt    *timestamppb.Timestamp `protobuf:"bytes,12,opt,name=attached_at,json=attachedAt,proto3" json:"attached_at,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *AttachmentInfo) Reset() {
 	*x = AttachmentInfo{}
-	mi := &file_v1_daemon_proto_msgTypes[4]
+	mi := &file_v1_daemon_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -363,7 +439,7 @@ func (x *AttachmentInfo) String() string {
 func (*AttachmentInfo) ProtoMessage() {}
 
 func (x *AttachmentInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_v1_daemon_proto_msgTypes[4]
+	mi := &file_v1_daemon_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -376,7 +452,7 @@ func (x *AttachmentInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AttachmentInfo.ProtoReflect.Descriptor instead.
 func (*AttachmentInfo) Descriptor() ([]byte, []int) {
-	return file_v1_daemon_proto_rawDescGZIP(), []int{4}
+	return file_v1_daemon_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *AttachmentInfo) GetId() string {
@@ -456,6 +532,13 @@ func (x *AttachmentInfo) GetDnsQueriesBlocked() uint64 {
 	return 0
 }
 
+func (x *AttachmentInfo) GetAttachedAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.AttachedAt
+	}
+	return nil
+}
+
 // DaemonStatus contains the current state of the daemon.
 type DaemonStatus struct {
 	state    protoimpl.MessageState `protogen:"open.v1"`
@@ -472,7 +555,7 @@ type DaemonStatus struct {
 
 func (x *DaemonStatus) Reset() {
 	*x = DaemonStatus{}
-	mi := &file_v1_daemon_proto_msgTypes[5]
+	mi := &file_v1_daemon_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -484,7 +567,7 @@ func (x *DaemonStatus) String() string {
 func (*DaemonStatus) ProtoMessage() {}
 
 func (x *DaemonStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_v1_daemon_proto_msgTypes[5]
+	mi := &file_v1_daemon_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -497,7 +580,7 @@ func (x *DaemonStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DaemonStatus.ProtoReflect.Descriptor instead.
 func (*DaemonStatus) Descriptor() ([]byte, []int) {
-	return file_v1_daemon_proto_rawDescGZIP(), []int{5}
+	return file_v1_daemon_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *DaemonStatus) GetVersion() string {
@@ -546,7 +629,7 @@ var File_v1_daemon_proto protoreflect.FileDescriptor
 
 const file_v1_daemon_proto_rawDesc = "" +
 	"\n" +
-	"\x0fv1/daemon.proto\x12\vnetfence.v1\x1a\x1bgoogle/protobuf/empty.proto\x1a\x0ev1/types.proto\"\x95\x02\n" +
+	"\x0fv1/daemon.proto\x12\vnetfence.v1\x1a\x1bgoogle/protobuf/empty.proto\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x0ev1/types.proto\"\x95\x02\n" +
 	"\rAttachRequest\x12'\n" +
 	"\x0einterface_name\x18\x01 \x01(\tH\x00R\rinterfaceName\x12!\n" +
 	"\vcgroup_path\x18\x02 \x01(\tH\x00R\n" +
@@ -562,9 +645,16 @@ const file_v1_daemon_proto_rawDesc = "" +
 	"\vdns_address\x18\x02 \x01(\tR\n" +
 	"dnsAddress\"\x1f\n" +
 	"\rDetachRequest\x12\x0e\n" +
-	"\x02id\x18\x01 \x01(\tR\x02id\"M\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\"I\n" +
+	"\vListRequest\x12\x1b\n" +
+	"\tpage_size\x18\x01 \x01(\x05R\bpageSize\x12\x1d\n" +
+	"\n" +
+	"page_token\x18\x02 \x01(\tR\tpageToken\"\x96\x01\n" +
 	"\fListResponse\x12=\n" +
-	"\vattachments\x18\x01 \x03(\v2\x1b.netfence.v1.AttachmentInfoR\vattachments\"\x9e\x04\n" +
+	"\vattachments\x18\x01 \x03(\v2\x1b.netfence.v1.AttachmentInfoR\vattachments\x12&\n" +
+	"\x0fnext_page_token\x18\x02 \x01(\tR\rnextPageToken\x12\x1f\n" +
+	"\vtotal_count\x18\x03 \x01(\x05R\n" +
+	"totalCount\"\xdb\x04\n" +
 	"\x0eAttachmentInfo\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x16\n" +
 	"\x06target\x18\x02 \x01(\tR\x06target\x12/\n" +
@@ -578,7 +668,9 @@ const file_v1_daemon_proto_rawDesc = "" +
 	"\x0fpackets_blocked\x18\t \x01(\x04R\x0epacketsBlocked\x12.\n" +
 	"\x13dns_queries_allowed\x18\n" +
 	" \x01(\x04R\x11dnsQueriesAllowed\x12.\n" +
-	"\x13dns_queries_blocked\x18\v \x01(\x04R\x11dnsQueriesBlocked\x1a;\n" +
+	"\x13dns_queries_blocked\x18\v \x01(\x04R\x11dnsQueriesBlocked\x12;\n" +
+	"\vattached_at\x18\f \x01(\v2\x1a.google.protobuf.TimestampR\n" +
+	"attachedAt\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x8e\x02\n" +
@@ -593,11 +685,11 @@ const file_v1_daemon_proto_rawDesc = "" +
 	"\x1cCONNECTION_STATE_UNSPECIFIED\x10\x00\x12!\n" +
 	"\x1dCONNECTION_STATE_DISCONNECTED\x10\x01\x12\x1f\n" +
 	"\x1bCONNECTION_STATE_CONNECTING\x10\x02\x12\x1e\n" +
-	"\x1aCONNECTION_STATE_CONNECTED\x10\x032\x8b\x02\n" +
+	"\x1aCONNECTION_STATE_CONNECTED\x10\x032\x8d\x02\n" +
 	"\rDaemonService\x12A\n" +
 	"\x06Attach\x12\x1a.netfence.v1.AttachRequest\x1a\x1b.netfence.v1.AttachResponse\x12<\n" +
-	"\x06Detach\x12\x1a.netfence.v1.DetachRequest\x1a\x16.google.protobuf.Empty\x129\n" +
-	"\x04List\x12\x16.google.protobuf.Empty\x1a\x19.netfence.v1.ListResponse\x12>\n" +
+	"\x06Detach\x12\x1a.netfence.v1.DetachRequest\x1a\x16.google.protobuf.Empty\x12;\n" +
+	"\x04List\x12\x18.netfence.v1.ListRequest\x1a\x19.netfence.v1.ListResponse\x12>\n" +
 	"\tGetStatus\x12\x16.google.protobuf.Empty\x1a\x19.netfence.v1.DaemonStatusB1Z/github.com/danthegoodman1/netfence/api/v1;apiv1b\x06proto3"
 
 var (
@@ -613,44 +705,47 @@ func file_v1_daemon_proto_rawDescGZIP() []byte {
 }
 
 var file_v1_daemon_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_v1_daemon_proto_msgTypes = make([]protoimpl.MessageInfo, 8)
+var file_v1_daemon_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
 var file_v1_daemon_proto_goTypes = []any{
-	(ConnectionState)(0),   // 0: netfence.v1.ConnectionState
-	(*AttachRequest)(nil),  // 1: netfence.v1.AttachRequest
-	(*AttachResponse)(nil), // 2: netfence.v1.AttachResponse
-	(*DetachRequest)(nil),  // 3: netfence.v1.DetachRequest
-	(*ListResponse)(nil),   // 4: netfence.v1.ListResponse
-	(*AttachmentInfo)(nil), // 5: netfence.v1.AttachmentInfo
-	(*DaemonStatus)(nil),   // 6: netfence.v1.DaemonStatus
-	nil,                    // 7: netfence.v1.AttachRequest.MetadataEntry
-	nil,                    // 8: netfence.v1.AttachmentInfo.MetadataEntry
-	(PolicyMode)(0),        // 9: netfence.v1.PolicyMode
-	(AttachmentType)(0),    // 10: netfence.v1.AttachmentType
-	(DnsMode)(0),           // 11: netfence.v1.DnsMode
-	(*emptypb.Empty)(nil),  // 12: google.protobuf.Empty
+	(ConnectionState)(0),          // 0: netfence.v1.ConnectionState
+	(*AttachRequest)(nil),         // 1: netfence.v1.AttachRequest
+	(*AttachResponse)(nil),        // 2: netfence.v1.AttachResponse
+	(*DetachRequest)(nil),         // 3: netfence.v1.DetachRequest
+	(*ListRequest)(nil),           // 4: netfence.v1.ListRequest
+	(*ListResponse)(nil),          // 5: netfence.v1.ListResponse
+	(*AttachmentInfo)(nil),        // 6: netfence.v1.AttachmentInfo
+	(*DaemonStatus)(nil),          // 7: netfence.v1.DaemonStatus
+	nil,                           // 8: netfence.v1.AttachRequest.MetadataEntry
+	nil,                           // 9: netfence.v1.AttachmentInfo.MetadataEntry
+	(PolicyMode)(0),               // 10: netfence.v1.PolicyMode
+	(AttachmentType)(0),           // 11: netfence.v1.AttachmentType
+	(DnsMode)(0),                  // 12: netfence.v1.DnsMode
+	(*timestamppb.Timestamp)(nil), // 13: google.protobuf.Timestamp
+	(*emptypb.Empty)(nil),         // 14: google.protobuf.Empty
 }
 var file_v1_daemon_proto_depIdxs = []int32{
-	9,  // 0: netfence.v1.AttachRequest.mode:type_name -> netfence.v1.PolicyMode
-	7,  // 1: netfence.v1.AttachRequest.metadata:type_name -> netfence.v1.AttachRequest.MetadataEntry
-	5,  // 2: netfence.v1.ListResponse.attachments:type_name -> netfence.v1.AttachmentInfo
-	10, // 3: netfence.v1.AttachmentInfo.type:type_name -> netfence.v1.AttachmentType
-	9,  // 4: netfence.v1.AttachmentInfo.mode:type_name -> netfence.v1.PolicyMode
-	11, // 5: netfence.v1.AttachmentInfo.dns_mode:type_name -> netfence.v1.DnsMode
-	8,  // 6: netfence.v1.AttachmentInfo.metadata:type_name -> netfence.v1.AttachmentInfo.MetadataEntry
-	0,  // 7: netfence.v1.DaemonStatus.control_plane_state:type_name -> netfence.v1.ConnectionState
-	1,  // 8: netfence.v1.DaemonService.Attach:input_type -> netfence.v1.AttachRequest
-	3,  // 9: netfence.v1.DaemonService.Detach:input_type -> netfence.v1.DetachRequest
-	12, // 10: netfence.v1.DaemonService.List:input_type -> google.protobuf.Empty
-	12, // 11: netfence.v1.DaemonService.GetStatus:input_type -> google.protobuf.Empty
-	2,  // 12: netfence.v1.DaemonService.Attach:output_type -> netfence.v1.AttachResponse
-	12, // 13: netfence.v1.DaemonService.Detach:output_type -> google.protobuf.Empty
-	4,  // 14: netfence.v1.DaemonService.List:output_type -> netfence.v1.ListResponse
-	6,  // 15: netfence.v1.DaemonService.GetStatus:output_type -> netfence.v1.DaemonStatus
-	12, // [12:16] is the sub-list for method output_type
-	8,  // [8:12] is the sub-list for method input_type
-	8,  // [8:8] is the sub-list for extension type_name
-	8,  // [8:8] is the sub-list for extension extendee
-	0,  // [0:8] is the sub-list for field type_name
+	10, // 0: netfence.v1.AttachRequest.mode:type_name -> netfence.v1.PolicyMode
+	8,  // 1: netfence.v1.AttachRequest.metadata:type_name -> netfence.v1.AttachRequest.MetadataEntry
+	6,  // 2: netfence.v1.ListResponse.attachments:type_name -> netfence.v1.AttachmentInfo
+	11, // 3: netfence.v1.AttachmentInfo.type:type_name -> netfence.v1.AttachmentType
+	10, // 4: netfence.v1.AttachmentInfo.mode:type_name -> netfence.v1.PolicyMode
+	12, // 5: netfence.v1.AttachmentInfo.dns_mode:type_name -> netfence.v1.DnsMode
+	9,  // 6: netfence.v1.AttachmentInfo.metadata:type_name -> netfence.v1.AttachmentInfo.MetadataEntry
+	13, // 7: netfence.v1.AttachmentInfo.attached_at:type_name -> google.protobuf.Timestamp
+	0,  // 8: netfence.v1.DaemonStatus.control_plane_state:type_name -> netfence.v1.ConnectionState
+	1,  // 9: netfence.v1.DaemonService.Attach:input_type -> netfence.v1.AttachRequest
+	3,  // 10: netfence.v1.DaemonService.Detach:input_type -> netfence.v1.DetachRequest
+	4,  // 11: netfence.v1.DaemonService.List:input_type -> netfence.v1.ListRequest
+	14, // 12: netfence.v1.DaemonService.GetStatus:input_type -> google.protobuf.Empty
+	2,  // 13: netfence.v1.DaemonService.Attach:output_type -> netfence.v1.AttachResponse
+	14, // 14: netfence.v1.DaemonService.Detach:output_type -> google.protobuf.Empty
+	5,  // 15: netfence.v1.DaemonService.List:output_type -> netfence.v1.ListResponse
+	7,  // 16: netfence.v1.DaemonService.GetStatus:output_type -> netfence.v1.DaemonStatus
+	13, // [13:17] is the sub-list for method output_type
+	9,  // [9:13] is the sub-list for method input_type
+	9,  // [9:9] is the sub-list for extension type_name
+	9,  // [9:9] is the sub-list for extension extendee
+	0,  // [0:9] is the sub-list for field type_name
 }
 
 func init() { file_v1_daemon_proto_init() }
@@ -669,7 +764,7 @@ func file_v1_daemon_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_v1_daemon_proto_rawDesc), len(file_v1_daemon_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   8,
+			NumMessages:   9,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

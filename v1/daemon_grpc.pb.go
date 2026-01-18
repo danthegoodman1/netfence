@@ -38,8 +38,8 @@ type DaemonServiceClient interface {
 	Attach(ctx context.Context, in *AttachRequest, opts ...grpc.CallOption) (*AttachResponse, error)
 	// Detach removes the eBPF filter and unsubscribes from the control plane.
 	Detach(ctx context.Context, in *DetachRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
-	// List returns all currently attached filters.
-	List(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*ListResponse, error)
+	// List returns attached filters with pagination (sorted by attach time).
+	List(ctx context.Context, in *ListRequest, opts ...grpc.CallOption) (*ListResponse, error)
 	// GetStatus returns the current daemon status.
 	GetStatus(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*DaemonStatus, error)
 }
@@ -72,7 +72,7 @@ func (c *daemonServiceClient) Detach(ctx context.Context, in *DetachRequest, opt
 	return out, nil
 }
 
-func (c *daemonServiceClient) List(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*ListResponse, error) {
+func (c *daemonServiceClient) List(ctx context.Context, in *ListRequest, opts ...grpc.CallOption) (*ListResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ListResponse)
 	err := c.cc.Invoke(ctx, DaemonService_List_FullMethodName, in, out, cOpts...)
@@ -104,8 +104,8 @@ type DaemonServiceServer interface {
 	Attach(context.Context, *AttachRequest) (*AttachResponse, error)
 	// Detach removes the eBPF filter and unsubscribes from the control plane.
 	Detach(context.Context, *DetachRequest) (*emptypb.Empty, error)
-	// List returns all currently attached filters.
-	List(context.Context, *emptypb.Empty) (*ListResponse, error)
+	// List returns attached filters with pagination (sorted by attach time).
+	List(context.Context, *ListRequest) (*ListResponse, error)
 	// GetStatus returns the current daemon status.
 	GetStatus(context.Context, *emptypb.Empty) (*DaemonStatus, error)
 	mustEmbedUnimplementedDaemonServiceServer()
@@ -124,7 +124,7 @@ func (UnimplementedDaemonServiceServer) Attach(context.Context, *AttachRequest) 
 func (UnimplementedDaemonServiceServer) Detach(context.Context, *DetachRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method Detach not implemented")
 }
-func (UnimplementedDaemonServiceServer) List(context.Context, *emptypb.Empty) (*ListResponse, error) {
+func (UnimplementedDaemonServiceServer) List(context.Context, *ListRequest) (*ListResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method List not implemented")
 }
 func (UnimplementedDaemonServiceServer) GetStatus(context.Context, *emptypb.Empty) (*DaemonStatus, error) {
@@ -188,7 +188,7 @@ func _DaemonService_Detach_Handler(srv interface{}, ctx context.Context, dec fun
 }
 
 func _DaemonService_List_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(emptypb.Empty)
+	in := new(ListRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
@@ -200,7 +200,7 @@ func _DaemonService_List_Handler(srv interface{}, ctx context.Context, dec func(
 		FullMethod: DaemonService_List_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(DaemonServiceServer).List(ctx, req.(*emptypb.Empty))
+		return srv.(DaemonServiceServer).List(ctx, req.(*ListRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
