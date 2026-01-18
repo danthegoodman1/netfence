@@ -71,10 +71,14 @@ func (s *DNSServer) Start() error {
 		return err
 	}
 
+	ready := make(chan struct{})
 	s.conn = conn
 	s.server = &dns.Server{
 		PacketConn: conn,
 		Handler:    dns.HandlerFunc(s.handleDNS),
+		NotifyStartedFunc: func() {
+			close(ready)
+		},
 	}
 
 	go func() {
@@ -84,6 +88,7 @@ func (s *DNSServer) Start() error {
 		}
 	}()
 
+	<-ready
 	return nil
 }
 
