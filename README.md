@@ -42,14 +42,32 @@ Each attachment gets a unique DNS address (port) provisioned by the daemon. Cont
 
 ## Per host
 
-- Run the daemon, which:
-  - Exposes a local gRPC API (`DaemonService`) for attaching/detaching filters
-  - Connects to your control plane via bidirectional stream (`ControlPlane.Connect`)
-  - Loads and manages eBPF programs
+Run the daemon, which:
+- Exposes a local gRPC API (`DaemonService`) for attaching/detaching filters
+- Connects to your control plane via bidirectional stream (`ControlPlane.Connect`)
+- Loads and manages eBPF programs
+
+**Start the daemon:**
+
+```bash
+# Start with default config
+netfenced start
+
+# Start with custom config file
+netfenced start --config /etc/netfence/config.yaml
+```
+
+**Check daemon status:**
+
+```bash
+netfenced status
+```
 
 ## Per attachment
 
-Your orchestration system calls the daemon's local API:
+Your orchestration system calls the daemon's local API.
+
+**RPC:**
 
 ```
 DaemonService.Attach(interface_name: "veth123", metadata: {vm_id: "abc"})
@@ -57,10 +75,41 @@ DaemonService.Attach(interface_name: "veth123", metadata: {vm_id: "abc"})
 DaemonService.Attach(cgroup_path: "/sys/fs/cgroup/...", metadata: {container_id: "xyz"})
 ```
 
+**CLI:**
+
+```bash
+# Attach to a network interface (TC)
+netfenced attach --interface veth123 --metadata vm_id=abc
+
+# Attach to a cgroup
+netfenced attach --cgroup /sys/fs/cgroup/... --metadata container_id=xyz
+
+# Attach with initial policy mode
+netfenced attach --interface eth0 --mode allowlist --metadata tenant=acme,env=prod
+```
+
 - Daemon attaches eBPF filter to the target
 - Daemon sends `Subscribed{id, target, type, metadata}` to control plane
 - Daemon watches for target removal and sends `Unsubscribed` automatically
-- Or explicitly detach via `DaemonService.Detach(id)`
+
+**RPC:**
+
+```
+DaemonService.Detach(id)
+```
+
+**CLI:**
+
+```bash
+netfenced detach --id <attachment-id>
+```
+
+**List attachments:**
+
+```bash
+netfenced list
+netfenced list --all  # fetch all pages
+```
 
 ## On the control plane (you implement this)
 
