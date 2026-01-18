@@ -1,6 +1,6 @@
 # Netfence
 
-_Like Envoy xDS, but for VM/container firewalls._
+_Like Envoy xDS, but for eBPF filters._
 
 Netfence runs as a daemon on your VM/container hosts and automatically injects filter programs into cgroups and network interfaces, with a built-in DNS server that resolves allowed domains and populates the IP allowlist.
 
