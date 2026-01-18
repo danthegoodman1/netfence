@@ -9,6 +9,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
+	"github.com/danthegoodman1/netfence/pkg/filter"
 	apiv1 "github.com/danthegoodman1/netfence/v1"
 )
 
@@ -190,7 +191,6 @@ func (c *ControlPlaneClient) heartbeatLoop(ctx context.Context) {
 	}
 }
 
-// TODO: Implement CIDR command handling - integrate with pkg/filter to modify eBPF maps
 func (c *ControlPlaneClient) handleCommand(cmd *apiv1.ControlCommand) {
 	switch v := cmd.Command.(type) {
 	case *apiv1.ControlCommand_SyncAck:
@@ -198,23 +198,49 @@ func (c *ControlPlaneClient) handleCommand(cmd *apiv1.ControlCommand) {
 
 	case *apiv1.ControlCommand_SetMode:
 		c.logger.Debug().Str("id", cmd.Id).Str("mode", v.SetMode.Mode.String()).Msg("received set mode")
-		// TODO: Call filter.SetMode once eBPF integration is complete
+		if err := c.server.SetFilterMode(cmd.Id, v.SetMode.Mode); err != nil {
+			c.logger.Error().Err(err).Str("id", cmd.Id).Msg("failed to set filter mode")
+		}
 
 	case *apiv1.ControlCommand_AllowCidr:
 		c.logger.Debug().Str("id", cmd.Id).Str("cidr", v.AllowCidr.Cidr).Msg("received allow cidr")
-		// TODO: Call filter.AllowIP once eBPF integration is complete
+		cidr, err := filter.ParseCIDR(v.AllowCidr.Cidr)
+		if err != nil {
+			c.logger.Error().Err(err).Str("id", cmd.Id).Str("cidr", v.AllowCidr.Cidr).Msg("failed to parse CIDR")
+			return
+		}
+		if err := c.server.AllowCIDR(cmd.Id, cidr); err != nil {
+			c.logger.Error().Err(err).Str("id", cmd.Id).Msg("failed to allow CIDR")
+		}
 
 	case *apiv1.ControlCommand_DenyCidr:
 		c.logger.Debug().Str("id", cmd.Id).Str("cidr", v.DenyCidr.Cidr).Msg("received deny cidr")
-		// TODO: Call filter.DenyIP once eBPF integration is complete
+		cidr, err := filter.ParseCIDR(v.DenyCidr.Cidr)
+		if err != nil {
+			c.logger.Error().Err(err).Str("id", cmd.Id).Str("cidr", v.DenyCidr.Cidr).Msg("failed to parse CIDR")
+			return
+		}
+		if err := c.server.DenyCIDR(cmd.Id, cidr); err != nil {
+			c.logger.Error().Err(err).Str("id", cmd.Id).Msg("failed to deny CIDR")
+		}
 
 	case *apiv1.ControlCommand_RemoveCidr:
 		c.logger.Debug().Str("id", cmd.Id).Str("cidr", v.RemoveCidr).Msg("received remove cidr")
-		// TODO: Call filter.RemoveIP once eBPF integration is complete
+		cidr, err := filter.ParseCIDR(v.RemoveCidr)
+		if err != nil {
+			c.logger.Error().Err(err).Str("id", cmd.Id).Str("cidr", v.RemoveCidr).Msg("failed to parse CIDR")
+			return
+		}
+		if err := c.server.RemoveAllowedCIDR(cmd.Id, cidr); err != nil {
+			c.logger.Warn().Err(err).Str("id", cmd.Id).Msg("failed to remove CIDR from allowlist")
+		}
+		if err := c.server.RemoveDeniedCIDR(cmd.Id, cidr); err != nil {
+			c.logger.Warn().Err(err).Str("id", cmd.Id).Msg("failed to remove CIDR from denylist")
+		}
 
 	case *apiv1.ControlCommand_BulkUpdate:
 		c.logger.Debug().Str("id", cmd.Id).Msg("received bulk update")
-		// TODO: Apply bulk update once eBPF integration is complete
+		c.applyBulkUpdate(cmd.Id, v.BulkUpdate)
 
 	case *apiv1.ControlCommand_SetDnsMode:
 		c.logger.Debug().Str("id", cmd.Id).Str("mode", v.SetDnsMode.Mode.String()).Msg("received set dns mode")
@@ -288,5 +314,49 @@ func (c *ControlPlaneClient) MakeProxyFunc(attachmentID string) DnsProxyFunc {
 		}
 
 		return resp.Allow, resp.AddToFilter, resp.Ips, nil
+	}
+}
+
+func (c *ControlPlaneClient) applyBulkUpdate(id string, update *apiv1.BulkUpdate) {
+	if err := c.server.SetFilterMode(id, update.Mode); err != nil {
+		c.logger.Error().Err(err).Str("id", id).Msg("failed to set filter mode in bulk update")
+	}
+
+	for _, entry := range update.AllowCidrs {
+		cidr, err := filter.ParseCIDR(entry.Cidr)
+		if err != nil {
+			c.logger.Error().Err(err).Str("id", id).Str("cidr", entry.Cidr).Msg("failed to parse allow CIDR in bulk update")
+			continue
+		}
+		if err := c.server.AllowCIDR(id, cidr); err != nil {
+			c.logger.Error().Err(err).Str("id", id).Str("cidr", entry.Cidr).Msg("failed to allow CIDR in bulk update")
+		}
+	}
+
+	for _, entry := range update.DenyCidrs {
+		cidr, err := filter.ParseCIDR(entry.Cidr)
+		if err != nil {
+			c.logger.Error().Err(err).Str("id", id).Str("cidr", entry.Cidr).Msg("failed to parse deny CIDR in bulk update")
+			continue
+		}
+		if err := c.server.DenyCIDR(id, cidr); err != nil {
+			c.logger.Error().Err(err).Str("id", id).Str("cidr", entry.Cidr).Msg("failed to deny CIDR in bulk update")
+		}
+	}
+
+	if update.Dns != nil {
+		if err := c.server.SetDnsMode(id, update.Dns.Mode); err != nil {
+			c.logger.Error().Err(err).Str("id", id).Msg("failed to set DNS mode in bulk update")
+		}
+		for _, entry := range update.Dns.AllowDomains {
+			if err := c.server.AllowDomain(id, entry.Domain, entry.IncludeSubdomains); err != nil {
+				c.logger.Error().Err(err).Str("id", id).Str("domain", entry.Domain).Msg("failed to allow domain in bulk update")
+			}
+		}
+		for _, entry := range update.Dns.DenyDomains {
+			if err := c.server.DenyDomain(id, entry.Domain, entry.IncludeSubdomains); err != nil {
+				c.logger.Error().Err(err).Str("id", id).Str("domain", entry.Domain).Msg("failed to deny domain in bulk update")
+			}
+		}
 	}
 }

@@ -43,3 +43,17 @@
 //	cidr, _ = filter.ParseCIDR("10.0.0.0/8")
 //	f.AllowIP(cidr)
 package filter
+
+import "net"
+
+// Filter is the common interface implemented by both CgroupFilter and TCFilter.
+// It provides methods for managing IP allowlists/denylists and controlling the filter mode.
+type Filter interface {
+	SetMode(PolicyMode) error
+	AllowIP(cidr *net.IPNet) error
+	DenyIP(cidr *net.IPNet) error
+	RemoveAllowedIP(cidr *net.IPNet) error
+	RemoveDeniedIP(cidr *net.IPNet) error
+	GetStats() (Stats, error)
+	Close() error
+}

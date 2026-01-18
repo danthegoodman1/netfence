@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/danthegoodman1/netfence/internal/config"
 	"github.com/danthegoodman1/netfence/internal/store"
+	"github.com/danthegoodman1/netfence/pkg/filter"
 	apiv1 "github.com/danthegoodman1/netfence/v1"
 )
 
@@ -38,10 +40,9 @@ type Server struct {
 }
 
 type attachmentState struct {
-	info           *store.Attachment
-	dns            *DNSServer
-	packetsAllowed uint64
-	packetsBlocked uint64
+	info   *store.Attachment
+	dns    *DNSServer
+	filter filter.Filter
 }
 
 func NewServer(cfg *config.Config, st *store.Store, logger zerolog.Logger, version string) (*Server, error) {
@@ -93,21 +94,75 @@ func (s *Server) SetControlPlaneClient(cp *ControlPlaneClient) {
 }
 
 func (s *Server) Start() error {
-	s.mu.RLock()
-	for _, state := range s.attachments {
-		switch parseAttachmentType(state.info.Type) {
+	s.mu.Lock()
+	var toRemove []string
+	for id, state := range s.attachments {
+		attachType := parseAttachmentType(state.info.Type)
+		mode := parsePolicyMode(state.info.Mode)
+
+		ebpfFilter, err := createFilter(state.info.Target, attachType, mode)
+		if err != nil {
+			s.logger.Warn().Err(err).
+				Str("id", id).
+				Str("target", state.info.Target).
+				Msg("failed to restore filter, target may be gone")
+			toRemove = append(toRemove, id)
+			continue
+		}
+		state.filter = ebpfFilter
+
+		var proxyFunc DnsProxyFunc
+		if cpClient := s.cpClient.Load(); cpClient != nil {
+			proxyFunc = cpClient.MakeProxyFunc(id)
+		}
+		dnsServer := NewDNSServer(id, state.info.DnsAddress, s.cfg.DNS.Upstream, s.logger, ebpfFilter, proxyFunc)
+		if err := dnsServer.Start(); err != nil {
+			s.logger.Warn().Err(err).
+				Str("id", id).
+				Str("target", state.info.Target).
+				Msg("failed to start DNS server on restore")
+			if ebpfFilter != nil {
+				ebpfFilter.Close()
+			}
+			toRemove = append(toRemove, id)
+			continue
+		}
+		state.dns = dnsServer
+
+		switch attachType {
 		case apiv1.AttachmentType_ATTACHMENT_TYPE_TC:
 			s.watcher.WatchInterface(state.info.Target)
 		case apiv1.AttachmentType_ATTACHMENT_TYPE_CGROUP:
 			if err := s.watcher.WatchCgroup(state.info.Target); err != nil {
 				s.logger.Warn().Err(err).
-					Str("id", state.info.ID).
+					Str("id", id).
 					Str("target", state.info.Target).
 					Msg("failed to watch cgroup, may already be removed")
 			}
 		}
+
+		s.logger.Info().
+			Str("id", id).
+			Str("target", state.info.Target).
+			Str("type", attachType.String()).
+			Msg("restored attachment")
 	}
-	s.mu.RUnlock()
+
+	for _, id := range toRemove {
+		state := s.attachments[id]
+		if state != nil {
+			delete(s.targetIndex, state.info.Target)
+			port := extractPort(state.info.DnsAddress)
+			if port > 0 {
+				s.releasePort(port)
+			}
+		}
+		delete(s.attachments, id)
+		if err := s.store.DeleteAttachment(id); err != nil {
+			s.logger.Error().Err(err).Str("id", id).Msg("failed to delete stale attachment from store")
+		}
+	}
+	s.mu.Unlock()
 
 	if err := s.watcher.Start(); err != nil {
 		return fmt.Errorf("starting target watcher: %w", err)
@@ -134,16 +189,6 @@ func (s *Server) handleTargetRemoved(target string) {
 		return
 	}
 
-	if state.dns != nil {
-		if err := state.dns.Stop(); err != nil {
-			s.logger.Warn().Err(err).Str("id", id).Msg("error stopping DNS server")
-		}
-	}
-
-	if err := s.store.DeleteAttachment(id); err != nil {
-		s.logger.Error().Err(err).Str("id", id).Msg("error deleting attachment from store")
-	}
-
 	port := extractPort(state.info.DnsAddress)
 	if port > 0 {
 		s.releasePort(port)
@@ -159,6 +204,22 @@ func (s *Server) handleTargetRemoved(target string) {
 	delete(s.attachments, id)
 	delete(s.targetIndex, target)
 	s.mu.Unlock()
+
+	if state.dns != nil {
+		if err := state.dns.Stop(); err != nil {
+			s.logger.Warn().Err(err).Str("id", id).Msg("error stopping DNS server")
+		}
+	}
+
+	if state.filter != nil {
+		if err := state.filter.Close(); err != nil {
+			s.logger.Warn().Err(err).Str("id", id).Msg("error closing eBPF filter")
+		}
+	}
+
+	if err := s.store.DeleteAttachment(id); err != nil {
+		s.logger.Error().Err(err).Str("id", id).Msg("error deleting attachment from store")
+	}
 
 	s.logger.Info().
 		Str("id", id).
@@ -220,20 +281,28 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (*apiv1.A
 		return nil, fmt.Errorf("saving attachment: %w", err)
 	}
 
-	// Start DNS server for this attachment
-	// TODO: Pass actual filter once eBPF integration is complete
+	ebpfFilter, err := createFilter(target, attachType, mode)
+	if err != nil {
+		s.releasePort(port)
+		s.store.DeleteAttachment(id)
+		return nil, fmt.Errorf("creating eBPF filter: %w", err)
+	}
+
 	var proxyFunc DnsProxyFunc
 	if cpClient := s.cpClient.Load(); cpClient != nil {
 		proxyFunc = cpClient.MakeProxyFunc(id)
 	}
-	dnsServer := NewDNSServer(id, dnsAddr, s.cfg.DNS.Upstream, s.logger, nil, proxyFunc)
+	dnsServer := NewDNSServer(id, dnsAddr, s.cfg.DNS.Upstream, s.logger, ebpfFilter, proxyFunc)
 	if err := dnsServer.Start(); err != nil {
+		if ebpfFilter != nil {
+			ebpfFilter.Close()
+		}
 		s.releasePort(port)
 		s.store.DeleteAttachment(id)
 		return nil, fmt.Errorf("starting DNS server: %w", err)
 	}
 
-	s.attachments[id] = &attachmentState{info: attachment, dns: dnsServer}
+	s.attachments[id] = &attachmentState{info: attachment, dns: dnsServer, filter: ebpfFilter}
 	s.targetIndex[target] = id
 
 	switch attachType {
@@ -272,21 +341,10 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (*apiv1.A
 
 func (s *Server) Detach(ctx context.Context, req *apiv1.DetachRequest) (*emptypb.Empty, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	state, ok := s.attachments[req.Id]
 	if !ok {
+		s.mu.Unlock()
 		return nil, fmt.Errorf("attachment not found: %s", req.Id)
-	}
-
-	if state.dns != nil {
-		if err := state.dns.Stop(); err != nil {
-			s.logger.Warn().Err(err).Str("id", req.Id).Msg("error stopping DNS server")
-		}
-	}
-
-	if err := s.store.DeleteAttachment(req.Id); err != nil {
-		return nil, fmt.Errorf("deleting attachment: %w", err)
 	}
 
 	port := extractPort(state.info.DnsAddress)
@@ -303,6 +361,23 @@ func (s *Server) Detach(ctx context.Context, req *apiv1.DetachRequest) (*emptypb
 
 	delete(s.attachments, req.Id)
 	delete(s.targetIndex, state.info.Target)
+	s.mu.Unlock()
+
+	if state.dns != nil {
+		if err := state.dns.Stop(); err != nil {
+			s.logger.Warn().Err(err).Str("id", req.Id).Msg("error stopping DNS server")
+		}
+	}
+
+	if state.filter != nil {
+		if err := state.filter.Close(); err != nil {
+			s.logger.Warn().Err(err).Str("id", req.Id).Msg("error closing eBPF filter")
+		}
+	}
+
+	if err := s.store.DeleteAttachment(req.Id); err != nil {
+		s.logger.Error().Err(err).Str("id", req.Id).Msg("error deleting attachment from store")
+	}
 
 	s.logger.Info().
 		Str("id", req.Id).
@@ -342,8 +417,12 @@ func (s *Server) List(ctx context.Context, req *apiv1.ListRequest) (*apiv1.ListR
 			AttachedAt: timestamppb.New(a.AttachedAt),
 		}
 		if state != nil {
-			info.PacketsAllowed = state.packetsAllowed
-			info.PacketsBlocked = state.packetsBlocked
+			if state.filter != nil {
+				if stats, err := state.filter.GetStats(); err == nil {
+					info.PacketsAllowed = stats.Allowed
+					info.PacketsBlocked = stats.Blocked
+				}
+			}
 			if state.dns != nil {
 				info.DnsQueriesAllowed, info.DnsQueriesBlocked = state.dns.Stats()
 			}
@@ -405,9 +484,13 @@ func (s *Server) GetAttachmentStats() []*apiv1.AttachmentStats {
 	var stats []*apiv1.AttachmentStats
 	for id, state := range s.attachments {
 		stat := &apiv1.AttachmentStats{
-			Id:             id,
-			PacketsAllowed: state.packetsAllowed,
-			PacketsBlocked: state.packetsBlocked,
+			Id: id,
+		}
+		if state.filter != nil {
+			if filterStats, err := state.filter.GetStats(); err == nil {
+				stat.PacketsAllowed = filterStats.Allowed
+				stat.PacketsBlocked = filterStats.Blocked
+			}
 		}
 		if state.dns != nil {
 			stat.DnsQueriesAllowed, stat.DnsQueriesBlocked = state.dns.Stats()
@@ -477,6 +560,76 @@ func (s *Server) RemoveDomain(id string, domain string) error {
 	}
 	if state.dns != nil {
 		state.dns.RemoveDomain(domain)
+	}
+	return nil
+}
+
+func (s *Server) SetFilterMode(id string, mode apiv1.PolicyMode) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	state, ok := s.attachments[id]
+	if !ok {
+		return fmt.Errorf("attachment not found: %s", id)
+	}
+	if state.filter != nil {
+		return state.filter.SetMode(apiModeToFilterMode(mode))
+	}
+	return nil
+}
+
+func (s *Server) AllowCIDR(id string, cidr *net.IPNet) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	state, ok := s.attachments[id]
+	if !ok {
+		return fmt.Errorf("attachment not found: %s", id)
+	}
+	if state.filter != nil {
+		return state.filter.AllowIP(cidr)
+	}
+	return nil
+}
+
+func (s *Server) DenyCIDR(id string, cidr *net.IPNet) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	state, ok := s.attachments[id]
+	if !ok {
+		return fmt.Errorf("attachment not found: %s", id)
+	}
+	if state.filter != nil {
+		return state.filter.DenyIP(cidr)
+	}
+	return nil
+}
+
+func (s *Server) RemoveAllowedCIDR(id string, cidr *net.IPNet) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	state, ok := s.attachments[id]
+	if !ok {
+		return fmt.Errorf("attachment not found: %s", id)
+	}
+	if state.filter != nil {
+		return state.filter.RemoveAllowedIP(cidr)
+	}
+	return nil
+}
+
+func (s *Server) RemoveDeniedCIDR(id string, cidr *net.IPNet) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	state, ok := s.attachments[id]
+	if !ok {
+		return fmt.Errorf("attachment not found: %s", id)
+	}
+	if state.filter != nil {
+		return state.filter.RemoveDeniedIP(cidr)
 	}
 	return nil
 }
