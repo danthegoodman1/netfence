@@ -1,0 +1,42 @@
+# Test environment for eBPF filter development
+# Works on both Mac (via Docker Desktop) and Linux
+
+FROM golang:1.25.5-trixie
+
+# Install build dependencies for BPF
+RUN apt-get update && apt-get install -y \
+    clang \
+    llvm \
+    libbpf-dev \
+    libc6-dev \
+    linux-libc-dev \
+    iproute2 \
+    iputils-ping \
+    curl \
+    netcat-openbsd \
+    make \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create symlink for asm headers (needed for BPF compilation)
+RUN ln -sf /usr/include/$(uname -m)-linux-gnu/asm /usr/include/asm
+
+# Set up BPF include paths
+ENV CPATH=/usr/include
+
+WORKDIR /app
+
+# Copy go mod files first for caching
+COPY go.mod go.sum* ./
+RUN go mod download
+
+# Copy the rest of the source
+COPY . .
+
+# Generate BPF objects
+RUN go generate ./pkg/filter/...
+
+# Build the test binary
+RUN go test -c -o /test-runner ./tests/integration/...
+
+# Default command runs tests
+CMD ["go", "test", "-v", "./tests/integration/..."]
