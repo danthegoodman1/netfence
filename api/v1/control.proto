@@ -46,6 +46,8 @@ message SyncRequest {
   string hostname = 2;
   // All current attachments managed by this daemon
   repeated Attachment attachments = 3;
+  // User-defined metadata from daemon config (region, tags, etc.)
+  map<string, string> metadata = 4;
 }
 
 // Attachment describes a filter attachment managed by the daemon.
