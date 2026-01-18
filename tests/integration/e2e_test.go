@@ -235,7 +235,7 @@ func newE2ETestEnv(t *testing.T) *e2eTestEnv {
 		DNS: config.DNSConfig{
 			ListenAddr: "127.0.0.1",
 			PortMin:    19000,
-			PortMax:    29000,
+			PortMax:    20000,
 			Upstream:   "8.8.8.8:53",
 		},
 		ControlPlane: config.ControlPlaneConfig{
