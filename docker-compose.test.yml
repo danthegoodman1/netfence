@@ -18,7 +18,7 @@ services:
       # Mount BPF filesystem
       - /sys/fs/bpf:/sys/fs/bpf
     environment:
-      - CGO_ENABLED=0
+      - CGO_ENABLED=1
     networks:
       - test-net
 

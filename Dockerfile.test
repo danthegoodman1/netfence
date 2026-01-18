@@ -22,8 +22,9 @@ RUN apt-get update && apt-get install -y \
 # Create symlink for asm headers (needed for BPF compilation)
 RUN ln -sf /usr/include/$(uname -m)-linux-gnu/asm /usr/include/asm
 
-# Set up BPF include paths
+# Set up BPF include paths and enable CGO for sqlite3
 ENV CPATH=/usr/include
+ENV CGO_ENABLED=1
 
 WORKDIR /app
 
@@ -37,11 +38,8 @@ COPY . .
 # Generate BPF objects
 RUN go generate ./pkg/filter/...
 
-# Enable CGO for sqlite3
-ENV CGO_ENABLED=1
-
-# Build the test binary
+# Build the test binary with CGO
 RUN go test -c -o /test-runner ./tests/integration/...
 
-# Default command runs tests with 30s timeout
-CMD ["go", "test", "-v", "-timeout", "30s", "./tests/integration/..."]
+# Run the prebuilt test binary directly
+CMD ["/test-runner", "-test.v", "-test.timeout", "30s"]

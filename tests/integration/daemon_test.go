@@ -123,7 +123,7 @@ func TestDaemonAttachInterface(t *testing.T) {
 	ts := newTestServer(t)
 	defer ts.cleanup()
 
-	ifaceName := "netfence-daemon0"
+	ifaceName := "nf-dmn-test0"
 	require.NoError(t, createDummyInterface(ifaceName))
 	defer deleteDummyInterface(ifaceName)
 
@@ -197,7 +197,7 @@ func TestDaemonManualDetachInterface(t *testing.T) {
 	ts := newTestServer(t)
 	defer ts.cleanup()
 
-	ifaceName := "netfence-detach0"
+	ifaceName := "nf-det-test0"
 	require.NoError(t, createDummyInterface(ifaceName))
 	defer deleteDummyInterface(ifaceName)
 
@@ -283,7 +283,7 @@ func TestDaemonAutoRemoveInterface(t *testing.T) {
 	ts := newTestServer(t)
 	defer ts.cleanup()
 
-	ifaceName := "netfence-auto0"
+	ifaceName := "nf-auto-test0"
 	require.NoError(t, createDummyInterface(ifaceName))
 
 	ctx := context.Background()
