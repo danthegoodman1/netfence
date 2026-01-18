@@ -6,7 +6,7 @@ Netfence runs as a daemon on your VM/container hosts and automatically injects f
 
 Netfence daemons connect to a central control plane that you implement via gRPC to synchronize allowlists/denylists with your backend.
 
-Your control plane pushes network rules like `ALLOW *.pypi.org` or `ALLOW 10.0.0.0/16` to attached interfaces/cgroups. When a workload queries DNS, Netfence resolves it, adds the IPs to the eBPF filter, and drops everything else before it leaves the host without any performance penalty.
+Your control plane pushes network rules like `ALLOW *.pypi.org` or `ALLOW 10.0.0.0/16` to attached interfaces/cgroups. When a VM/container queries DNS, Netfence resolves it, adds the IPs to the eBPF filter, and drops traffic to unknown IPs before it leaves the host without any performance penalty.
 
 ## Features
 
