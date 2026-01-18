@@ -20,6 +20,8 @@ type ControlPlaneClient struct {
 
 	mu     sync.RWMutex
 	state  apiv1.ConnectionState
+	conn   *grpc.ClientConn
+	client apiv1.ControlPlaneClient
 	stream grpc.BidiStreamingClient[apiv1.DaemonEvent, apiv1.ControlCommand]
 	cancel context.CancelFunc
 
@@ -76,12 +78,20 @@ func (c *ControlPlaneClient) connect(ctx context.Context) {
 		c.setState(apiv1.ConnectionState_CONNECTION_STATE_DISCONNECTED)
 		return
 	}
-	defer conn.Close()
+	defer func() {
+		conn.Close()
+		c.mu.Lock()
+		c.conn = nil
+		c.client = nil
+		c.mu.Unlock()
+	}()
 
 	client := apiv1.NewControlPlaneClient(conn)
 
 	streamCtx, cancel := context.WithCancel(ctx)
 	c.mu.Lock()
+	c.conn = conn
+	c.client = client
 	c.cancel = cancel
 	c.mu.Unlock()
 	defer cancel()
@@ -180,29 +190,56 @@ func (c *ControlPlaneClient) heartbeatLoop(ctx context.Context) {
 	}
 }
 
-// TODO: Implement actual command handling - integrate with pkg/filter to modify eBPF maps
+// TODO: Implement CIDR command handling - integrate with pkg/filter to modify eBPF maps
 func (c *ControlPlaneClient) handleCommand(cmd *apiv1.ControlCommand) {
-	switch cmd.Command.(type) {
+	switch v := cmd.Command.(type) {
 	case *apiv1.ControlCommand_SyncAck:
 		c.logger.Debug().Msg("received sync ack")
+
 	case *apiv1.ControlCommand_SetMode:
-		c.logger.Debug().Str("id", cmd.Id).Msg("received set mode")
+		c.logger.Debug().Str("id", cmd.Id).Str("mode", v.SetMode.Mode.String()).Msg("received set mode")
+		// TODO: Call filter.SetMode once eBPF integration is complete
+
 	case *apiv1.ControlCommand_AllowCidr:
-		c.logger.Debug().Str("id", cmd.Id).Msg("received allow cidr")
+		c.logger.Debug().Str("id", cmd.Id).Str("cidr", v.AllowCidr.Cidr).Msg("received allow cidr")
+		// TODO: Call filter.AllowIP once eBPF integration is complete
+
 	case *apiv1.ControlCommand_DenyCidr:
-		c.logger.Debug().Str("id", cmd.Id).Msg("received deny cidr")
+		c.logger.Debug().Str("id", cmd.Id).Str("cidr", v.DenyCidr.Cidr).Msg("received deny cidr")
+		// TODO: Call filter.DenyIP once eBPF integration is complete
+
 	case *apiv1.ControlCommand_RemoveCidr:
-		c.logger.Debug().Str("id", cmd.Id).Msg("received remove cidr")
+		c.logger.Debug().Str("id", cmd.Id).Str("cidr", v.RemoveCidr).Msg("received remove cidr")
+		// TODO: Call filter.RemoveIP once eBPF integration is complete
+
 	case *apiv1.ControlCommand_BulkUpdate:
 		c.logger.Debug().Str("id", cmd.Id).Msg("received bulk update")
+		// TODO: Apply bulk update once eBPF integration is complete
+
 	case *apiv1.ControlCommand_SetDnsMode:
-		c.logger.Debug().Str("id", cmd.Id).Msg("received set dns mode")
+		c.logger.Debug().Str("id", cmd.Id).Str("mode", v.SetDnsMode.Mode.String()).Msg("received set dns mode")
+		if err := c.server.SetDnsMode(cmd.Id, v.SetDnsMode.Mode); err != nil {
+			c.logger.Error().Err(err).Str("id", cmd.Id).Msg("failed to set dns mode")
+		}
+
 	case *apiv1.ControlCommand_AllowDomain:
-		c.logger.Debug().Str("id", cmd.Id).Msg("received allow domain")
+		c.logger.Debug().Str("id", cmd.Id).Str("domain", v.AllowDomain.Domain).Msg("received allow domain")
+		if err := c.server.AllowDomain(cmd.Id, v.AllowDomain.Domain, v.AllowDomain.IncludeSubdomains); err != nil {
+			c.logger.Error().Err(err).Str("id", cmd.Id).Msg("failed to allow domain")
+		}
+
 	case *apiv1.ControlCommand_DenyDomain:
-		c.logger.Debug().Str("id", cmd.Id).Msg("received deny domain")
+		c.logger.Debug().Str("id", cmd.Id).Str("domain", v.DenyDomain.Domain).Msg("received deny domain")
+		if err := c.server.DenyDomain(cmd.Id, v.DenyDomain.Domain, v.DenyDomain.IncludeSubdomains); err != nil {
+			c.logger.Error().Err(err).Str("id", cmd.Id).Msg("failed to deny domain")
+		}
+
 	case *apiv1.ControlCommand_RemoveDomain:
-		c.logger.Debug().Str("id", cmd.Id).Msg("received remove domain")
+		c.logger.Debug().Str("id", cmd.Id).Str("domain", v.RemoveDomain).Msg("received remove domain")
+		if err := c.server.RemoveDomain(cmd.Id, v.RemoveDomain); err != nil {
+			c.logger.Error().Err(err).Str("id", cmd.Id).Msg("failed to remove domain")
+		}
+
 	default:
 		c.logger.Warn().Str("id", cmd.Id).Msg("received unknown command")
 	}
@@ -225,5 +262,31 @@ func (c *ControlPlaneClient) SendUnsubscribed(unsub *apiv1.Unsubscribed) {
 	}:
 	default:
 		c.logger.Warn().Str("id", unsub.Id).Msg("send channel full, dropping unsubscribed event")
+	}
+}
+
+func (c *ControlPlaneClient) MakeProxyFunc(attachmentID string) DnsProxyFunc {
+	return func(domain, queryType string) (allow, addToFilter bool, ips []string, err error) {
+		c.mu.RLock()
+		client := c.client
+		c.mu.RUnlock()
+
+		if client == nil {
+			return true, false, nil, nil
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		resp, err := client.QueryDns(ctx, &apiv1.DnsQueryRequest{
+			Id:        attachmentID,
+			Domain:    domain,
+			QueryType: queryType,
+		})
+		if err != nil {
+			return false, false, nil, err
+		}
+
+		return resp.Allow, resp.AddToFilter, resp.Ips, nil
 	}
 }

@@ -36,10 +36,9 @@ type Server struct {
 
 type attachmentState struct {
 	info           *store.Attachment
+	dns            *DNSServer
 	packetsAllowed uint64
 	packetsBlocked uint64
-	dnsAllowed     uint64
-	dnsBlocked     uint64
 }
 
 func NewServer(cfg *config.Config, st *store.Store, logger zerolog.Logger, version string) (*Server, error) {
@@ -133,7 +132,20 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (*apiv1.A
 		return nil, fmt.Errorf("saving attachment: %w", err)
 	}
 
-	s.attachments[id] = &attachmentState{info: attachment}
+	// Start DNS server for this attachment
+	// TODO: Pass actual filter once eBPF integration is complete
+	var proxyFunc DnsProxyFunc
+	if s.cpClient != nil {
+		proxyFunc = s.cpClient.MakeProxyFunc(id)
+	}
+	dnsServer := NewDNSServer(id, dnsAddr, s.cfg.DNS.Upstream, s.logger, nil, proxyFunc)
+	if err := dnsServer.Start(); err != nil {
+		s.releasePort(port)
+		s.store.DeleteAttachment(id)
+		return nil, fmt.Errorf("starting DNS server: %w", err)
+	}
+
+	s.attachments[id] = &attachmentState{info: attachment, dns: dnsServer}
 
 	s.logger.Info().
 		Str("id", id).
@@ -167,6 +179,12 @@ func (s *Server) Detach(ctx context.Context, req *apiv1.DetachRequest) (*emptypb
 	state, ok := s.attachments[req.Id]
 	if !ok {
 		return nil, fmt.Errorf("attachment not found: %s", req.Id)
+	}
+
+	if state.dns != nil {
+		if err := state.dns.Stop(); err != nil {
+			s.logger.Warn().Err(err).Str("id", req.Id).Msg("error stopping DNS server")
+		}
 	}
 
 	if err := s.store.DeleteAttachment(req.Id); err != nil {
@@ -220,8 +238,9 @@ func (s *Server) List(ctx context.Context, req *apiv1.ListRequest) (*apiv1.ListR
 		if state != nil {
 			info.PacketsAllowed = state.packetsAllowed
 			info.PacketsBlocked = state.packetsBlocked
-			info.DnsQueriesAllowed = state.dnsAllowed
-			info.DnsQueriesBlocked = state.dnsBlocked
+			if state.dns != nil {
+				info.DnsQueriesAllowed, info.DnsQueriesBlocked = state.dns.Stats()
+			}
 		}
 		infos = append(infos, info)
 	}
@@ -279,13 +298,15 @@ func (s *Server) GetAttachmentStats() []*apiv1.AttachmentStats {
 
 	var stats []*apiv1.AttachmentStats
 	for id, state := range s.attachments {
-		stats = append(stats, &apiv1.AttachmentStats{
-			Id:                id,
-			PacketsAllowed:    state.packetsAllowed,
-			PacketsBlocked:    state.packetsBlocked,
-			DnsQueriesAllowed: state.dnsAllowed,
-			DnsQueriesBlocked: state.dnsBlocked,
-		})
+		stat := &apiv1.AttachmentStats{
+			Id:             id,
+			PacketsAllowed: state.packetsAllowed,
+			PacketsBlocked: state.packetsBlocked,
+		}
+		if state.dns != nil {
+			stat.DnsQueriesAllowed, stat.DnsQueriesBlocked = state.dns.Stats()
+		}
+		stats = append(stats, stat)
 	}
 	return stats
 }
@@ -296,6 +317,62 @@ func (s *Server) DaemonID() string {
 
 func (s *Server) Hostname() string {
 	return s.hostname
+}
+
+func (s *Server) SetDnsMode(id string, mode apiv1.DnsMode) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	state, ok := s.attachments[id]
+	if !ok {
+		return fmt.Errorf("attachment not found: %s", id)
+	}
+	if state.dns != nil {
+		state.dns.SetMode(mode)
+	}
+	return nil
+}
+
+func (s *Server) AllowDomain(id string, domain string, includeSubdomains bool) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	state, ok := s.attachments[id]
+	if !ok {
+		return fmt.Errorf("attachment not found: %s", id)
+	}
+	if state.dns != nil {
+		state.dns.AllowDomain(domain, includeSubdomains)
+	}
+	return nil
+}
+
+func (s *Server) DenyDomain(id string, domain string, includeSubdomains bool) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	state, ok := s.attachments[id]
+	if !ok {
+		return fmt.Errorf("attachment not found: %s", id)
+	}
+	if state.dns != nil {
+		state.dns.DenyDomain(domain, includeSubdomains)
+	}
+	return nil
+}
+
+func (s *Server) RemoveDomain(id string, domain string) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	state, ok := s.attachments[id]
+	if !ok {
+		return fmt.Errorf("attachment not found: %s", id)
+	}
+	if state.dns != nil {
+		state.dns.RemoveDomain(domain)
+	}
+	return nil
 }
 
 func (s *Server) allocatePort() (int, error) {

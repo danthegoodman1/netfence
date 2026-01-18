@@ -20,6 +20,7 @@ type DNSConfig struct {
 	ListenAddr string `mapstructure:"listen_addr"`
 	PortMin    int    `mapstructure:"port_min"`
 	PortMax    int    `mapstructure:"port_max"`
+	Upstream   string `mapstructure:"upstream"`
 }
 
 type ControlPlaneConfig struct {
@@ -32,6 +33,7 @@ func Load(configPath string) (*Config, error) {
 	v.SetDefault("dns.listen_addr", "127.0.0.1")
 	v.SetDefault("dns.port_min", 11000)
 	v.SetDefault("dns.port_max", 11500)
+	v.SetDefault("dns.upstream", "8.8.8.8:53")
 	v.SetDefault("log_level", "info")
 	v.SetDefault("socket", "/var/run/netfence.sock")
 

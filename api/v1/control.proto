@@ -21,6 +21,11 @@ service ControlPlane {
   // 4. Control plane sends filter commands (AllowCIDR, SetMode, etc.)
   // 5. Daemon sends Unsubscribed when attachments are detached/removed
   rpc Connect(stream DaemonEvent) returns (stream ControlCommand);
+
+  // QueryDns is called by the daemon when DNS_MODE_PROXY is enabled.
+  // The control plane decides whether to allow the query and can return
+  // IPs to add to the filter.
+  rpc QueryDns(DnsQueryRequest) returns (DnsQueryResponse);
 }
 
 // DaemonEvent represents events sent from the daemon to the control plane.
@@ -195,3 +200,25 @@ message DomainEntry {
 
 // SetDnsMode changes the DNS filtering mode.
 message SetDnsMode { DnsMode mode = 1; }
+
+// DnsQueryRequest is sent when DNS_MODE_PROXY is enabled and a DNS query is received.
+message DnsQueryRequest {
+  // Attachment ID
+  string id = 1;
+  // Domain being queried (e.g., "example.com.")
+  string domain = 2;
+  // DNS query type (e.g., "A", "AAAA", "CNAME")
+  string query_type = 3;
+}
+
+// DnsQueryResponse tells the daemon how to handle the DNS query.
+message DnsQueryResponse {
+  // Whether to allow this query
+  bool allow = 1;
+  // If allowed, whether to add resolved IPs to the filter
+  bool add_to_filter = 2;
+  // Optional: override IPs to return (if empty, daemon queries upstream)
+  repeated string ips = 3;
+  // Optional: TTL for the response and filter entries
+  uint32 ttl_seconds = 4;
+}

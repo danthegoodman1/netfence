@@ -1262,6 +1262,143 @@ func (x *SetDnsMode) GetMode() DnsMode {
 	return DnsMode_DNS_MODE_UNSPECIFIED
 }
 
+// DnsQueryRequest is sent when DNS_MODE_PROXY is enabled and a DNS query is received.
+type DnsQueryRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Attachment ID
+	Id string `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	// Domain being queried (e.g., "example.com.")
+	Domain string `protobuf:"bytes,2,opt,name=domain,proto3" json:"domain,omitempty"`
+	// DNS query type (e.g., "A", "AAAA", "CNAME")
+	QueryType     string `protobuf:"bytes,3,opt,name=query_type,json=queryType,proto3" json:"query_type,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DnsQueryRequest) Reset() {
+	*x = DnsQueryRequest{}
+	mi := &file_v1_control_proto_msgTypes[15]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DnsQueryRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DnsQueryRequest) ProtoMessage() {}
+
+func (x *DnsQueryRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_v1_control_proto_msgTypes[15]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DnsQueryRequest.ProtoReflect.Descriptor instead.
+func (*DnsQueryRequest) Descriptor() ([]byte, []int) {
+	return file_v1_control_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *DnsQueryRequest) GetId() string {
+	if x != nil {
+		return x.Id
+	}
+	return ""
+}
+
+func (x *DnsQueryRequest) GetDomain() string {
+	if x != nil {
+		return x.Domain
+	}
+	return ""
+}
+
+func (x *DnsQueryRequest) GetQueryType() string {
+	if x != nil {
+		return x.QueryType
+	}
+	return ""
+}
+
+// DnsQueryResponse tells the daemon how to handle the DNS query.
+type DnsQueryResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Whether to allow this query
+	Allow bool `protobuf:"varint,1,opt,name=allow,proto3" json:"allow,omitempty"`
+	// If allowed, whether to add resolved IPs to the filter
+	AddToFilter bool `protobuf:"varint,2,opt,name=add_to_filter,json=addToFilter,proto3" json:"add_to_filter,omitempty"`
+	// Optional: override IPs to return (if empty, daemon queries upstream)
+	Ips []string `protobuf:"bytes,3,rep,name=ips,proto3" json:"ips,omitempty"`
+	// Optional: TTL for the response and filter entries
+	TtlSeconds    uint32 `protobuf:"varint,4,opt,name=ttl_seconds,json=ttlSeconds,proto3" json:"ttl_seconds,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DnsQueryResponse) Reset() {
+	*x = DnsQueryResponse{}
+	mi := &file_v1_control_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DnsQueryResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DnsQueryResponse) ProtoMessage() {}
+
+func (x *DnsQueryResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_v1_control_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DnsQueryResponse.ProtoReflect.Descriptor instead.
+func (*DnsQueryResponse) Descriptor() ([]byte, []int) {
+	return file_v1_control_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *DnsQueryResponse) GetAllow() bool {
+	if x != nil {
+		return x.Allow
+	}
+	return false
+}
+
+func (x *DnsQueryResponse) GetAddToFilter() bool {
+	if x != nil {
+		return x.AddToFilter
+	}
+	return false
+}
+
+func (x *DnsQueryResponse) GetIps() []string {
+	if x != nil {
+		return x.Ips
+	}
+	return nil
+}
+
+func (x *DnsQueryResponse) GetTtlSeconds() uint32 {
+	if x != nil {
+		return x.TtlSeconds
+	}
+	return 0
+}
+
 var File_v1_control_proto protoreflect.FileDescriptor
 
 const file_v1_control_proto_rawDesc = "" +
@@ -1362,14 +1499,26 @@ const file_v1_control_proto_rawDesc = "" +
 	"\x12include_subdomains\x18\x02 \x01(\bR\x11includeSubdomains\"6\n" +
 	"\n" +
 	"SetDnsMode\x12(\n" +
-	"\x04mode\x18\x01 \x01(\x0e2\x14.netfence.v1.DnsModeR\x04mode*\x96\x01\n" +
+	"\x04mode\x18\x01 \x01(\x0e2\x14.netfence.v1.DnsModeR\x04mode\"X\n" +
+	"\x0fDnsQueryRequest\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\x12\x16\n" +
+	"\x06domain\x18\x02 \x01(\tR\x06domain\x12\x1d\n" +
+	"\n" +
+	"query_type\x18\x03 \x01(\tR\tqueryType\"\x7f\n" +
+	"\x10DnsQueryResponse\x12\x14\n" +
+	"\x05allow\x18\x01 \x01(\bR\x05allow\x12\"\n" +
+	"\radd_to_filter\x18\x02 \x01(\bR\vaddToFilter\x12\x10\n" +
+	"\x03ips\x18\x03 \x03(\tR\x03ips\x12\x1f\n" +
+	"\vttl_seconds\x18\x04 \x01(\rR\n" +
+	"ttlSeconds*\x96\x01\n" +
 	"\x11UnsubscribeReason\x12\"\n" +
 	"\x1eUNSUBSCRIBE_REASON_UNSPECIFIED\x10\x00\x12\x1e\n" +
 	"\x1aUNSUBSCRIBE_REASON_REMOVED\x10\x01\x12\x1f\n" +
 	"\x1bUNSUBSCRIBE_REASON_DETACHED\x10\x02\x12\x1c\n" +
-	"\x18UNSUBSCRIBE_REASON_ERROR\x10\x032T\n" +
+	"\x18UNSUBSCRIBE_REASON_ERROR\x10\x032\x9d\x01\n" +
 	"\fControlPlane\x12D\n" +
-	"\aConnect\x12\x18.netfence.v1.DaemonEvent\x1a\x1b.netfence.v1.ControlCommand(\x010\x01B1Z/github.com/danthegoodman1/netfence/api/v1;apiv1b\x06proto3"
+	"\aConnect\x12\x18.netfence.v1.DaemonEvent\x1a\x1b.netfence.v1.ControlCommand(\x010\x01\x12G\n" +
+	"\bQueryDns\x12\x1c.netfence.v1.DnsQueryRequest\x1a\x1d.netfence.v1.DnsQueryResponseB1Z/github.com/danthegoodman1/netfence/api/v1;apiv1b\x06proto3"
 
 var (
 	file_v1_control_proto_rawDescOnce sync.Once
@@ -1384,7 +1533,7 @@ func file_v1_control_proto_rawDescGZIP() []byte {
 }
 
 var file_v1_control_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_v1_control_proto_msgTypes = make([]protoimpl.MessageInfo, 18)
+var file_v1_control_proto_msgTypes = make([]protoimpl.MessageInfo, 20)
 var file_v1_control_proto_goTypes = []any{
 	(UnsubscribeReason)(0),      // 0: netfence.v1.UnsubscribeReason
 	(*DaemonEvent)(nil),         // 1: netfence.v1.DaemonEvent
@@ -1402,13 +1551,15 @@ var file_v1_control_proto_goTypes = []any{
 	(*CIDREntry)(nil),           // 13: netfence.v1.CIDREntry
 	(*DomainEntry)(nil),         // 14: netfence.v1.DomainEntry
 	(*SetDnsMode)(nil),          // 15: netfence.v1.SetDnsMode
-	nil,                         // 16: netfence.v1.SyncRequest.MetadataEntry
-	nil,                         // 17: netfence.v1.Attachment.MetadataEntry
-	nil,                         // 18: netfence.v1.Subscribed.MetadataEntry
-	(AttachmentType)(0),         // 19: netfence.v1.AttachmentType
-	(PolicyMode)(0),             // 20: netfence.v1.PolicyMode
-	(DnsMode)(0),                // 21: netfence.v1.DnsMode
-	(*durationpb.Duration)(nil), // 22: google.protobuf.Duration
+	(*DnsQueryRequest)(nil),     // 16: netfence.v1.DnsQueryRequest
+	(*DnsQueryResponse)(nil),    // 17: netfence.v1.DnsQueryResponse
+	nil,                         // 18: netfence.v1.SyncRequest.MetadataEntry
+	nil,                         // 19: netfence.v1.Attachment.MetadataEntry
+	nil,                         // 20: netfence.v1.Subscribed.MetadataEntry
+	(AttachmentType)(0),         // 21: netfence.v1.AttachmentType
+	(PolicyMode)(0),             // 22: netfence.v1.PolicyMode
+	(DnsMode)(0),                // 23: netfence.v1.DnsMode
+	(*durationpb.Duration)(nil), // 24: google.protobuf.Duration
 }
 var file_v1_control_proto_depIdxs = []int32{
 	2,  // 0: netfence.v1.DaemonEvent.sync:type_name -> netfence.v1.SyncRequest
@@ -1416,15 +1567,15 @@ var file_v1_control_proto_depIdxs = []int32{
 	5,  // 2: netfence.v1.DaemonEvent.unsubscribed:type_name -> netfence.v1.Unsubscribed
 	6,  // 3: netfence.v1.DaemonEvent.heartbeat:type_name -> netfence.v1.Heartbeat
 	3,  // 4: netfence.v1.SyncRequest.attachments:type_name -> netfence.v1.Attachment
-	16, // 5: netfence.v1.SyncRequest.metadata:type_name -> netfence.v1.SyncRequest.MetadataEntry
-	19, // 6: netfence.v1.Attachment.type:type_name -> netfence.v1.AttachmentType
-	20, // 7: netfence.v1.Attachment.mode:type_name -> netfence.v1.PolicyMode
-	21, // 8: netfence.v1.Attachment.dns_mode:type_name -> netfence.v1.DnsMode
-	17, // 9: netfence.v1.Attachment.metadata:type_name -> netfence.v1.Attachment.MetadataEntry
-	19, // 10: netfence.v1.Subscribed.type:type_name -> netfence.v1.AttachmentType
-	20, // 11: netfence.v1.Subscribed.mode:type_name -> netfence.v1.PolicyMode
-	21, // 12: netfence.v1.Subscribed.dns_mode:type_name -> netfence.v1.DnsMode
-	18, // 13: netfence.v1.Subscribed.metadata:type_name -> netfence.v1.Subscribed.MetadataEntry
+	18, // 5: netfence.v1.SyncRequest.metadata:type_name -> netfence.v1.SyncRequest.MetadataEntry
+	21, // 6: netfence.v1.Attachment.type:type_name -> netfence.v1.AttachmentType
+	22, // 7: netfence.v1.Attachment.mode:type_name -> netfence.v1.PolicyMode
+	23, // 8: netfence.v1.Attachment.dns_mode:type_name -> netfence.v1.DnsMode
+	19, // 9: netfence.v1.Attachment.metadata:type_name -> netfence.v1.Attachment.MetadataEntry
+	21, // 10: netfence.v1.Subscribed.type:type_name -> netfence.v1.AttachmentType
+	22, // 11: netfence.v1.Subscribed.mode:type_name -> netfence.v1.PolicyMode
+	23, // 12: netfence.v1.Subscribed.dns_mode:type_name -> netfence.v1.DnsMode
+	20, // 13: netfence.v1.Subscribed.metadata:type_name -> netfence.v1.Subscribed.MetadataEntry
 	0,  // 14: netfence.v1.Unsubscribed.reason:type_name -> netfence.v1.UnsubscribeReason
 	7,  // 15: netfence.v1.Heartbeat.stats:type_name -> netfence.v1.AttachmentStats
 	9,  // 16: netfence.v1.ControlCommand.sync_ack:type_name -> netfence.v1.SyncAck
@@ -1435,20 +1586,22 @@ var file_v1_control_proto_depIdxs = []int32{
 	15, // 21: netfence.v1.ControlCommand.set_dns_mode:type_name -> netfence.v1.SetDnsMode
 	14, // 22: netfence.v1.ControlCommand.allow_domain:type_name -> netfence.v1.DomainEntry
 	14, // 23: netfence.v1.ControlCommand.deny_domain:type_name -> netfence.v1.DomainEntry
-	20, // 24: netfence.v1.SetMode.mode:type_name -> netfence.v1.PolicyMode
-	20, // 25: netfence.v1.BulkUpdate.mode:type_name -> netfence.v1.PolicyMode
+	22, // 24: netfence.v1.SetMode.mode:type_name -> netfence.v1.PolicyMode
+	22, // 25: netfence.v1.BulkUpdate.mode:type_name -> netfence.v1.PolicyMode
 	13, // 26: netfence.v1.BulkUpdate.allow_cidrs:type_name -> netfence.v1.CIDREntry
 	13, // 27: netfence.v1.BulkUpdate.deny_cidrs:type_name -> netfence.v1.CIDREntry
 	12, // 28: netfence.v1.BulkUpdate.dns:type_name -> netfence.v1.DnsConfig
-	21, // 29: netfence.v1.DnsConfig.mode:type_name -> netfence.v1.DnsMode
+	23, // 29: netfence.v1.DnsConfig.mode:type_name -> netfence.v1.DnsMode
 	14, // 30: netfence.v1.DnsConfig.allow_domains:type_name -> netfence.v1.DomainEntry
 	14, // 31: netfence.v1.DnsConfig.deny_domains:type_name -> netfence.v1.DomainEntry
-	22, // 32: netfence.v1.CIDREntry.ttl:type_name -> google.protobuf.Duration
-	21, // 33: netfence.v1.SetDnsMode.mode:type_name -> netfence.v1.DnsMode
+	24, // 32: netfence.v1.CIDREntry.ttl:type_name -> google.protobuf.Duration
+	23, // 33: netfence.v1.SetDnsMode.mode:type_name -> netfence.v1.DnsMode
 	1,  // 34: netfence.v1.ControlPlane.Connect:input_type -> netfence.v1.DaemonEvent
-	8,  // 35: netfence.v1.ControlPlane.Connect:output_type -> netfence.v1.ControlCommand
-	35, // [35:36] is the sub-list for method output_type
-	34, // [34:35] is the sub-list for method input_type
+	16, // 35: netfence.v1.ControlPlane.QueryDns:input_type -> netfence.v1.DnsQueryRequest
+	8,  // 36: netfence.v1.ControlPlane.Connect:output_type -> netfence.v1.ControlCommand
+	17, // 37: netfence.v1.ControlPlane.QueryDns:output_type -> netfence.v1.DnsQueryResponse
+	36, // [36:38] is the sub-list for method output_type
+	34, // [34:36] is the sub-list for method input_type
 	34, // [34:34] is the sub-list for extension type_name
 	34, // [34:34] is the sub-list for extension extendee
 	0,  // [0:34] is the sub-list for field type_name
@@ -1484,7 +1637,7 @@ func file_v1_control_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_v1_control_proto_rawDesc), len(file_v1_control_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   18,
+			NumMessages:   20,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
