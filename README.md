@@ -16,7 +16,7 @@ Your control plane pushes network rules like `ALLOW *.pypi.org` or `ALLOW 10.0.0
 - Per-attachment DNS server with domain allowlist/denylist
 - Domain rules support subdomains with specificity-based matching (more specific rules win)
 - Resolved domains auto-populate IP filter
-- Metadata on attachments for associating with VM ID, tenant, etc.
+- Metadata on daemon and attachments for associating with VM ID, tenant, etc.
 
 # Design
 
