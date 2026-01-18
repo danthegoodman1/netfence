@@ -1,10 +1,8 @@
 # Netfence
 
-A control plane for network filters per-interface/cgroup so you can give each VM or container its own egress filtering policy.
+eBPF-based egress filtering for VMs and containers. Attach per-interface or per-cgroup network policies with DNS-aware allowlisting.
 
-Specifically great for VMs. This is what I made for our agent VMs so we can define DNS names that the VMs can access (apt, pip, npm) but prevent internet access to anything else to reduce the exfiltration surface area. Using a custom DNS server that sends the IPs to a whitelist map shared with an eBPF filter for each container. Works fantastic.
-
-Make this a pre-made control daemon and eBPF program, and the user just manages attaching to new interfaces/cgroups and implementing the gRPC control plane.
+Define which domains your workloads can reach (e.g., apt, pip, npm registries) and block everything else. Resolved IPs are automatically added to the eBPF filter map.
 
 ## Features
 
