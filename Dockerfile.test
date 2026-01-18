@@ -11,6 +11,7 @@ RUN apt-get update && apt-get install -y \
     libc6-dev \
     linux-libc-dev \
     iproute2 \
+    iptables \
     iputils-ping \
     curl \
     netcat-openbsd \

@@ -34,8 +34,8 @@ func newTestServer(t *testing.T) *testServer {
 	cfg := &config.Config{
 		DNS: config.DNSConfig{
 			ListenAddr: "127.0.0.1",
-			PortMin:    19000,
-			PortMax:    19100,
+			PortMin:    30000,
+			PortMax:    31000,
 			Upstream:   "8.8.8.8:53",
 		},
 	}
