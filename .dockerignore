@@ -1,0 +1,30 @@
+# Git
+.git
+.gitignore
+
+# IDE / editor
+.idea
+.vscode
+*.swp
+*.swo
+*~
+
+# Build artifacts that get regenerated
+*.o
+*.a
+
+# Test artifacts
+coverage.out
+*.test
+
+# Docker files (not needed inside container)
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+
+# Documentation
+README.md
+LICENSE
+
+# Cursor
+.cursor
