@@ -31,8 +31,10 @@ type Server struct {
 	mu          sync.RWMutex
 	portPool    map[int]bool
 	attachments map[string]*attachmentState
+	targetIndex map[string]string // target -> attachment ID (for reverse lookup on removal)
 
 	cpClient atomic.Pointer[ControlPlaneClient]
+	watcher  *TargetWatcher
 }
 
 type attachmentState struct {
@@ -61,7 +63,10 @@ func NewServer(cfg *config.Config, st *store.Store, logger zerolog.Logger, versi
 		version:     version,
 		portPool:    make(map[int]bool),
 		attachments: make(map[string]*attachmentState),
+		targetIndex: make(map[string]string),
 	}
+
+	s.watcher = NewTargetWatcher(logger, s.handleTargetRemoved)
 
 	for port := cfg.DNS.PortMin; port <= cfg.DNS.PortMax; port++ {
 		s.portPool[port] = false
@@ -73,6 +78,7 @@ func NewServer(cfg *config.Config, st *store.Store, logger zerolog.Logger, versi
 	}
 	for i := range existing {
 		s.attachments[existing[i].ID] = &attachmentState{info: &existing[i]}
+		s.targetIndex[existing[i].Target] = existing[i].ID
 		port := extractPort(existing[i].DnsAddress)
 		if port > 0 {
 			s.portPool[port] = true
@@ -84,6 +90,87 @@ func NewServer(cfg *config.Config, st *store.Store, logger zerolog.Logger, versi
 
 func (s *Server) SetControlPlaneClient(cp *ControlPlaneClient) {
 	s.cpClient.Store(cp)
+}
+
+func (s *Server) Start() error {
+	s.mu.RLock()
+	for _, state := range s.attachments {
+		switch parseAttachmentType(state.info.Type) {
+		case apiv1.AttachmentType_ATTACHMENT_TYPE_TC:
+			s.watcher.WatchInterface(state.info.Target)
+		case apiv1.AttachmentType_ATTACHMENT_TYPE_CGROUP:
+			if err := s.watcher.WatchCgroup(state.info.Target); err != nil {
+				s.logger.Warn().Err(err).
+					Str("id", state.info.ID).
+					Str("target", state.info.Target).
+					Msg("failed to watch cgroup, may already be removed")
+			}
+		}
+	}
+	s.mu.RUnlock()
+
+	if err := s.watcher.Start(); err != nil {
+		return fmt.Errorf("starting target watcher: %w", err)
+	}
+
+	return nil
+}
+
+func (s *Server) Stop() {
+	s.watcher.Stop()
+}
+
+func (s *Server) handleTargetRemoved(target string) {
+	s.mu.Lock()
+	id, ok := s.targetIndex[target]
+	if !ok {
+		s.mu.Unlock()
+		return
+	}
+
+	state, ok := s.attachments[id]
+	if !ok {
+		s.mu.Unlock()
+		return
+	}
+
+	if state.dns != nil {
+		if err := state.dns.Stop(); err != nil {
+			s.logger.Warn().Err(err).Str("id", id).Msg("error stopping DNS server")
+		}
+	}
+
+	if err := s.store.DeleteAttachment(id); err != nil {
+		s.logger.Error().Err(err).Str("id", id).Msg("error deleting attachment from store")
+	}
+
+	port := extractPort(state.info.DnsAddress)
+	if port > 0 {
+		s.releasePort(port)
+	}
+
+	switch parseAttachmentType(state.info.Type) {
+	case apiv1.AttachmentType_ATTACHMENT_TYPE_TC:
+		s.watcher.UnwatchInterface(target)
+	case apiv1.AttachmentType_ATTACHMENT_TYPE_CGROUP:
+		s.watcher.UnwatchCgroup(target)
+	}
+
+	delete(s.attachments, id)
+	delete(s.targetIndex, target)
+	s.mu.Unlock()
+
+	s.logger.Info().
+		Str("id", id).
+		Str("target", target).
+		Msg("cleaned up attachment after target removal")
+
+	if cpClient := s.cpClient.Load(); cpClient != nil {
+		cpClient.SendUnsubscribed(&apiv1.Unsubscribed{
+			Id:     id,
+			Reason: apiv1.UnsubscribeReason_UNSUBSCRIBE_REASON_REMOVED,
+		})
+	}
 }
 
 func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (*apiv1.AttachResponse, error) {
@@ -147,6 +234,16 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (*apiv1.A
 	}
 
 	s.attachments[id] = &attachmentState{info: attachment, dns: dnsServer}
+	s.targetIndex[target] = id
+
+	switch attachType {
+	case apiv1.AttachmentType_ATTACHMENT_TYPE_TC:
+		s.watcher.WatchInterface(target)
+	case apiv1.AttachmentType_ATTACHMENT_TYPE_CGROUP:
+		if err := s.watcher.WatchCgroup(target); err != nil {
+			s.logger.Warn().Err(err).Str("target", target).Msg("failed to watch cgroup")
+		}
+	}
 
 	s.logger.Info().
 		Str("id", id).
@@ -197,7 +294,15 @@ func (s *Server) Detach(ctx context.Context, req *apiv1.DetachRequest) (*emptypb
 		s.releasePort(port)
 	}
 
+	switch parseAttachmentType(state.info.Type) {
+	case apiv1.AttachmentType_ATTACHMENT_TYPE_TC:
+		s.watcher.UnwatchInterface(state.info.Target)
+	case apiv1.AttachmentType_ATTACHMENT_TYPE_CGROUP:
+		s.watcher.UnwatchCgroup(state.info.Target)
+	}
+
 	delete(s.attachments, req.Id)
+	delete(s.targetIndex, state.info.Target)
 
 	s.logger.Info().
 		Str("id", req.Id).

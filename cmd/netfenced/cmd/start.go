@@ -62,6 +62,11 @@ func runStart(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	if err := server.Start(); err != nil {
+		return err
+	}
+	defer server.Stop()
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
