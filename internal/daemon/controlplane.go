@@ -283,6 +283,9 @@ func (c *ControlPlaneClient) handleCommand(cmd *apiv1.ControlCommand) {
 
 	case *apiv1.ControlCommand_SubscribedAck:
 		c.logger.Debug().Str("id", cmd.Id).Msg("received subscribed ack")
+		// Apply configuration before unblocking the waiter to ensure the
+		// attachment is fully configured when Attach returns to the caller.
+		c.applySubscribedAck(cmd.Id, v.SubscribedAck)
 		c.pendingAcksMu.Lock()
 		if ch, ok := c.pendingAcks[cmd.Id]; ok {
 			select {
@@ -292,7 +295,6 @@ func (c *ControlPlaneClient) handleCommand(cmd *apiv1.ControlCommand) {
 			delete(c.pendingAcks, cmd.Id)
 		}
 		c.pendingAcksMu.Unlock()
-		c.applySubscribedAck(cmd.Id, v.SubscribedAck)
 
 	default:
 		c.logger.Warn().Str("id", cmd.Id).Msg("received unknown command")
