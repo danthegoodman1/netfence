@@ -29,6 +29,8 @@ A few major benefits to this solution that other options don't usually support:
 
 To my knowledge, no other solutions offers all of these features together.
 
+However, this does have a bit more overhead than something like [httpjail](https://github.com/coder/httpjail).
+
 # Design
 
 ## Architecture
