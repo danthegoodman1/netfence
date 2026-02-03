@@ -19,6 +19,16 @@ Your control plane pushes network rules like `ALLOW *.pypi.org` or `ALLOW 10.0.0
 - Metadata on daemons and attachments for associating with VM ID, tenant, etc.
 - Support for proxying DNS queries to the control plane to make DNS decisions per-attachment
 
+## Differences from other options
+
+A few major benefits to this solution that other options don't usually support:
+
+- Immediate severing of existing connections when rules change to disallow an IP (interface attach only)
+- Support all network protocols, and direct to IP networking. For example, the awesome [httpjail](https://github.com/coder/httpjail) doesn't allow you to connect direct to IPs, or direct TCP/UDP connections like connecting to databases.
+- Dynamic resolving of DNS and pre-resolution filtering (so there's no `secretdata.someattacker.com` exfiltration)
+
+To my knowledge, no other solutions offers all of these features together.
+
 # Design
 
 ## Architecture
