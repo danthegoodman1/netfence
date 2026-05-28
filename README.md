@@ -6,7 +6,7 @@ Netfence runs as a daemon on your VM/container hosts and automatically injects e
 
 Netfence daemons connect to a central control plane that you implement via gRPC to synchronize allowlists/denylists with your backend.
 
-Your control plane pushes network rules like `ALLOW *.pypi.org` or `ALLOW 10.0.0.0/16` to attached interfaces/cgroups. When a VM/container queries DNS, Netfence resolves it, adds the IPs to the eBPF filter, and drops traffic to unknown IPs before it leaves the host without any performance penalty.
+Your control plane pushes network rules like `ALLOW *.pypi.org` or `ALLOW 10.0.0.0/16` to attached interfaces/cgroups. When a VM/container queries DNS, Netfence resolves it, adds the IPs to the eBPF filter, and drops traffic to unknown IPs before it leaves the host with warmed-path overhead that is effectively indistinguishable from a normal socket connect in current benchmarks.
 
 ## Features
 
@@ -30,6 +30,40 @@ A few major benefits to this solution that other options don't usually support:
 To my knowledge, no other solutions offers all of these features together.
 
 However, this does have a bit more overhead than something like [httpjail](https://github.com/coder/httpjail).
+
+## Performance snapshot
+
+These numbers were measured in the privileged Docker Linux gate on `linux/arm64`
+using `docker compose run --build --rm bench ...`.
+
+### Warm socket path
+
+The warm socket benchmark uses connected UDP sockets to isolate the
+`cgroup/connect4` eBPF hook cost from TCP handshake latency. In this path DNS has
+already resolved the domain, the IP is still within TTL, and the IP/CIDR is
+already present in the eBPF map.
+
+| Path | Mean latency |
+| --- | ---: |
+| Normal socket connect, no eBPF | ~3.037 us |
+| Warm allowlist, IP already in eBPF map | ~3.042 us |
+| Measured overhead | ~4 ns, effectively noise |
+| Allowlist miss, local block | ~1.803 us |
+
+There is no "kernel miss asks parent process" path today. A cgroup allowlist
+miss is decided locally by eBPF and is blocked immediately.
+
+### DNS query path
+
+These numbers measure the DNS server path, not the warmed socket connect path.
+
+| Path | Mean latency |
+| --- | ---: |
+| Proxy query cold, in-process policy function | ~26.7 us |
+| Proxy query warm | ~25.3 us |
+| Allowlist query cold with local upstream | ~68.0 us |
+| Allowlist query warm with local upstream | ~67.4 us |
+| Cached "already added to filter" check | ~66.7 ns |
 
 # Design
 

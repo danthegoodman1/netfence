@@ -62,7 +62,7 @@ func queryServer(s *DNSServer, domain string, qtype uint16) *dns.Msg {
 	return writer.msg
 }
 
-func startTestUpstream(t *testing.T) string {
+func startTestUpstream(t testing.TB) string {
 	t.Helper()
 
 	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
