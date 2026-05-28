@@ -102,6 +102,7 @@ type dnsResponse struct {
 	Allow       bool
 	AddToFilter bool
 	IPs         []string
+	TTLSeconds  uint32
 }
 
 // testControlPlane is a minimal control plane server for end-to-end testing.
@@ -112,6 +113,8 @@ type testControlPlane struct {
 	pendingConfig map[string]*apiv1.SubscribedAck
 	streams       map[string]grpc.BidiStreamingServer[apiv1.DaemonEvent, apiv1.ControlCommand]
 	dnsResponses  map[string]*dnsResponse // domain -> response
+	noAckTargets  map[string]bool
+	unsubscribed  map[string]*apiv1.Unsubscribed
 }
 
 func newTestControlPlane() *testControlPlane {
@@ -119,6 +122,8 @@ func newTestControlPlane() *testControlPlane {
 		pendingConfig: make(map[string]*apiv1.SubscribedAck),
 		streams:       make(map[string]grpc.BidiStreamingServer[apiv1.DaemonEvent, apiv1.ControlCommand]),
 		dnsResponses:  make(map[string]*dnsResponse),
+		noAckTargets:  make(map[string]bool),
+		unsubscribed:  make(map[string]*apiv1.Unsubscribed),
 	}
 }
 
@@ -132,6 +137,31 @@ func (cp *testControlPlane) SetConfig(target string, ack *apiv1.SubscribedAck) {
 	cp.mu.Lock()
 	defer cp.mu.Unlock()
 	cp.pendingConfig[target] = ack
+}
+
+func (cp *testControlPlane) SetNoAck(target string, noAck bool) {
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	cp.noAckTargets[target] = noAck
+}
+
+func (cp *testControlPlane) StreamCount() int {
+	cp.mu.RLock()
+	defer cp.mu.RUnlock()
+	return len(cp.streams)
+}
+
+func (cp *testControlPlane) Unsubscribed(id string) *apiv1.Unsubscribed {
+	cp.mu.RLock()
+	defer cp.mu.RUnlock()
+	if unsub := cp.unsubscribed[id]; unsub != nil {
+		return &apiv1.Unsubscribed{
+			Id:     unsub.Id,
+			Reason: unsub.Reason,
+			Error:  unsub.Error,
+		}
+	}
+	return nil
 }
 
 func (cp *testControlPlane) SendCommand(attachmentID string, cmd *apiv1.ControlCommand) error {
@@ -165,12 +195,17 @@ func (cp *testControlPlane) Connect(stream grpc.BidiStreamingServer[apiv1.Daemon
 		case *apiv1.DaemonEvent_Subscribed:
 			cp.mu.Lock()
 			cp.streams[e.Subscribed.Id] = stream
+			noAck := cp.noAckTargets[e.Subscribed.Target]
 
 			ack := cp.pendingConfig[e.Subscribed.Target]
 			if ack == nil {
 				ack = &apiv1.SubscribedAck{Mode: apiv1.PolicyMode_POLICY_MODE_DISABLED}
 			}
 			cp.mu.Unlock()
+
+			if noAck {
+				continue
+			}
 
 			if err := stream.Send(&apiv1.ControlCommand{
 				Id:      e.Subscribed.Id,
@@ -182,6 +217,7 @@ func (cp *testControlPlane) Connect(stream grpc.BidiStreamingServer[apiv1.Daemon
 		case *apiv1.DaemonEvent_Unsubscribed:
 			cp.mu.Lock()
 			delete(cp.streams, e.Unsubscribed.Id)
+			cp.unsubscribed[e.Unsubscribed.Id] = e.Unsubscribed
 			cp.mu.Unlock()
 		}
 	}
@@ -200,6 +236,7 @@ func (cp *testControlPlane) QueryDns(ctx context.Context, req *apiv1.DnsQueryReq
 		Allow:       resp.Allow,
 		AddToFilter: resp.AddToFilter,
 		Ips:         resp.IPs,
+		TtlSeconds:  resp.TTLSeconds,
 	}, nil
 }
 
@@ -214,6 +251,10 @@ type e2eTestEnv struct {
 }
 
 func newE2ETestEnv(t *testing.T) *e2eTestEnv {
+	return newE2ETestEnvWithOptions(t, 19000, 20000, 5*time.Second)
+}
+
+func newE2ETestEnvWithOptions(t *testing.T, portMin, portMax int, subscribeAckTimeout time.Duration) *e2eTestEnv {
 	t.Helper()
 
 	cp := newTestControlPlane()
@@ -234,12 +275,13 @@ func newE2ETestEnv(t *testing.T) *e2eTestEnv {
 	cfg := &config.Config{
 		DNS: config.DNSConfig{
 			ListenAddr: "127.0.0.1",
-			PortMin:    19000,
-			PortMax:    20000,
+			PortMin:    portMin,
+			PortMax:    portMax,
 			Upstream:   "8.8.8.8:53",
 		},
 		ControlPlane: config.ControlPlaneConfig{
-			URL: grpcAddr,
+			URL:                 grpcAddr,
+			SubscribeAckTimeout: subscribeAckTimeout,
 		},
 	}
 
@@ -248,7 +290,7 @@ func newE2ETestEnv(t *testing.T) *e2eTestEnv {
 	srv, err := daemon.NewServer(cfg, st, logger, "test")
 	require.NoError(t, err)
 
-	cpClient := daemon.NewControlPlaneClient(grpcAddr, srv, logger, nil, 5*time.Second)
+	cpClient := daemon.NewControlPlaneClient(grpcAddr, srv, logger, nil, subscribeAckTimeout)
 	srv.SetControlPlaneClient(cpClient)
 
 	require.NoError(t, srv.Start())
@@ -682,6 +724,60 @@ func TestE2E_DynamicDNS(t *testing.T) {
 		ips := queryDNS(t, resp.DnsAddress, blockedDomain)
 		assert.Empty(t, ips, "expected no IPs for blocked domain")
 	})
+}
+
+func TestE2E_SubscribeTimeoutCleansUpAttachment(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("test requires root")
+	}
+
+	env := newE2ETestEnvWithOptions(t, 20100, 20100, 100*time.Millisecond)
+	defer env.cleanup()
+
+	cgroupPath, cgroupCleanup := setupTestCgroup(t, "netfence-e2e-subscribe-timeout")
+	defer cgroupCleanup()
+
+	env.controlPlane.SetNoAck(cgroupPath, true)
+
+	ctx := context.Background()
+	resp, err := env.daemonServer.Attach(ctx, &apiv1.AttachRequest{
+		Target: &apiv1.AttachRequest_CgroupPath{CgroupPath: cgroupPath},
+	})
+	require.Error(t, err)
+	assert.Nil(t, resp)
+
+	require.Eventually(t, func() bool {
+		list, err := env.daemonServer.List(ctx, &apiv1.ListRequest{})
+		return err == nil && len(list.Attachments) == 0
+	}, 2*time.Second, 25*time.Millisecond)
+
+	attachments, _, total, err := env.daemonStore.ListAttachments(100, "")
+	require.NoError(t, err)
+	assert.Zero(t, total)
+	assert.Empty(t, attachments)
+
+	require.Eventually(t, func() bool {
+		return env.controlPlane.StreamCount() == 0
+	}, 2*time.Second, 25*time.Millisecond)
+
+	env.controlPlane.SetNoAck(cgroupPath, false)
+	env.controlPlane.SetConfig(cgroupPath, &apiv1.SubscribedAck{
+		Mode: apiv1.PolicyMode_POLICY_MODE_DISABLED,
+	})
+
+	resp, err = env.daemonServer.Attach(ctx, &apiv1.AttachRequest{
+		Target: &apiv1.AttachRequest_CgroupPath{CgroupPath: cgroupPath},
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, resp.Id)
+	assert.True(t, isDNSServerRunning(resp.DnsAddress), "single DNS port should be reusable after failed ack cleanup")
+
+	_, err = env.daemonServer.Detach(ctx, &apiv1.DetachRequest{Id: resp.Id})
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		unsub := env.controlPlane.Unsubscribed(resp.Id)
+		return unsub != nil && unsub.Reason == apiv1.UnsubscribeReason_UNSUBSCRIBE_REASON_DETACHED
+	}, 2*time.Second, 25*time.Millisecond)
 }
 
 func queryDNS(t *testing.T, serverAddr, domain string) []string {

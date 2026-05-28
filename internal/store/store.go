@@ -56,17 +56,23 @@ func New(dbPath string) (*Store, error) {
 }
 
 func migrate(db *sql.DB) error {
-	_, err := db.Exec(`
-		CREATE TABLE IF NOT EXISTS attachments (
-			id TEXT PRIMARY KEY,
-			target TEXT NOT NULL,
+	if _, err := db.Exec(`
+			CREATE TABLE IF NOT EXISTS attachments (
+				id TEXT PRIMARY KEY,
+				target TEXT NOT NULL,
 			type TEXT NOT NULL,
 			mode TEXT NOT NULL,
 			dns_mode TEXT NOT NULL,
 			dns_address TEXT NOT NULL,
 			metadata TEXT NOT NULL,
-			attached_at TEXT NOT NULL
-		) STRICT, WITHOUT ROWID
+				attached_at TEXT NOT NULL
+			) STRICT, WITHOUT ROWID
+		`); err != nil {
+		return err
+	}
+	_, err := db.Exec(`
+		CREATE INDEX IF NOT EXISTS idx_attachments_attached_at_id
+		ON attachments(attached_at, id)
 	`)
 	return err
 }
@@ -123,16 +129,9 @@ func (s *Store) ListAttachments(pageSize int, pageToken string) ([]Attachment, s
 		LIMIT ?
 	`
 
-	var afterTime, afterID string
-	if pageToken != "" {
-		parts := strings.SplitN(pageToken, "|", 2)
-		if len(parts) == 2 {
-			afterTime = parts[0]
-			afterID = parts[1]
-		}
-	}
-	if afterTime == "" {
-		afterTime = "0001-01-01T00:00:00Z"
+	afterTime, afterID, err := parsePageToken(pageToken)
+	if err != nil {
+		return nil, "", 0, err
 	}
 
 	rows, err := s.db.Query(query, afterTime, afterID, pageSize+1)
@@ -148,6 +147,9 @@ func (s *Store) ListAttachments(pageSize int, pageToken string) ([]Attachment, s
 			return nil, "", 0, err
 		}
 		attachments = append(attachments, *a)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, "", 0, fmt.Errorf("iterating attachments: %w", err)
 	}
 
 	var nextPageToken string
@@ -178,7 +180,24 @@ func (s *Store) GetAllAttachments() ([]Attachment, error) {
 		}
 		attachments = append(attachments, *a)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating attachments: %w", err)
+	}
 	return attachments, nil
+}
+
+func parsePageToken(pageToken string) (string, string, error) {
+	if pageToken == "" {
+		return "0001-01-01T00:00:00Z", "", nil
+	}
+	parts := strings.SplitN(pageToken, "|", 2)
+	if len(parts) != 2 || parts[0] == "" {
+		return "", "", fmt.Errorf("invalid page token")
+	}
+	if _, err := time.Parse(time.RFC3339Nano, parts[0]); err != nil {
+		return "", "", fmt.Errorf("invalid page token timestamp: %w", err)
+	}
+	return parts[0], parts[1], nil
 }
 
 type scanner interface {
@@ -190,7 +209,7 @@ func scanAttachment(row *sql.Row) (*Attachment, error) {
 	var metadata, attachedAt string
 	err := row.Scan(&a.ID, &a.Target, &a.Type, &a.Mode, &a.DnsMode, &a.DnsAddress, &metadata, &attachedAt)
 	if err == sql.ErrNoRows {
-		return nil, nil
+		return nil, sql.ErrNoRows
 	}
 	if err != nil {
 		return nil, fmt.Errorf("scanning attachment: %w", err)

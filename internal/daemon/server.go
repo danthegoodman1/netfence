@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -109,7 +110,6 @@ func (s *Server) Start() error {
 			toRemove = append(toRemove, id)
 			continue
 		}
-		state.filter = ebpfFilter
 
 		var proxyFunc DnsProxyFunc
 		if cpClient := s.cpClient.Load(); cpClient != nil {
@@ -127,7 +127,6 @@ func (s *Server) Start() error {
 			toRemove = append(toRemove, id)
 			continue
 		}
-		state.dns = dnsServer
 
 		switch attachType {
 		case apiv1.AttachmentType_ATTACHMENT_TYPE_TC:
@@ -137,9 +136,21 @@ func (s *Server) Start() error {
 				s.logger.Warn().Err(err).
 					Str("id", id).
 					Str("target", state.info.Target).
-					Msg("failed to watch cgroup, may already be removed")
+					Msg("failed to watch cgroup on restore")
+				if err := dnsServer.Stop(); err != nil {
+					s.logger.Warn().Err(err).Str("id", id).Msg("error stopping DNS server after restore watch failure")
+				}
+				if ebpfFilter != nil {
+					if err := ebpfFilter.Close(); err != nil {
+						s.logger.Warn().Err(err).Str("id", id).Msg("error closing filter after restore watch failure")
+					}
+				}
+				toRemove = append(toRemove, id)
+				continue
 			}
 		}
+		state.filter = ebpfFilter
+		state.dns = dnsServer
 
 		s.logger.Info().
 			Str("id", id).
@@ -266,15 +277,20 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (*apiv1.A
 	}
 
 	s.mu.Lock()
+	if existingID, ok := s.targetIndex[target]; ok {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("target already attached: %s (%s)", target, existingID)
+	}
 
 	port, err := s.allocatePort()
 	if err != nil {
 		s.mu.Unlock()
 		return nil, err
 	}
+	s.mu.Unlock()
 
 	id := uuid.Must(uuid.NewV7()).String()
-	dnsAddr := fmt.Sprintf("%s:%d", s.cfg.DNS.ListenAddr, port)
+	dnsAddr := net.JoinHostPort(s.cfg.DNS.ListenAddr, strconv.Itoa(port))
 
 	// Always start in DISABLED mode - the control plane provides the initial
 	// configuration via SubscribedAck
@@ -292,6 +308,7 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (*apiv1.A
 	}
 
 	if err := s.store.SaveAttachment(attachment); err != nil {
+		s.mu.Lock()
 		s.releasePort(port)
 		s.mu.Unlock()
 		return nil, fmt.Errorf("saving attachment: %w", err)
@@ -299,9 +316,10 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (*apiv1.A
 
 	ebpfFilter, err := createFilter(target, attachType, mode)
 	if err != nil {
+		s.mu.Lock()
 		s.releasePort(port)
-		s.store.DeleteAttachment(id)
 		s.mu.Unlock()
+		s.store.DeleteAttachment(id)
 		return nil, fmt.Errorf("creating eBPF filter: %w", err)
 	}
 
@@ -314,21 +332,38 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (*apiv1.A
 		if ebpfFilter != nil {
 			ebpfFilter.Close()
 		}
+		s.mu.Lock()
 		s.releasePort(port)
-		s.store.DeleteAttachment(id)
 		s.mu.Unlock()
+		s.store.DeleteAttachment(id)
 		return nil, fmt.Errorf("starting DNS server: %w", err)
 	}
 
+	s.mu.Lock()
+	if existingID, ok := s.targetIndex[target]; ok {
+		s.mu.Unlock()
+		dnsServer.Stop()
+		if ebpfFilter != nil {
+			ebpfFilter.Close()
+		}
+		s.mu.Lock()
+		s.releasePort(port)
+		s.mu.Unlock()
+		s.store.DeleteAttachment(id)
+		return nil, fmt.Errorf("target already attached: %s (%s)", target, existingID)
+	}
 	s.attachments[id] = &attachmentState{info: attachment, dns: dnsServer, filter: ebpfFilter}
 	s.targetIndex[target] = id
+	s.mu.Unlock()
 
 	switch attachType {
 	case apiv1.AttachmentType_ATTACHMENT_TYPE_TC:
 		s.watcher.WatchInterface(target)
 	case apiv1.AttachmentType_ATTACHMENT_TYPE_CGROUP:
 		if err := s.watcher.WatchCgroup(target); err != nil {
-			s.logger.Warn().Err(err).Str("target", target).Msg("failed to watch cgroup")
+			s.logger.Error().Err(err).Str("target", target).Msg("failed to watch cgroup")
+			s.cleanupAttachment(id, target, attachType, port, dnsServer, ebpfFilter, false)
+			return nil, fmt.Errorf("watching cgroup: %w", err)
 		}
 	}
 
@@ -340,7 +375,6 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (*apiv1.A
 		Msg("attached filter")
 
 	cpClient := s.cpClient.Load()
-	s.mu.Unlock()
 
 	if cpClient != nil {
 		sub := &apiv1.Subscribed{
@@ -356,7 +390,7 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (*apiv1.A
 		_, err := cpClient.SubscribeAndWait(ctx, sub)
 		if err != nil {
 			s.logger.Error().Err(err).Str("id", id).Msg("control plane subscription failed, detaching")
-			s.cleanupAttachment(id, target, attachType, port, dnsServer, ebpfFilter)
+			s.cleanupAttachment(id, target, attachType, port, dnsServer, ebpfFilter, true)
 			return nil, fmt.Errorf("control plane subscription failed: %w", err)
 		}
 	}
@@ -428,12 +462,21 @@ func (s *Server) List(ctx context.Context, req *apiv1.ListRequest) (*apiv1.ListR
 		return nil, fmt.Errorf("listing attachments: %w", err)
 	}
 
+	statsRefs := make(map[string]attachmentStatsRef, len(attachments))
 	s.mu.RLock()
-	defer s.mu.RUnlock()
+	for _, a := range attachments {
+		if state := s.attachments[a.ID]; state != nil {
+			statsRefs[a.ID] = attachmentStatsRef{
+				id:     a.ID,
+				filter: state.filter,
+				dns:    state.dns,
+			}
+		}
+	}
+	s.mu.RUnlock()
 
 	var infos []*apiv1.AttachmentInfo
 	for _, a := range attachments {
-		state := s.attachments[a.ID]
 		info := &apiv1.AttachmentInfo{
 			Id:         a.ID,
 			Target:     a.Target,
@@ -444,15 +487,15 @@ func (s *Server) List(ctx context.Context, req *apiv1.ListRequest) (*apiv1.ListR
 			Metadata:   a.Metadata,
 			AttachedAt: timestamppb.New(a.AttachedAt),
 		}
-		if state != nil {
-			if state.filter != nil {
-				if stats, err := state.filter.GetStats(); err == nil {
+		if refs, ok := statsRefs[a.ID]; ok {
+			if refs.filter != nil {
+				if stats, err := refs.filter.GetStats(); err == nil {
 					info.PacketsAllowed = stats.Allowed
 					info.PacketsBlocked = stats.Blocked
 				}
 			}
-			if state.dns != nil {
-				info.DnsQueriesAllowed, info.DnsQueriesBlocked = state.dns.Stats()
+			if refs.dns != nil {
+				info.DnsQueriesAllowed, info.DnsQueriesBlocked = refs.dns.Stats()
 			}
 		}
 		infos = append(infos, info)
@@ -506,26 +549,46 @@ func (s *Server) GetSyncAttachments() []*apiv1.Attachment {
 }
 
 func (s *Server) GetAttachmentStats() []*apiv1.AttachmentStats {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	refs := s.snapshotAttachmentStats()
 
 	var stats []*apiv1.AttachmentStats
-	for id, state := range s.attachments {
+	for _, ref := range refs {
 		stat := &apiv1.AttachmentStats{
-			Id: id,
+			Id: ref.id,
 		}
-		if state.filter != nil {
-			if filterStats, err := state.filter.GetStats(); err == nil {
+		if ref.filter != nil {
+			if filterStats, err := ref.filter.GetStats(); err == nil {
 				stat.PacketsAllowed = filterStats.Allowed
 				stat.PacketsBlocked = filterStats.Blocked
 			}
 		}
-		if state.dns != nil {
-			stat.DnsQueriesAllowed, stat.DnsQueriesBlocked = state.dns.Stats()
+		if ref.dns != nil {
+			stat.DnsQueriesAllowed, stat.DnsQueriesBlocked = ref.dns.Stats()
 		}
 		stats = append(stats, stat)
 	}
 	return stats
+}
+
+type attachmentStatsRef struct {
+	id     string
+	filter filter.Filter
+	dns    *DNSServer
+}
+
+func (s *Server) snapshotAttachmentStats() []attachmentStatsRef {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	refs := make([]attachmentStatsRef, 0, len(s.attachments))
+	for id, state := range s.attachments {
+		refs = append(refs, attachmentStatsRef{
+			id:     id,
+			filter: state.filter,
+			dns:    state.dns,
+		})
+	}
+	return refs
 }
 
 func (s *Server) DaemonID() string {
@@ -538,131 +601,231 @@ func (s *Server) Hostname() string {
 
 func (s *Server) SetDnsMode(id string, mode apiv1.DnsMode) error {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	state, ok := s.attachments[id]
 	if !ok {
+		s.mu.RUnlock()
 		return fmt.Errorf("attachment not found: %s", id)
 	}
-	if state.dns != nil {
-		state.dns.SetMode(mode)
+	dnsServer := state.dns
+	s.mu.RUnlock()
+
+	if dnsServer != nil {
+		dnsServer.SetMode(mode)
+	}
+
+	s.mu.Lock()
+	state, ok = s.attachments[id]
+	if !ok {
+		s.mu.Unlock()
+		return fmt.Errorf("attachment not found: %s", id)
+	}
+	state.info.DnsMode = mode.String()
+	attachment := cloneAttachment(state.info)
+	s.mu.Unlock()
+
+	if err := s.store.SaveAttachment(attachment); err != nil {
+		return fmt.Errorf("saving DNS mode: %w", err)
 	}
 	return nil
 }
 
 func (s *Server) AllowDomain(id string, domain string, includeSubdomains bool) error {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	state, ok := s.attachments[id]
 	if !ok {
+		s.mu.RUnlock()
 		return fmt.Errorf("attachment not found: %s", id)
 	}
-	if state.dns != nil {
-		state.dns.AllowDomain(domain, includeSubdomains)
+	dnsServer := state.dns
+	s.mu.RUnlock()
+
+	if dnsServer != nil {
+		dnsServer.AllowDomain(domain, includeSubdomains)
 	}
 	return nil
 }
 
 func (s *Server) DenyDomain(id string, domain string, includeSubdomains bool) error {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	state, ok := s.attachments[id]
 	if !ok {
+		s.mu.RUnlock()
 		return fmt.Errorf("attachment not found: %s", id)
 	}
-	if state.dns != nil {
-		state.dns.DenyDomain(domain, includeSubdomains)
+	dnsServer := state.dns
+	s.mu.RUnlock()
+
+	if dnsServer != nil {
+		dnsServer.DenyDomain(domain, includeSubdomains)
 	}
 	return nil
 }
 
 func (s *Server) RemoveDomain(id string, domain string) error {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	state, ok := s.attachments[id]
 	if !ok {
+		s.mu.RUnlock()
 		return fmt.Errorf("attachment not found: %s", id)
 	}
-	if state.dns != nil {
-		state.dns.RemoveDomain(domain)
+	dnsServer := state.dns
+	s.mu.RUnlock()
+
+	if dnsServer != nil {
+		dnsServer.RemoveDomain(domain)
+	}
+	return nil
+}
+
+func (s *Server) ReplaceDNSRules(id string, mode apiv1.DnsMode, allowDomains, denyDomains []*apiv1.DomainEntry) error {
+	s.mu.RLock()
+	state, ok := s.attachments[id]
+	if !ok {
+		s.mu.RUnlock()
+		return fmt.Errorf("attachment not found: %s", id)
+	}
+	dnsServer := state.dns
+	s.mu.RUnlock()
+
+	if dnsServer != nil {
+		dnsServer.ReplaceRules(mode, allowDomains, denyDomains)
+	}
+
+	s.mu.Lock()
+	state, ok = s.attachments[id]
+	if !ok {
+		s.mu.Unlock()
+		return fmt.Errorf("attachment not found: %s", id)
+	}
+	state.info.DnsMode = mode.String()
+	attachment := cloneAttachment(state.info)
+	s.mu.Unlock()
+
+	if err := s.store.SaveAttachment(attachment); err != nil {
+		return fmt.Errorf("saving DNS rules: %w", err)
+	}
+	return nil
+}
+
+func (s *Server) ClearRules(id string) error {
+	s.mu.RLock()
+	state, ok := s.attachments[id]
+	if !ok {
+		s.mu.RUnlock()
+		return fmt.Errorf("attachment not found: %s", id)
+	}
+	ebpfFilter := state.filter
+	dnsServer := state.dns
+	s.mu.RUnlock()
+
+	if ebpfFilter != nil {
+		if err := ebpfFilter.ClearRules(); err != nil {
+			return err
+		}
+	}
+	if dnsServer != nil {
+		dnsServer.ClearDynamicCache()
 	}
 	return nil
 }
 
 func (s *Server) SetFilterMode(id string, mode apiv1.PolicyMode) error {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	state, ok := s.attachments[id]
 	if !ok {
+		s.mu.RUnlock()
 		return fmt.Errorf("attachment not found: %s", id)
 	}
-	if state.filter != nil {
-		return state.filter.SetMode(apiModeToFilterMode(mode))
+	ebpfFilter := state.filter
+	s.mu.RUnlock()
+
+	if ebpfFilter != nil {
+		if err := ebpfFilter.SetMode(apiModeToFilterMode(mode)); err != nil {
+			return err
+		}
+	}
+
+	s.mu.Lock()
+	state, ok = s.attachments[id]
+	if !ok {
+		s.mu.Unlock()
+		return fmt.Errorf("attachment not found: %s", id)
+	}
+	state.info.Mode = mode.String()
+	attachment := cloneAttachment(state.info)
+	s.mu.Unlock()
+
+	if err := s.store.SaveAttachment(attachment); err != nil {
+		return fmt.Errorf("saving filter mode: %w", err)
 	}
 	return nil
 }
 
 func (s *Server) AllowCIDR(id string, cidr *net.IPNet) error {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	state, ok := s.attachments[id]
 	if !ok {
+		s.mu.RUnlock()
 		return fmt.Errorf("attachment not found: %s", id)
 	}
-	if state.filter != nil {
-		return state.filter.AllowIP(cidr)
+	ebpfFilter := state.filter
+	s.mu.RUnlock()
+
+	if ebpfFilter != nil {
+		return ebpfFilter.AllowIP(cidr)
 	}
 	return nil
 }
 
 func (s *Server) DenyCIDR(id string, cidr *net.IPNet) error {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	state, ok := s.attachments[id]
 	if !ok {
+		s.mu.RUnlock()
 		return fmt.Errorf("attachment not found: %s", id)
 	}
-	if state.filter != nil {
-		return state.filter.DenyIP(cidr)
+	ebpfFilter := state.filter
+	s.mu.RUnlock()
+
+	if ebpfFilter != nil {
+		return ebpfFilter.DenyIP(cidr)
 	}
 	return nil
 }
 
 func (s *Server) RemoveAllowedCIDR(id string, cidr *net.IPNet) error {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	state, ok := s.attachments[id]
 	if !ok {
+		s.mu.RUnlock()
 		return fmt.Errorf("attachment not found: %s", id)
 	}
-	if state.filter != nil {
-		return state.filter.RemoveAllowedIP(cidr)
+	ebpfFilter := state.filter
+	s.mu.RUnlock()
+
+	if ebpfFilter != nil {
+		return ebpfFilter.RemoveAllowedIP(cidr)
 	}
 	return nil
 }
 
 func (s *Server) RemoveDeniedCIDR(id string, cidr *net.IPNet) error {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	state, ok := s.attachments[id]
 	if !ok {
+		s.mu.RUnlock()
 		return fmt.Errorf("attachment not found: %s", id)
 	}
-	if state.filter != nil {
-		return state.filter.RemoveDeniedIP(cidr)
+	ebpfFilter := state.filter
+	s.mu.RUnlock()
+
+	if ebpfFilter != nil {
+		return ebpfFilter.RemoveDeniedIP(cidr)
 	}
 	return nil
 }
 
-func (s *Server) cleanupAttachment(id, target string, attachType apiv1.AttachmentType, port int, dnsServer *DNSServer, ebpfFilter filter.Filter) {
+func (s *Server) cleanupAttachment(id, target string, attachType apiv1.AttachmentType, port int, dnsServer *DNSServer, ebpfFilter filter.Filter, notifyControlPlane bool) {
 	s.mu.Lock()
 	// Check if attachment still exists - it may have already been cleaned up
 	// by the target watcher if the interface/cgroup was removed while we were
@@ -691,6 +854,16 @@ func (s *Server) cleanupAttachment(id, target string, attachType apiv1.Attachmen
 		ebpfFilter.Close()
 	}
 	s.store.DeleteAttachment(id)
+
+	if notifyControlPlane {
+		if cpClient := s.cpClient.Load(); cpClient != nil {
+			cpClient.SendUnsubscribed(&apiv1.Unsubscribed{
+				Id:     id,
+				Reason: apiv1.UnsubscribeReason_UNSUBSCRIBE_REASON_ERROR,
+				Error:  "control plane subscription failed",
+			})
+		}
+	}
 }
 
 func (s *Server) allocatePort() (int, error) {
@@ -710,9 +883,29 @@ func (s *Server) releasePort(port int) {
 }
 
 func extractPort(addr string) int {
-	var port int
-	fmt.Sscanf(addr, "%*[^:]:%d", &port)
+	_, portString, err := net.SplitHostPort(addr)
+	if err != nil {
+		return 0
+	}
+	port, err := strconv.Atoi(portString)
+	if err != nil {
+		return 0
+	}
 	return port
+}
+
+func cloneAttachment(a *store.Attachment) *store.Attachment {
+	if a == nil {
+		return nil
+	}
+	clone := *a
+	if a.Metadata != nil {
+		clone.Metadata = make(map[string]string, len(a.Metadata))
+		for k, v := range a.Metadata {
+			clone.Metadata[k] = v
+		}
+	}
+	return &clone
 }
 
 func parseAttachmentType(s string) apiv1.AttachmentType {

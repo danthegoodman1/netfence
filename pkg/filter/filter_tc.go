@@ -3,6 +3,7 @@
 package filter
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -133,10 +134,16 @@ func (f *TCFilter) RemoveAllowedIP(cidr *net.IPNet) error {
 
 	if cidr.IP.To4() != nil {
 		key := ipv4CIDRToKey(cidr)
-		return f.objs.AllowedIpv4.Delete(key)
+		if err := f.objs.AllowedIpv4.Delete(key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+			return err
+		}
+		return nil
 	}
 	key := ipv6CIDRToKey(cidr)
-	return f.objs.AllowedIpv6.Delete(key)
+	if err := f.objs.AllowedIpv6.Delete(key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+		return err
+	}
+	return nil
 }
 
 // RemoveDeniedIP removes an IP address or CIDR from the denylist
@@ -146,10 +153,36 @@ func (f *TCFilter) RemoveDeniedIP(cidr *net.IPNet) error {
 
 	if cidr.IP.To4() != nil {
 		key := ipv4CIDRToKey(cidr)
-		return f.objs.DeniedIpv4.Delete(key)
+		if err := f.objs.DeniedIpv4.Delete(key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+			return err
+		}
+		return nil
 	}
 	key := ipv6CIDRToKey(cidr)
-	return f.objs.DeniedIpv6.Delete(key)
+	if err := f.objs.DeniedIpv6.Delete(key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+		return err
+	}
+	return nil
+}
+
+// ClearRules removes all configured allowlist and denylist entries.
+func (f *TCFilter) ClearRules() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if err := clearMap[IPv4LPMKey](f.objs.AllowedIpv4); err != nil {
+		return fmt.Errorf("clearing allowed IPv4 rules: %w", err)
+	}
+	if err := clearMap[IPv6LPMKey](f.objs.AllowedIpv6); err != nil {
+		return fmt.Errorf("clearing allowed IPv6 rules: %w", err)
+	}
+	if err := clearMap[IPv4LPMKey](f.objs.DeniedIpv4); err != nil {
+		return fmt.Errorf("clearing denied IPv4 rules: %w", err)
+	}
+	if err := clearMap[IPv6LPMKey](f.objs.DeniedIpv6); err != nil {
+		return fmt.Errorf("clearing denied IPv6 rules: %w", err)
+	}
+	return nil
 }
 
 // GetStats returns the current filter statistics
@@ -158,12 +191,16 @@ func (f *TCFilter) GetStats() (Stats, error) {
 	defer f.mu.Unlock()
 
 	var stats Stats
-	if err := f.objs.Stats.Lookup(uint32(0), &stats.Allowed); err != nil {
+	allowed, err := sumPerCPUCounter(f.objs.Stats, 0)
+	if err != nil {
 		return stats, fmt.Errorf("reading allowed count: %w", err)
 	}
-	if err := f.objs.Stats.Lookup(uint32(1), &stats.Blocked); err != nil {
+	blocked, err := sumPerCPUCounter(f.objs.Stats, 1)
+	if err != nil {
 		return stats, fmt.Errorf("reading blocked count: %w", err)
 	}
+	stats.Allowed = allowed
+	stats.Blocked = blocked
 	return stats, nil
 }
 

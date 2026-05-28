@@ -76,7 +76,7 @@ struct {
 
 // Statistics counters
 struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(max_entries, 2); // 0 = allowed, 1 = blocked
     __type(key, __u32);
     __type(value, __u64);
@@ -86,7 +86,7 @@ static __always_inline void increment_stat(__u32 idx)
 {
     __u64 *count = bpf_map_lookup_elem(&stats, &idx);
     if (count) {
-        __sync_fetch_and_add(count, 1);
+        *count += 1;
     }
 }
 

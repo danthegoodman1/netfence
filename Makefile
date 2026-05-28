@@ -1,6 +1,6 @@
 # Makefile for netfence
 
-.PHONY: all generate build test test-docker test-docker-cgroup test-docker-tc check-docker dev-docker clean help
+.PHONY: all generate build test test-docker test-docker-cgroup test-docker-tc check-docker bench-docker dev-docker clean help
 
 # Default target
 all: generate build
@@ -40,6 +40,11 @@ check-docker:
 	@echo "Running checks in Docker..."
 	docker compose run --build --rm check
 
+# Run benchmarks in Docker
+bench-docker:
+	@echo "Running benchmarks in Docker..."
+	docker compose run --build --rm bench
+
 # Start an interactive Linux development container
 dev-docker:
 	@echo "Starting Linux development container..."
@@ -77,6 +82,7 @@ help:
 	@echo "  test-docker-cgroup - Run only cgroup filter tests in Docker"
 	@echo "  test-docker-tc   - Run only TC filter tests in Docker"
 	@echo "  check-docker     - Run fmt/vet/race tests in Docker"
+	@echo "  bench-docker     - Run benchmarks in Docker"
 	@echo "  dev-docker       - Start an interactive Linux development container"
 	@echo "  clean            - Clean generated files and build artifacts"
 	@echo "  deps             - Update dependencies"

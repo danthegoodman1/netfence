@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -20,7 +21,16 @@ type IPAllower interface {
 }
 
 // DnsProxyFunc is called when DNS_MODE_PROXY is enabled to get a decision from the control plane
-type DnsProxyFunc func(domain, queryType string) (allow, addToFilter bool, ips []string, err error)
+type DnsProxyFunc func(domain, queryType string) (DnsProxyDecision, error)
+
+const defaultDNSTTLSeconds uint32 = 300
+
+type DnsProxyDecision struct {
+	Allow       bool
+	AddToFilter bool
+	IPs         []string
+	TTLSeconds  uint32
+}
 
 // DNSServer is a per-attachment DNS server that filters queries and populates the IP filter
 type DNSServer struct {
@@ -35,6 +45,7 @@ type DNSServer struct {
 	mode           apiv1.DnsMode
 	allowedDomains map[string]bool // domain -> includeSubdomains
 	deniedDomains  map[string]bool // domain -> includeSubdomains
+	ipCache        map[string]time.Time
 
 	serverMu sync.Mutex
 	server   *dns.Server
@@ -55,6 +66,7 @@ func NewDNSServer(attachmentID, listenAddr, upstream string, logger zerolog.Logg
 		mode:           apiv1.DnsMode_DNS_MODE_DISABLED,
 		allowedDomains: make(map[string]bool),
 		deniedDomains:  make(map[string]bool),
+		ipCache:        make(map[string]time.Time),
 	}
 }
 
@@ -141,6 +153,35 @@ func (s *DNSServer) RemoveDomain(domain string) {
 	s.logger.Debug().Str("domain", domain).Msg("domain removed from rules")
 }
 
+func (s *DNSServer) ReplaceRules(mode apiv1.DnsMode, allowDomains, denyDomains []*apiv1.DomainEntry) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.mode = mode
+	s.allowedDomains = make(map[string]bool, len(allowDomains))
+	s.deniedDomains = make(map[string]bool, len(denyDomains))
+	s.ipCache = make(map[string]time.Time)
+	for _, entry := range allowDomains {
+		if entry == nil {
+			continue
+		}
+		s.allowedDomains[normalizeDomain(entry.Domain)] = entry.IncludeSubdomains
+	}
+	for _, entry := range denyDomains {
+		if entry == nil {
+			continue
+		}
+		s.deniedDomains[normalizeDomain(entry.Domain)] = entry.IncludeSubdomains
+	}
+	s.logger.Debug().Str("mode", mode.String()).Msg("DNS rules replaced")
+}
+
+func (s *DNSServer) ClearDynamicCache() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ipCache = make(map[string]time.Time)
+}
+
 func (s *DNSServer) Stats() (allowed, blocked uint64) {
 	return s.queriesAllowed.Load(), s.queriesBlocked.Load()
 }
@@ -156,61 +197,66 @@ func (s *DNSServer) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 
 	s.mu.RLock()
 	mode := s.mode
-	allowed := s.isDomainAllowed(domain)
-	denied := s.isDomainDenied(domain)
-	s.mu.RUnlock()
 
 	shouldResolve := false
 	shouldAddToFilter := false
 
 	switch mode {
 	case apiv1.DnsMode_DNS_MODE_DISABLED:
+		s.mu.RUnlock()
 		// Forward all, don't add to filter
 		shouldResolve = true
 		shouldAddToFilter = false
 
 	case apiv1.DnsMode_DNS_MODE_ALLOWLIST:
-		// Only resolve allowed domains, add to filter
-		if allowed {
+		decision := s.evaluateDomainLocked(domain)
+		s.mu.RUnlock()
+		if decision == domainDecisionAllow {
 			shouldResolve = true
 			shouldAddToFilter = true
 		}
 
 	case apiv1.DnsMode_DNS_MODE_DENYLIST:
-		// Resolve all except denied, add to filter
-		if !denied {
+		decision := s.evaluateDomainLocked(domain)
+		s.mu.RUnlock()
+		if decision != domainDecisionDeny {
 			shouldResolve = true
 			shouldAddToFilter = true
 		}
 
 	case apiv1.DnsMode_DNS_MODE_PROXY:
-		if s.proxyFunc != nil {
-			queryType := dns.TypeToString[q.Qtype]
-			allow, addToFilter, ips, err := s.proxyFunc(domain, queryType)
-			if err != nil {
-				s.logger.Error().Err(err).Str("domain", domain).Msg("control plane query failed")
-				s.sendServFail(w, req)
-				return
-			}
-			if !allow {
-				s.queriesBlocked.Add(1)
-				s.logger.Debug().Str("domain", domain).Msg("DNS query blocked by control plane")
-				s.sendRefused(w, req)
-				return
-			}
-			shouldResolve = true
-			shouldAddToFilter = addToFilter
-			// If control plane provided IPs, return them directly
-			if len(ips) > 0 {
-				s.queriesAllowed.Add(1)
-				s.sendProxyResponse(w, req, domain, ips, addToFilter)
-				return
-			}
-		} else {
-			// No proxy function, fall back to allowing
-			shouldResolve = true
-			shouldAddToFilter = false
+		proxyFunc := s.proxyFunc
+		s.mu.RUnlock()
+		if proxyFunc == nil {
+			s.queriesBlocked.Add(1)
+			s.logger.Warn().Str("domain", domain).Msg("DNS proxy unavailable")
+			s.sendServFail(w, req)
+			return
 		}
+		queryType := dns.TypeToString[q.Qtype]
+		decision, err := proxyFunc(domain, queryType)
+		if err != nil {
+			s.queriesBlocked.Add(1)
+			s.logger.Error().Err(err).Str("domain", domain).Msg("control plane query failed")
+			s.sendServFail(w, req)
+			return
+		}
+		if !decision.Allow {
+			s.queriesBlocked.Add(1)
+			s.logger.Debug().Str("domain", domain).Msg("DNS query blocked by control plane")
+			s.sendRefused(w, req)
+			return
+		}
+		shouldResolve = true
+		shouldAddToFilter = decision.AddToFilter
+		if len(decision.IPs) > 0 {
+			s.queriesAllowed.Add(1)
+			s.sendProxyResponse(w, req, domain, decision.IPs, decision.AddToFilter, decision.TTLSeconds)
+			return
+		}
+
+	default:
+		s.mu.RUnlock()
 	}
 
 	if !shouldResolve {
@@ -234,19 +280,9 @@ func (s *DNSServer) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 		for _, rr := range resp.Answer {
 			switch a := rr.(type) {
 			case *dns.A:
-				cidr := &net.IPNet{IP: a.A, Mask: net.CIDRMask(32, 32)}
-				if err := s.filter.AllowIP(cidr); err != nil {
-					s.logger.Warn().Err(err).Str("ip", a.A.String()).Msg("failed to add IPv4 to filter")
-				} else {
-					s.logger.Debug().Str("domain", domain).Str("ip", a.A.String()).Msg("added IPv4 to filter")
-				}
+				s.addIPToFilter(domain, a.A, 32, a.Hdr.Ttl)
 			case *dns.AAAA:
-				cidr := &net.IPNet{IP: a.AAAA, Mask: net.CIDRMask(128, 128)}
-				if err := s.filter.AllowIP(cidr); err != nil {
-					s.logger.Warn().Err(err).Str("ip", a.AAAA.String()).Msg("failed to add IPv6 to filter")
-				} else {
-					s.logger.Debug().Str("domain", domain).Str("ip", a.AAAA.String()).Msg("added IPv6 to filter")
-				}
+				s.addIPToFilter(domain, a.AAAA, 128, a.Hdr.Ttl)
 			}
 		}
 	}
@@ -256,52 +292,39 @@ func (s *DNSServer) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 	}
 }
 
-func (s *DNSServer) isDomainAllowed(domain string) bool {
+type domainDecision uint8
+
+const (
+	domainDecisionNone domainDecision = iota
+	domainDecisionAllow
+	domainDecisionDeny
+)
+
+func (s *DNSServer) evaluateDomainLocked(domain string) domainDecision {
 	domain = normalizeDomain(domain)
-
-	// Check exact match
-	if _, ok := s.allowedDomains[domain]; ok {
-		return true
-	}
-
-	// Check if any parent domain allows subdomains
-	for d := domain; strings.Contains(d, "."); {
-		parts := strings.SplitN(d, ".", 2)
-		if len(parts) != 2 {
+	for candidate := domain; candidate != ""; {
+		exact := candidate == domain
+		allow := false
+		deny := false
+		if includeSubdomains, ok := s.allowedDomains[candidate]; ok && (exact || includeSubdomains) {
+			allow = true
+		}
+		if includeSubdomains, ok := s.deniedDomains[candidate]; ok && (exact || includeSubdomains) {
+			deny = true
+		}
+		if deny {
+			return domainDecisionDeny
+		}
+		if allow {
+			return domainDecisionAllow
+		}
+		dot := strings.IndexByte(candidate, '.')
+		if dot < 0 {
 			break
 		}
-		parent := parts[1]
-		if includesSubs, ok := s.allowedDomains[parent]; ok && includesSubs {
-			return true
-		}
-		d = parent
+		candidate = candidate[dot+1:]
 	}
-
-	return false
-}
-
-func (s *DNSServer) isDomainDenied(domain string) bool {
-	domain = normalizeDomain(domain)
-
-	// Check exact match
-	if _, ok := s.deniedDomains[domain]; ok {
-		return true
-	}
-
-	// Check if any parent domain denies subdomains
-	for d := domain; strings.Contains(d, "."); {
-		parts := strings.SplitN(d, ".", 2)
-		if len(parts) != 2 {
-			break
-		}
-		parent := parts[1]
-		if includesSubs, ok := s.deniedDomains[parent]; ok && includesSubs {
-			return true
-		}
-		d = parent
-	}
-
-	return false
+	return domainDecisionNone
 }
 
 func (s *DNSServer) sendRefused(w dns.ResponseWriter, req *dns.Msg) {
@@ -320,9 +343,16 @@ func (s *DNSServer) sendServFail(w dns.ResponseWriter, req *dns.Msg) {
 	}
 }
 
-func (s *DNSServer) sendProxyResponse(w dns.ResponseWriter, req *dns.Msg, domain string, ips []string, addToFilter bool) {
+func (s *DNSServer) sendProxyResponse(w dns.ResponseWriter, req *dns.Msg, domain string, ips []string, addToFilter bool, ttlSeconds uint32) {
 	resp := new(dns.Msg)
 	resp.SetReply(req)
+	if ttlSeconds == 0 {
+		ttlSeconds = defaultDNSTTLSeconds
+	}
+	qType := uint16(0)
+	if len(req.Question) > 0 {
+		qType = req.Question[0].Qtype
+	}
 
 	for _, ipStr := range ips {
 		ip := net.ParseIP(ipStr)
@@ -331,30 +361,30 @@ func (s *DNSServer) sendProxyResponse(w dns.ResponseWriter, req *dns.Msg, domain
 		}
 
 		if ip4 := ip.To4(); ip4 != nil {
+			if qType != dns.TypeA && qType != dns.TypeANY {
+				continue
+			}
 			rr := &dns.A{
-				Hdr: dns.RR_Header{Name: domain, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
+				Hdr: dns.RR_Header{Name: domain, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: ttlSeconds},
 				A:   ip4,
 			}
 			resp.Answer = append(resp.Answer, rr)
 
-			if addToFilter && s.filter != nil {
-				cidr := &net.IPNet{IP: ip4, Mask: net.CIDRMask(32, 32)}
-				if err := s.filter.AllowIP(cidr); err != nil {
-					s.logger.Warn().Err(err).Str("ip", ipStr).Msg("failed to add IPv4 to filter")
-				}
+			if addToFilter {
+				s.addIPToFilter(domain, ip4, 32, ttlSeconds)
 			}
 		} else {
+			if qType != dns.TypeAAAA && qType != dns.TypeANY {
+				continue
+			}
 			rr := &dns.AAAA{
-				Hdr:  dns.RR_Header{Name: domain, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 300},
+				Hdr:  dns.RR_Header{Name: domain, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: ttlSeconds},
 				AAAA: ip,
 			}
 			resp.Answer = append(resp.Answer, rr)
 
-			if addToFilter && s.filter != nil {
-				cidr := &net.IPNet{IP: ip, Mask: net.CIDRMask(128, 128)}
-				if err := s.filter.AllowIP(cidr); err != nil {
-					s.logger.Warn().Err(err).Str("ip", ipStr).Msg("failed to add IPv6 to filter")
-				}
+			if addToFilter {
+				s.addIPToFilter(domain, ip, 128, ttlSeconds)
 			}
 		}
 	}
@@ -364,8 +394,53 @@ func (s *DNSServer) sendProxyResponse(w dns.ResponseWriter, req *dns.Msg, domain
 	}
 }
 
+func (s *DNSServer) addIPToFilter(domain string, ip net.IP, bits int, ttlSeconds uint32) {
+	if s.filter == nil {
+		return
+	}
+	if ttlSeconds == 0 {
+		ttlSeconds = defaultDNSTTLSeconds
+	}
+	ip = normalizeIP(ip)
+	if ip == nil {
+		return
+	}
+	key := ip.String()
+	now := time.Now()
+
+	s.mu.RLock()
+	expiresAt, cached := s.ipCache[key]
+	s.mu.RUnlock()
+	if cached && now.Before(expiresAt) {
+		return
+	}
+
+	cidr := &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)}
+	if err := s.filter.AllowIP(cidr); err != nil {
+		s.logger.Warn().Err(err).Str("ip", key).Msg("failed to add IP to filter")
+		return
+	}
+
+	s.mu.Lock()
+	s.ipCache[key] = now.Add(time.Duration(ttlSeconds) * time.Second)
+	s.mu.Unlock()
+	s.logger.Debug().Str("domain", domain).Str("ip", key).Msg("added IP to filter")
+}
+
+func normalizeIP(ip net.IP) net.IP {
+	if ip == nil {
+		return nil
+	}
+	if ip4 := ip.To4(); ip4 != nil {
+		return ip4
+	}
+	return ip.To16()
+}
+
 func normalizeDomain(domain string) string {
 	domain = strings.ToLower(domain)
 	domain = strings.TrimSuffix(domain, ".")
 	return domain
 }
+
+var errDNSProxyUnavailable = errors.New("DNS proxy unavailable")

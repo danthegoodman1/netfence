@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"os"
 	"os/signal"
@@ -76,7 +77,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 		go cpClient.Run(ctx)
 	}
 
-	if err := os.RemoveAll(cfg.Socket); err != nil {
+	if err := removeStaleSocket(cfg.Socket); err != nil {
 		return err
 	}
 
@@ -104,6 +105,20 @@ func runStart(cmd *cobra.Command, args []string) error {
 
 	logger.Info().Str("socket", cfg.Socket).Msg("listening")
 	return grpcServer.Serve(listener)
+}
+
+func removeStaleSocket(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if info.Mode()&os.ModeSocket == 0 {
+		return fmt.Errorf("refusing to remove non-socket path %q", path)
+	}
+	return os.Remove(path)
 }
 
 func setupLogger(level string) zerolog.Logger {

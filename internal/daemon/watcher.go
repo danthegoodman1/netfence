@@ -79,6 +79,9 @@ func (w *TargetWatcher) WatchCgroup(path string) error {
 	if _, ok := w.cgroups[path]; ok {
 		return nil
 	}
+	if _, err := os.Stat(path); err != nil {
+		return err
+	}
 
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {

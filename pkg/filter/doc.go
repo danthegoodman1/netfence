@@ -54,6 +54,7 @@ type Filter interface {
 	DenyIP(cidr *net.IPNet) error
 	RemoveAllowedIP(cidr *net.IPNet) error
 	RemoveDeniedIP(cidr *net.IPNet) error
+	ClearRules() error
 	GetStats() (Stats, error)
 	Close() error
 }

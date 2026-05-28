@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"fmt"
+	"net"
 	"sync"
 	"time"
 
@@ -34,12 +35,18 @@ type ControlPlaneClient struct {
 	stream grpc.BidiStreamingClient[apiv1.DaemonEvent, apiv1.ControlCommand]
 	cancel context.CancelFunc
 
-	sendCh chan *apiv1.DaemonEvent
+	sendCh chan outboundEvent
 
 	// pendingAcks tracks subscriptions waiting for SubscribedAck responses.
 	// Key is attachment ID, value is the channel to send the result on.
 	pendingAcksMu sync.Mutex
 	pendingAcks   map[string]chan SubscribedAckResult
+}
+
+type outboundEvent struct {
+	event             *apiv1.DaemonEvent
+	subscribedID      string
+	requirePendingAck bool
 }
 
 func NewControlPlaneClient(url string, server *Server, logger zerolog.Logger, metadata map[string]string, subscribeAckTimeout time.Duration) *ControlPlaneClient {
@@ -50,7 +57,7 @@ func NewControlPlaneClient(url string, server *Server, logger zerolog.Logger, me
 		metadata:            metadata,
 		subscribeAckTimeout: subscribeAckTimeout,
 		state:               apiv1.ConnectionState_CONNECTION_STATE_DISCONNECTED,
-		sendCh:              make(chan *apiv1.DaemonEvent, 100),
+		sendCh:              make(chan outboundEvent, 100),
 		pendingAcks:         make(map[string]chan SubscribedAckResult),
 	}
 }
@@ -165,13 +172,24 @@ func (c *ControlPlaneClient) sendLoop(ctx context.Context, stream grpc.BidiStrea
 		select {
 		case <-ctx.Done():
 			return
-		case event := <-c.sendCh:
-			if err := stream.Send(event); err != nil {
+		case outbound := <-c.sendCh:
+			if outbound.requirePendingAck && !c.hasPendingAck(outbound.subscribedID) {
+				c.logger.Debug().Str("id", outbound.subscribedID).Msg("dropping stale subscribed event")
+				continue
+			}
+			if err := stream.Send(outbound.event); err != nil {
 				errCh <- err
 				return
 			}
 		}
 	}
+}
+
+func (c *ControlPlaneClient) hasPendingAck(id string) bool {
+	c.pendingAcksMu.Lock()
+	defer c.pendingAcksMu.Unlock()
+	_, ok := c.pendingAcks[id]
+	return ok
 }
 
 func (c *ControlPlaneClient) recvLoop(stream grpc.BidiStreamingClient[apiv1.DaemonEvent, apiv1.ControlCommand], errCh chan<- error) {
@@ -195,12 +213,21 @@ func (c *ControlPlaneClient) heartbeatLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			c.sendCh <- &apiv1.DaemonEvent{
-				Event: &apiv1.DaemonEvent_Heartbeat{
-					Heartbeat: &apiv1.Heartbeat{
-						Stats: c.server.GetAttachmentStats(),
+			event := outboundEvent{
+				event: &apiv1.DaemonEvent{
+					Event: &apiv1.DaemonEvent_Heartbeat{
+						Heartbeat: &apiv1.Heartbeat{
+							Stats: c.server.GetAttachmentStats(),
+						},
 					},
 				},
+			}
+			select {
+			case c.sendCh <- event:
+			case <-ctx.Done():
+				return
+			default:
+				c.logger.Warn().Msg("send channel full, dropping heartbeat")
 			}
 		}
 	}
@@ -307,9 +334,9 @@ func (c *ControlPlaneClient) handleCommand(cmd *apiv1.ControlCommand) {
 func (c *ControlPlaneClient) SubscribeAndWait(ctx context.Context, sub *apiv1.Subscribed) (*apiv1.SubscribedAck, error) {
 	if c.subscribeAckTimeout == 0 {
 		select {
-		case c.sendCh <- &apiv1.DaemonEvent{
+		case c.sendCh <- outboundEvent{event: &apiv1.DaemonEvent{
 			Event: &apiv1.DaemonEvent_Subscribed{Subscribed: sub},
-		}:
+		}}:
 			return nil, nil
 		default:
 			return nil, fmt.Errorf("send channel full")
@@ -323,8 +350,12 @@ func (c *ControlPlaneClient) SubscribeAndWait(ctx context.Context, sub *apiv1.Su
 	c.pendingAcksMu.Unlock()
 
 	select {
-	case c.sendCh <- &apiv1.DaemonEvent{
-		Event: &apiv1.DaemonEvent_Subscribed{Subscribed: sub},
+	case c.sendCh <- outboundEvent{
+		event: &apiv1.DaemonEvent{
+			Event: &apiv1.DaemonEvent_Subscribed{Subscribed: sub},
+		},
+		subscribedID:      sub.Id,
+		requirePendingAck: true,
 	}:
 	default:
 		c.pendingAcksMu.Lock()
@@ -349,22 +380,23 @@ func (c *ControlPlaneClient) SubscribeAndWait(ctx context.Context, sub *apiv1.Su
 
 func (c *ControlPlaneClient) SendUnsubscribed(unsub *apiv1.Unsubscribed) {
 	select {
-	case c.sendCh <- &apiv1.DaemonEvent{
+	case c.sendCh <- outboundEvent{event: &apiv1.DaemonEvent{
 		Event: &apiv1.DaemonEvent_Unsubscribed{Unsubscribed: unsub},
-	}:
+	}}:
 	default:
 		c.logger.Warn().Str("id", unsub.Id).Msg("send channel full, dropping unsubscribed event")
 	}
 }
 
 func (c *ControlPlaneClient) MakeProxyFunc(attachmentID string) DnsProxyFunc {
-	return func(domain, queryType string) (allow, addToFilter bool, ips []string, err error) {
+	return func(domain, queryType string) (DnsProxyDecision, error) {
 		c.mu.RLock()
 		client := c.client
+		state := c.state
 		c.mu.RUnlock()
 
-		if client == nil {
-			return true, false, nil, nil
+		if client == nil || state != apiv1.ConnectionState_CONNECTION_STATE_CONNECTED {
+			return DnsProxyDecision{}, errDNSProxyUnavailable
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -376,10 +408,15 @@ func (c *ControlPlaneClient) MakeProxyFunc(attachmentID string) DnsProxyFunc {
 			QueryType: queryType,
 		})
 		if err != nil {
-			return false, false, nil, err
+			return DnsProxyDecision{}, err
 		}
 
-		return resp.Allow, resp.AddToFilter, resp.Ips, nil
+		return DnsProxyDecision{
+			Allow:       resp.GetAllow(),
+			AddToFilter: resp.GetAddToFilter(),
+			IPs:         resp.GetIps(),
+			TTLSeconds:  resp.GetTtlSeconds(),
+		}, nil
 	}
 }
 
@@ -414,62 +451,70 @@ func (c *ControlPlaneClient) applySubscribedAck(id string, ack *apiv1.Subscribed
 	}
 
 	if ack.Dns != nil {
-		if err := c.server.SetDnsMode(id, ack.Dns.Mode); err != nil {
-			c.logger.Error().Err(err).Str("id", id).Msg("failed to set DNS mode in subscribed ack")
-		}
-		for _, entry := range ack.Dns.AllowDomains {
-			if err := c.server.AllowDomain(id, entry.Domain, entry.IncludeSubdomains); err != nil {
-				c.logger.Error().Err(err).Str("id", id).Str("domain", entry.Domain).Msg("failed to allow domain in subscribed ack")
-			}
-		}
-		for _, entry := range ack.Dns.DenyDomains {
-			if err := c.server.DenyDomain(id, entry.Domain, entry.IncludeSubdomains); err != nil {
-				c.logger.Error().Err(err).Str("id", id).Str("domain", entry.Domain).Msg("failed to deny domain in subscribed ack")
-			}
+		if err := c.server.ReplaceDNSRules(id, ack.Dns.Mode, ack.Dns.AllowDomains, ack.Dns.DenyDomains); err != nil {
+			c.logger.Error().Err(err).Str("id", id).Msg("failed to replace DNS rules in subscribed ack")
 		}
 	}
 }
 
 func (c *ControlPlaneClient) applyBulkUpdate(id string, update *apiv1.BulkUpdate) {
+	if update == nil {
+		return
+	}
+	allowCIDRs, denyCIDRs, ok := c.parseBulkCIDRs(id, update)
+	if !ok {
+		return
+	}
+	if err := c.server.ClearRules(id); err != nil {
+		c.logger.Error().Err(err).Str("id", id).Msg("failed to clear rules in bulk update")
+		return
+	}
 	if err := c.server.SetFilterMode(id, update.Mode); err != nil {
 		c.logger.Error().Err(err).Str("id", id).Msg("failed to set filter mode in bulk update")
+		return
 	}
 
+	for _, cidr := range allowCIDRs {
+		if err := c.server.AllowCIDR(id, cidr); err != nil {
+			c.logger.Error().Err(err).Str("id", id).Str("cidr", cidr.String()).Msg("failed to allow CIDR in bulk update")
+		}
+	}
+
+	for _, cidr := range denyCIDRs {
+		if err := c.server.DenyCIDR(id, cidr); err != nil {
+			c.logger.Error().Err(err).Str("id", id).Str("cidr", cidr.String()).Msg("failed to deny CIDR in bulk update")
+		}
+	}
+
+	if update.Dns == nil {
+		if err := c.server.ReplaceDNSRules(id, apiv1.DnsMode_DNS_MODE_DISABLED, nil, nil); err != nil {
+			c.logger.Error().Err(err).Str("id", id).Msg("failed to clear DNS rules in bulk update")
+		}
+		return
+	}
+	if err := c.server.ReplaceDNSRules(id, update.Dns.Mode, update.Dns.AllowDomains, update.Dns.DenyDomains); err != nil {
+		c.logger.Error().Err(err).Str("id", id).Msg("failed to replace DNS rules in bulk update")
+	}
+}
+
+func (c *ControlPlaneClient) parseBulkCIDRs(id string, update *apiv1.BulkUpdate) (allowCIDRs, denyCIDRs []*net.IPNet, ok bool) {
 	for _, entry := range update.AllowCidrs {
 		cidr, err := filter.ParseCIDR(entry.Cidr)
 		if err != nil {
 			c.logger.Error().Err(err).Str("id", id).Str("cidr", entry.Cidr).Msg("failed to parse allow CIDR in bulk update")
-			continue
+			return nil, nil, false
 		}
-		if err := c.server.AllowCIDR(id, cidr); err != nil {
-			c.logger.Error().Err(err).Str("id", id).Str("cidr", entry.Cidr).Msg("failed to allow CIDR in bulk update")
-		}
+		allowCIDRs = append(allowCIDRs, cidr)
 	}
 
 	for _, entry := range update.DenyCidrs {
 		cidr, err := filter.ParseCIDR(entry.Cidr)
 		if err != nil {
 			c.logger.Error().Err(err).Str("id", id).Str("cidr", entry.Cidr).Msg("failed to parse deny CIDR in bulk update")
-			continue
+			return nil, nil, false
 		}
-		if err := c.server.DenyCIDR(id, cidr); err != nil {
-			c.logger.Error().Err(err).Str("id", id).Str("cidr", entry.Cidr).Msg("failed to deny CIDR in bulk update")
-		}
+		denyCIDRs = append(denyCIDRs, cidr)
 	}
 
-	if update.Dns != nil {
-		if err := c.server.SetDnsMode(id, update.Dns.Mode); err != nil {
-			c.logger.Error().Err(err).Str("id", id).Msg("failed to set DNS mode in bulk update")
-		}
-		for _, entry := range update.Dns.AllowDomains {
-			if err := c.server.AllowDomain(id, entry.Domain, entry.IncludeSubdomains); err != nil {
-				c.logger.Error().Err(err).Str("id", id).Str("domain", entry.Domain).Msg("failed to allow domain in bulk update")
-			}
-		}
-		for _, entry := range update.Dns.DenyDomains {
-			if err := c.server.DenyDomain(id, entry.Domain, entry.IncludeSubdomains); err != nil {
-				c.logger.Error().Err(err).Str("id", id).Str("domain", entry.Domain).Msg("failed to deny domain in bulk update")
-			}
-		}
-	}
+	return allowCIDRs, denyCIDRs, true
 }

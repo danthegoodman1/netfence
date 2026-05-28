@@ -37,6 +37,10 @@ services:
     <<: *netfence-linux
     command: scripts/check-linux.sh
 
+  bench:
+    <<: *netfence-linux
+    command: scripts/bench-linux.sh
+
   test-cgroup:
     <<: *netfence-linux
     command:

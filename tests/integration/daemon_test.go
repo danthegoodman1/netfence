@@ -30,12 +30,16 @@ type testServer struct {
 
 func newTestServer(t *testing.T) *testServer {
 	t.Helper()
+	return newTestServerWithDNSPorts(t, 30000, 31000)
+}
 
+func newTestServerWithDNSPorts(t *testing.T, portMin, portMax int) *testServer {
+	t.Helper()
 	cfg := &config.Config{
 		DNS: config.DNSConfig{
 			ListenAddr: "127.0.0.1",
-			PortMin:    30000,
-			PortMax:    31000,
+			PortMin:    portMin,
+			PortMax:    portMax,
 			Upstream:   "8.8.8.8:53",
 		},
 	}
@@ -184,6 +188,40 @@ func TestDaemonManualDetachCgroup(t *testing.T) {
 		})
 		assert.True(t, stopped, "DNS server should stop after detach")
 	})
+}
+
+func TestDaemonOnePortDetachReattachCgroup(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("test requires root")
+	}
+
+	ts := newTestServerWithDNSPorts(t, 31500, 31500)
+	defer ts.cleanup()
+
+	cgroupPath, cgroupCleanup := setupTestCgroup(t, "netfence-daemon-one-port")
+	defer cgroupCleanup()
+
+	ctx := context.Background()
+	resp, err := ts.server.Attach(ctx, &apiv1.AttachRequest{
+		Target: &apiv1.AttachRequest_CgroupPath{CgroupPath: cgroupPath},
+	})
+	require.NoError(t, err)
+	require.Equal(t, "127.0.0.1:31500", resp.DnsAddress)
+
+	_, err = ts.server.Detach(ctx, &apiv1.DetachRequest{Id: resp.Id})
+	require.NoError(t, err)
+	require.True(t, waitForCondition(2*time.Second, func() bool {
+		return !isDNSServerRunning(resp.DnsAddress)
+	}), "DNS server should stop after detach")
+
+	reattach, err := ts.server.Attach(ctx, &apiv1.AttachRequest{
+		Target: &apiv1.AttachRequest_CgroupPath{CgroupPath: cgroupPath},
+	})
+	require.NoError(t, err)
+	require.Equal(t, resp.DnsAddress, reattach.DnsAddress)
+
+	_, err = ts.server.Detach(ctx, &apiv1.DetachRequest{Id: reattach.Id})
+	require.NoError(t, err)
 }
 
 func TestDaemonManualDetachInterface(t *testing.T) {

@@ -7,11 +7,14 @@ package filter
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/cilium/ebpf"
 )
 
 // IPv4LPMKey is the key structure for IPv4 LPM trie lookups
@@ -50,6 +53,37 @@ func ipv6CIDRToKey(cidr *net.IPNet) IPv6LPMKey {
 	key.Addr[2] = binary.LittleEndian.Uint32(ip[8:12])
 	key.Addr[3] = binary.LittleEndian.Uint32(ip[12:16])
 	return key
+}
+
+func clearMap[K any](m *ebpf.Map) error {
+	var keys []K
+	var value uint8
+	var key K
+	iter := m.Iterate()
+	for iter.Next(&key, &value) {
+		keys = append(keys, key)
+	}
+	if err := iter.Err(); err != nil {
+		return err
+	}
+	for _, key := range keys {
+		if err := m.Delete(key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+			return err
+		}
+	}
+	return nil
+}
+
+func sumPerCPUCounter(m *ebpf.Map, key uint32) (uint64, error) {
+	var values []uint64
+	if err := m.Lookup(key, &values); err != nil {
+		return 0, err
+	}
+	var total uint64
+	for _, value := range values {
+		total += value
+	}
+	return total, nil
 }
 
 // GetCgroupPath returns the container's cgroup path based on its ID
