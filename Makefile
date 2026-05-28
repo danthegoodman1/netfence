@@ -1,6 +1,6 @@
 # Makefile for netfence
 
-.PHONY: all generate build test test-docker clean help
+.PHONY: all generate build test test-docker test-docker-cgroup test-docker-tc check-docker dev-docker clean help
 
 # Default target
 all: generate build
@@ -23,17 +23,27 @@ test:
 # Run tests in Docker (works on Mac and Linux)
 test-docker:
 	@echo "Running tests in Docker..."
-	docker compose -f docker-compose.test.yml up --build --abort-on-container-exit
+	docker compose run --build --rm test
 
 # Run only cgroup filter tests in Docker
 test-docker-cgroup:
 	@echo "Running cgroup tests in Docker..."
-	docker compose -f docker-compose.test.yml --profile cgroup up --build --abort-on-container-exit test-cgroup
+	docker compose --profile cgroup run --build --rm test-cgroup
 
 # Run only TC filter tests in Docker
 test-docker-tc:
 	@echo "Running TC tests in Docker..."
-	docker compose -f docker-compose.test.yml --profile tc up --build --abort-on-container-exit test-tc
+	docker compose --profile tc run --build --rm test-tc
+
+# Run full Linux check suite in Docker
+check-docker:
+	@echo "Running checks in Docker..."
+	docker compose run --build --rm check
+
+# Start an interactive Linux development container
+dev-docker:
+	@echo "Starting Linux development container..."
+	docker compose run --build --rm dev bash
 
 # Clean generated files and build artifacts
 clean:
@@ -66,6 +76,8 @@ help:
 	@echo "  test-docker      - Run tests in Docker (Mac + Linux)"
 	@echo "  test-docker-cgroup - Run only cgroup filter tests in Docker"
 	@echo "  test-docker-tc   - Run only TC filter tests in Docker"
+	@echo "  check-docker     - Run fmt/vet/race tests in Docker"
+	@echo "  dev-docker       - Start an interactive Linux development container"
 	@echo "  clean            - Clean generated files and build artifacts"
 	@echo "  deps             - Update dependencies"
 	@echo "  lint             - Lint the code"

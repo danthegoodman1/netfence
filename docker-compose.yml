@@ -1,0 +1,62 @@
+x-netfence-linux: &netfence-linux
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: netfence-linux-dev
+  working_dir: /workspace
+  privileged: true
+  cgroup: host
+  cap_add:
+    - BPF
+    - NET_ADMIN
+    - SYS_ADMIN
+  security_opt:
+    - seccomp=unconfined
+    - apparmor=unconfined
+  environment:
+    CGO_ENABLED: "1"
+    CPATH: /usr/include
+    GOFLAGS: -buildvcs=false
+  volumes:
+    - .:/workspace
+    - go-mod-cache:/go/pkg/mod
+    - go-build-cache:/root/.cache/go-build
+
+services:
+  dev:
+    <<: *netfence-linux
+    command: sleep infinity
+    stdin_open: true
+    tty: true
+
+  test:
+    <<: *netfence-linux
+    command: scripts/test-linux.sh
+
+  check:
+    <<: *netfence-linux
+    command: scripts/check-linux.sh
+
+  test-cgroup:
+    <<: *netfence-linux
+    command:
+      - scripts/test-linux.sh
+      - ./tests/integration/...
+      - -run
+      - TestCgroup
+    profiles:
+      - cgroup
+
+  test-tc:
+    <<: *netfence-linux
+    command:
+      - scripts/test-linux.sh
+      - ./tests/integration/...
+      - -run
+      - TestTC
+    profiles:
+      - tc
+
+volumes:
+  go-mod-cache:
+  go-build-cache:
