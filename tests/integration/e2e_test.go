@@ -318,7 +318,10 @@ func newE2ETestEnvWithOptions(t *testing.T, portMin, portMax int, subscribeAckTi
 			Upstream:   "8.8.8.8:53",
 		},
 		ControlPlane: config.ControlPlaneConfig{
-			URL:                 grpcAddr,
+			URL: grpcAddr,
+			// Plaintext is now an explicit opt-in (4A fail-closed default);
+			// this exercises the insecure: true path end to end.
+			Insecure:            true,
 			SubscribeAckTimeout: subscribeAckTimeout,
 		},
 	}
@@ -328,7 +331,10 @@ func newE2ETestEnvWithOptions(t *testing.T, portMin, portMax int, subscribeAckTi
 	srv, err := daemon.NewServer(cfg, st, logger, "test")
 	require.NoError(t, err)
 
-	cpClient := daemon.NewControlPlaneClient(grpcAddr, srv, logger, nil, subscribeAckTimeout)
+	creds, err := daemon.BuildControlPlaneCreds(cfg.ControlPlane)
+	require.NoError(t, err)
+
+	cpClient := daemon.NewControlPlaneClient(grpcAddr, srv, logger, nil, subscribeAckTimeout, creds)
 	srv.SetControlPlaneClient(cpClient)
 
 	require.NoError(t, srv.Start())

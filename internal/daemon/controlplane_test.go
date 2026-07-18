@@ -31,7 +31,7 @@ func (f *fakeControlPlaneClient) QueryDns(context.Context, *apiv1.DnsQueryReques
 
 func TestApplyBulkUpdateReplacesExistingState(t *testing.T) {
 	server, _, id, ff, dnsServer := newTestServerWithAttachment(t)
-	c := NewControlPlaneClient("", server, zerolog.Nop(), nil, 0)
+	c := NewControlPlaneClient("", server, zerolog.Nop(), nil, 0, nil)
 
 	oldAllow, err := filter.ParseCIDR("10.0.0.0/8")
 	require.NoError(t, err)
@@ -88,7 +88,7 @@ func TestApplyBulkUpdateReplacesExistingState(t *testing.T) {
 
 func TestApplyBulkUpdateWithNilDNSClearsExistingDNSRules(t *testing.T) {
 	server, _, id, _, dnsServer := newTestServerWithAttachment(t)
-	c := NewControlPlaneClient("", server, zerolog.Nop(), nil, 0)
+	c := NewControlPlaneClient("", server, zerolog.Nop(), nil, 0, nil)
 
 	require.NoError(t, server.ReplaceDNSRules(
 		id,
@@ -108,7 +108,7 @@ func TestApplyBulkUpdateWithNilDNSClearsExistingDNSRules(t *testing.T) {
 
 func TestApplyBulkUpdateRejectsInvalidCIDRBeforeClearingExistingState(t *testing.T) {
 	server, _, id, ff, dnsServer := newTestServerWithAttachment(t)
-	c := NewControlPlaneClient("", server, zerolog.Nop(), nil, 0)
+	c := NewControlPlaneClient("", server, zerolog.Nop(), nil, 0, nil)
 
 	oldAllow, err := filter.ParseCIDR("10.0.0.0/8")
 	require.NoError(t, err)
@@ -137,7 +137,7 @@ func TestApplyBulkUpdateRejectsInvalidCIDRBeforeClearingExistingState(t *testing
 }
 
 func TestSubscribeAndWaitTimeoutCleansPendingAckAndMarksOutboundStale(t *testing.T) {
-	c := NewControlPlaneClient("", nil, zerolog.Nop(), nil, 10*time.Millisecond)
+	c := NewControlPlaneClient("", nil, zerolog.Nop(), nil, 10*time.Millisecond, nil)
 
 	_, err := c.SubscribeAndWait(context.Background(), &apiv1.Subscribed{Id: "att-timeout"})
 	require.Error(t, err)
@@ -158,7 +158,7 @@ func TestSubscribeAndWaitTimeoutCleansPendingAckAndMarksOutboundStale(t *testing
 }
 
 func TestMakeProxyFuncRequiresConnectedState(t *testing.T) {
-	c := NewControlPlaneClient("", nil, zerolog.Nop(), nil, 0)
+	c := NewControlPlaneClient("", nil, zerolog.Nop(), nil, 0, nil)
 	fakeClient := &fakeControlPlaneClient{}
 
 	c.mu.Lock()
@@ -203,7 +203,7 @@ func drainCommandResults(t *testing.T, c *ControlPlaneClient) []*apiv1.CommandRe
 // fully applied); commands without one produce no result at all.
 func TestHandleCommandEmitsCommandResults(t *testing.T) {
 	server, _, id, ff, _ := newTestServerWithAttachment(t)
-	c := NewControlPlaneClient("", server, zerolog.Nop(), nil, 0)
+	c := NewControlPlaneClient("", server, zerolog.Nop(), nil, 0, nil)
 
 	t.Run("valid_command_reports_success", func(t *testing.T) {
 		c.handleCommand(&apiv1.ControlCommand{

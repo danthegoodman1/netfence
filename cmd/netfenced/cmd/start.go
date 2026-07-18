@@ -72,7 +72,19 @@ func runStart(cmd *cobra.Command, args []string) error {
 	defer cancel()
 
 	if cfg.ControlPlane.URL != "" {
-		cpClient := daemon.NewControlPlaneClient(cfg.ControlPlane.URL, server, logger, cfg.Metadata, cfg.ControlPlane.SubscribeAckTimeout)
+		// Resolve TLS/mTLS/token credentials once at startup so cert/key/CA
+		// problems fail the start with a clear error instead of surfacing on
+		// every reconnect. There is no plaintext fallback: config.Validate
+		// already required either control_plane.tls or an explicit
+		// control_plane.insecure: true.
+		creds, err := daemon.BuildControlPlaneCreds(cfg.ControlPlane)
+		if err != nil {
+			return fmt.Errorf("building control plane credentials: %w", err)
+		}
+		if cfg.ControlPlane.Insecure && cfg.ControlPlane.AuthToken != "" {
+			logger.Warn().Msg("control_plane.auth_token is set with control_plane.insecure: true — the bearer token will be sent over an unencrypted connection")
+		}
+		cpClient := daemon.NewControlPlaneClient(cfg.ControlPlane.URL, server, logger, cfg.Metadata, cfg.ControlPlane.SubscribeAckTimeout, creds)
 		server.SetControlPlaneClient(cpClient)
 		go cpClient.Run(ctx)
 	}

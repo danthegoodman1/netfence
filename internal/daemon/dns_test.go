@@ -179,7 +179,7 @@ func TestDNSServerProxyFailsClosed(t *testing.T) {
 		{name: "proxy error", proxyFunc: func(string, string) (DnsProxyDecision, error) {
 			return DnsProxyDecision{}, errors.New("control plane down")
 		}},
-		{name: "disconnected control plane proxy", proxyFunc: NewControlPlaneClient("", nil, zerolog.Nop(), nil, 0).MakeProxyFunc("att-1")},
+		{name: "disconnected control plane proxy", proxyFunc: NewControlPlaneClient("", nil, zerolog.Nop(), nil, 0, nil).MakeProxyFunc("att-1")},
 	}
 
 	for _, tt := range tests {

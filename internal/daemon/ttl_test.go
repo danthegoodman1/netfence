@@ -80,7 +80,7 @@ func TestTTLCIDRExpiresAfterSweep(t *testing.T) {
 	server, _, id, ff, _ := newTestServerWithAttachment(t)
 	clk := newFakeClock()
 	server.now = clk.Now
-	c := NewControlPlaneClient("", server, zerolog.Nop(), nil, 0)
+	c := NewControlPlaneClient("", server, zerolog.Nop(), nil, 0, nil)
 
 	c.handleCommand(allowCidrCmd(id, "10.0.0.0/8", 5*time.Second))
 	c.handleCommand(denyCidrCmd(id, "192.0.2.0/24", 10*time.Second))
@@ -120,7 +120,7 @@ func TestPermanentCIDRNeverExpires(t *testing.T) {
 	server, _, id, ff, _ := newTestServerWithAttachment(t)
 	clk := newFakeClock()
 	server.now = clk.Now
-	c := NewControlPlaneClient("", server, zerolog.Nop(), nil, 0)
+	c := NewControlPlaneClient("", server, zerolog.Nop(), nil, 0, nil)
 
 	c.handleCommand(allowCidrCmd(id, "10.0.0.0/8", 0))
 	c.handleCommand(denyCidrCmd(id, "192.0.2.0/24", 0))
@@ -140,7 +140,7 @@ func TestReAddRefreshesTTL(t *testing.T) {
 	server, _, id, ff, _ := newTestServerWithAttachment(t)
 	clk := newFakeClock()
 	server.now = clk.Now
-	c := NewControlPlaneClient("", server, zerolog.Nop(), nil, 0)
+	c := NewControlPlaneClient("", server, zerolog.Nop(), nil, 0, nil)
 
 	c.handleCommand(allowCidrCmd(id, "10.0.0.0/8", 5*time.Second))
 	clk.Advance(3 * time.Second)
@@ -164,7 +164,7 @@ func TestReAddWithoutTTLMakesPermanent(t *testing.T) {
 	server, _, id, ff, _ := newTestServerWithAttachment(t)
 	clk := newFakeClock()
 	server.now = clk.Now
-	c := NewControlPlaneClient("", server, zerolog.Nop(), nil, 0)
+	c := NewControlPlaneClient("", server, zerolog.Nop(), nil, 0, nil)
 
 	c.handleCommand(allowCidrCmd(id, "10.0.0.0/8", 5*time.Second))
 	c.handleCommand(allowCidrCmd(id, "10.0.0.0/8", 0))
@@ -182,7 +182,7 @@ func TestRemoveCidrPurgesRegistry(t *testing.T) {
 	server, _, id, ff, _ := newTestServerWithAttachment(t)
 	clk := newFakeClock()
 	server.now = clk.Now
-	c := NewControlPlaneClient("", server, zerolog.Nop(), nil, 0)
+	c := NewControlPlaneClient("", server, zerolog.Nop(), nil, 0, nil)
 
 	c.handleCommand(allowCidrCmd(id, "10.0.0.0/8", 5*time.Second))
 	c.handleCommand(denyCidrCmd(id, "10.0.0.0/8", 5*time.Second))
@@ -208,7 +208,7 @@ func TestBulkUpdatePurgesAndTracksTTLs(t *testing.T) {
 	server, _, id, ff, _ := newTestServerWithAttachment(t)
 	clk := newFakeClock()
 	server.now = clk.Now
-	c := NewControlPlaneClient("", server, zerolog.Nop(), nil, 0)
+	c := NewControlPlaneClient("", server, zerolog.Nop(), nil, 0, nil)
 
 	c.handleCommand(allowCidrCmd(id, "10.0.0.0/8", 5*time.Second))
 	assert.Equal(t, 1, registryLen(t, server, id))
@@ -236,7 +236,7 @@ func TestSubscribedAckTracksTTLs(t *testing.T) {
 	server, _, id, ff, _ := newTestServerWithAttachment(t)
 	clk := newFakeClock()
 	server.now = clk.Now
-	c := NewControlPlaneClient("", server, zerolog.Nop(), nil, 0)
+	c := NewControlPlaneClient("", server, zerolog.Nop(), nil, 0, nil)
 
 	c.applySubscribedAck(id, &apiv1.SubscribedAck{
 		Mode: apiv1.PolicyMode_POLICY_MODE_ALLOWLIST,
@@ -266,7 +266,7 @@ func TestSweepToleratesDetachedAttachment(t *testing.T) {
 	server, _, id, _, _ := newTestServerWithAttachment(t)
 	clk := newFakeClock()
 	server.now = clk.Now
-	c := NewControlPlaneClient("", server, zerolog.Nop(), nil, 0)
+	c := NewControlPlaneClient("", server, zerolog.Nop(), nil, 0, nil)
 
 	c.handleCommand(allowCidrCmd(id, "10.0.0.0/8", 1*time.Second))
 
@@ -289,7 +289,7 @@ func TestSweepToleratesDetachedAttachment(t *testing.T) {
 func TestTTLJanitorGoroutineRemovesExpiredEntry(t *testing.T) {
 	server, _, id, ff, _ := newTestServerWithAttachment(t)
 	server.ttlJanitorInterval = 5 * time.Millisecond
-	c := NewControlPlaneClient("", server, zerolog.Nop(), nil, 0)
+	c := NewControlPlaneClient("", server, zerolog.Nop(), nil, 0, nil)
 
 	c.handleCommand(allowCidrCmd(id, "10.0.0.0/8", time.Millisecond))
 	c.handleCommand(allowCidrCmd(id, "198.51.100.0/24", 0)) // permanent
@@ -313,7 +313,7 @@ func TestTTLConcurrentAddAndSweep(t *testing.T) {
 	server, _, id, ff, _ := newTestServerWithAttachment(t)
 	clk := newFakeClock()
 	server.now = clk.Now
-	c := NewControlPlaneClient("", server, zerolog.Nop(), nil, 0)
+	c := NewControlPlaneClient("", server, zerolog.Nop(), nil, 0, nil)
 
 	done := make(chan struct{})
 	go func() {
@@ -440,7 +440,7 @@ func TestPermanentCPAllowPinsAliasedDNSIP(t *testing.T) {
 	server, _, id, ff, dnsServer := newTestServerWithAttachment(t)
 	clk := newFakeClock()
 	server.now = clk.Now
-	c := NewControlPlaneClient("", server, zerolog.Nop(), nil, 0)
+	c := NewControlPlaneClient("", server, zerolog.Nop(), nil, 0, nil)
 
 	// Order 1: CP permanent first, DNS resolution second.
 	c.handleCommand(allowCidrCmd(id, "203.0.113.10/32", 0))
@@ -467,7 +467,7 @@ func TestAliasedDeadlineIsMaxOfSources(t *testing.T) {
 	server, _, id, ff, dnsServer := newTestServerWithAttachment(t)
 	clk := newFakeClock()
 	server.now = clk.Now
-	c := NewControlPlaneClient("", server, zerolog.Nop(), nil, 0)
+	c := NewControlPlaneClient("", server, zerolog.Nop(), nil, 0, nil)
 
 	// CP rule with 10min TTL, then a DNS resolution floored to 60s: the CP
 	// deadline is later and must win.
@@ -577,7 +577,7 @@ func TestMapFullCountedSurfacedAndRecovers(t *testing.T) {
 // with zero ClearRules calls.
 func TestBulkUpdateNoWindowForSurvivingRules(t *testing.T) {
 	server, _, id, ff, _ := newTestServerWithAttachment(t)
-	c := NewControlPlaneClient("", server, zerolog.Nop(), nil, 0)
+	c := NewControlPlaneClient("", server, zerolog.Nop(), nil, 0, nil)
 
 	// Initial state via individual commands.
 	c.handleCommand(allowCidrCmd(id, "10.0.0.0/8", 0))
@@ -633,7 +633,7 @@ func TestBulkUpdatePreservesDNSPopulatedIPs(t *testing.T) {
 	server, _, id, ff, dnsServer := newTestServerWithAttachment(t)
 	clk := newFakeClock()
 	server.now = clk.Now
-	c := NewControlPlaneClient("", server, zerolog.Nop(), nil, 0)
+	c := NewControlPlaneClient("", server, zerolog.Nop(), nil, 0, nil)
 
 	dnsServer.addIPToFilter("cached.example.com", net.ParseIP("203.0.113.5"), 32, 30) // floored to 60s
 
@@ -664,7 +664,7 @@ func TestBulkUpdateClearsCPSourceButDNSKeepsEntry(t *testing.T) {
 	server, _, id, ff, dnsServer := newTestServerWithAttachment(t)
 	clk := newFakeClock()
 	server.now = clk.Now
-	c := NewControlPlaneClient("", server, zerolog.Nop(), nil, 0)
+	c := NewControlPlaneClient("", server, zerolog.Nop(), nil, 0, nil)
 
 	c.handleCommand(allowCidrCmd(id, "203.0.113.6/32", 10*time.Minute))
 	dnsServer.addIPToFilter("both.example.com", net.ParseIP("203.0.113.6"), 32, 30) // DNS deadline: 60s floor
@@ -700,7 +700,7 @@ func TestBulkUpdateConcurrentWithDNSAdds(t *testing.T) {
 	server, _, id, ff, dnsServer := newTestServerWithAttachment(t)
 	clk := newFakeClock()
 	server.now = clk.Now
-	c := NewControlPlaneClient("", server, zerolog.Nop(), nil, 0)
+	c := NewControlPlaneClient("", server, zerolog.Nop(), nil, 0, nil)
 
 	done := make(chan struct{})
 	go func() {
@@ -752,7 +752,7 @@ func indexOfEvent(t *testing.T, events []string, event string) int {
 // land (and denylist->allowlist fails open via stale inert allow entries).
 func TestBulkUpdateModeFlipOrdering(t *testing.T) {
 	server, _, id, ff, _ := newTestServerWithAttachment(t)
-	c := NewControlPlaneClient("", server, zerolog.Nop(), nil, 0)
+	c := NewControlPlaneClient("", server, zerolog.Nop(), nil, 0, nil)
 
 	// Establish allowlist state; the deny rule is inert under allowlist.
 	c.applyBulkUpdate(id, &apiv1.BulkUpdate{

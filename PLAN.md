@@ -150,7 +150,8 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 4A: TLS/mTLS/token config + wiring | Missing: config, creds plumbing, mTLS test. |
+| Complete | Work | 4A: TLS/mTLS/token config + wiring | `control_plane.tls` (ca/cert/key/server_name, path or inline PEM), `insecure`, `auth_token`. `BuildControlPlaneCreds` (built once at startup) → TLS (MinVersion 1.2, CA pool or system roots, mTLS client cert when cert+key present) / explicit insecure / fail-closed default; bearer token via PerRPCCredentials with `RequireTransportSecurity()==!insecure`. `config.Validate` fails closed: URL without tls/insecure → error. `connect()` refuses to dial without transport creds (no plaintext fallback). 5 integration tests (mTLS + token, untrusted-CA/wrong-SNI/plaintext-CP rejection, insecure opt-in) + creds/config unit tests; negative-verified (plaintext-CP discriminator + validation fail against pre-4A). Hardening: key material never echoed in cert-read errors; warn on insecure+token. Docker gate green. |
+| Incomplete | Risk | Local daemon API (unix socket) still uses insecure creds | Reviewer 4A MINOR-4: `cmd/netfenced/cmd/attach.go` dials the local `unix://` admin socket with `insecure.NewCredentials()`. Filesystem perms are the boundary for a local socket, so likely fine — but decide explicitly under Phase 6 (local API/CLI). |
 | Incomplete | Work | 4B: gRPC keepalive + jittered exponential backoff | Missing: implementation + dead-peer test. |
 | Incomplete | Work | 4C: reconnect queue semantics + documented CP idempotency contract | Missing: implementation + proto/README doc. |
 | Incomplete | Work | 4D: re-sync (re-drive Subscribed→SubscribedAck) on restore for restart convergence | Decided (user, 2026-07-18) as the fix for the 3A reseed-permanent over-allow. Missing: implementation + test that a post-restart re-sync removes stale adopted rules without transiently blocking permanent ones. |

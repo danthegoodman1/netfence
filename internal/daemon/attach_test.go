@@ -146,7 +146,7 @@ func assertUDPPortFree(t *testing.T, port int) {
 // down a second time — the Detach already owned the full teardown.
 func TestAttachDetachRaceDuringSubscribeAck(t *testing.T) {
 	env := newAttachTestEnv(t, 12100)
-	cp := NewControlPlaneClient("", env.server, zerolog.Nop(), nil, 30*time.Second)
+	cp := NewControlPlaneClient("", env.server, zerolog.Nop(), nil, 30*time.Second, nil)
 	env.server.SetControlPlaneClient(cp)
 
 	type attachResult struct {
@@ -254,7 +254,7 @@ func TestAttachHappyPathNoControlPlane(t *testing.T) {
 // commit check: an acked subscribe still returns success.
 func TestAttachHappyPathWithControlPlaneAck(t *testing.T) {
 	env := newAttachTestEnv(t, 12120)
-	cp := NewControlPlaneClient("", env.server, zerolog.Nop(), nil, 30*time.Second)
+	cp := NewControlPlaneClient("", env.server, zerolog.Nop(), nil, 30*time.Second, nil)
 	env.server.SetControlPlaneClient(cp)
 
 	done := make(chan struct{})
@@ -376,7 +376,7 @@ func TestAttachRollbackOnStoreSaveError(t *testing.T) {
 // ERROR-reason Unsubscribed.
 func TestAttachRollbackOnSubscribeFailure(t *testing.T) {
 	env := newAttachTestEnv(t, 12170)
-	cp := NewControlPlaneClient("", env.server, zerolog.Nop(), nil, 50*time.Millisecond)
+	cp := NewControlPlaneClient("", env.server, zerolog.Nop(), nil, 50*time.Millisecond, nil)
 	env.server.SetControlPlaneClient(cp)
 
 	_, err := env.server.Attach(context.Background(), attachInterfaceReq("subfail-if0"))

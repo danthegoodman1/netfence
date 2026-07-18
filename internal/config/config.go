@@ -62,10 +62,41 @@ type FilterConfig struct {
 
 type ControlPlaneConfig struct {
 	URL string `mapstructure:"url"`
+	// TLS configures transport security for the control-plane connection.
+	// The presence of the block (even empty: `tls: {}`) enables TLS; an
+	// empty/absent `ca` verifies the server against the system root pool.
+	// When a URL is set, either this block or `insecure: true` MUST be
+	// configured — there is no implicit-plaintext default (fail closed).
+	TLS *ControlPlaneTLSConfig `mapstructure:"tls"`
+	// Insecure explicitly opts into a plaintext (unencrypted,
+	// unauthenticated) control-plane connection, e.g. for local
+	// development. Mutually exclusive with the tls block.
+	Insecure bool `mapstructure:"insecure"`
+	// AuthToken, if set, is sent as `authorization: Bearer <token>`
+	// metadata on every control-plane RPC. It is refused on a plaintext
+	// channel unless `insecure: true` was explicitly set.
+	AuthToken string `mapstructure:"auth_token"`
 	// SubscribeAckTimeout is how long to wait for the control plane to acknowledge
 	// a new subscription with initial config. If the timeout is reached, the
 	// attachment is detached. Set to 0 to disable (attach proceeds without waiting).
 	SubscribeAckTimeout time.Duration `mapstructure:"subscribe_ack_timeout"`
+}
+
+// ControlPlaneTLSConfig configures TLS for the control-plane channel. Each
+// certificate/key field accepts either a filesystem path or inline PEM
+// (detected by a "-----BEGIN" marker).
+type ControlPlaneTLSConfig struct {
+	// CA is the certificate authority bundle used to verify the
+	// control-plane server certificate. Empty uses the system root pool.
+	CA string `mapstructure:"ca"`
+	// Cert and Key are the daemon's client certificate and private key.
+	// Setting both enables mTLS (the daemon presents the cert to the
+	// server); setting only one is a config error.
+	Cert string `mapstructure:"cert"`
+	Key  string `mapstructure:"key"`
+	// ServerName overrides the hostname used to verify the server
+	// certificate (SNI), e.g. when dialing an IP address.
+	ServerName string `mapstructure:"server_name"`
 }
 
 func Load(configPath string) (*Config, error) {
@@ -124,6 +155,25 @@ func (c *Config) Validate() error {
 	// the kernel's u32 max_entries without truncation.
 	if c.Filter.MaxRuleEntries < 0 || int64(c.Filter.MaxRuleEntries) > math.MaxUint32 {
 		return fmt.Errorf("filter.max_rule_entries must be between 0 (default) and %d", uint32(math.MaxUint32))
+	}
+	return c.ControlPlane.validate()
+}
+
+// validate enforces the control-plane transport-security invariants. The
+// key one is fail-closed: a configured URL with neither `tls` nor
+// `insecure: true` is rejected instead of silently dialing plaintext (the
+// pre-4A behavior). An empty URL (no control plane) is always valid.
+func (c *ControlPlaneConfig) validate() error {
+	if c.URL != "" {
+		if c.TLS == nil && !c.Insecure {
+			return fmt.Errorf("control_plane.url is set but transport security is not configured: set control_plane.tls (ca/cert/key/server_name; an empty block uses system roots) or explicitly opt into plaintext with control_plane.insecure: true")
+		}
+		if c.TLS != nil && c.Insecure {
+			return fmt.Errorf("control_plane.tls and control_plane.insecure are mutually exclusive")
+		}
+	}
+	if c.TLS != nil && (c.TLS.Cert == "") != (c.TLS.Key == "") {
+		return fmt.Errorf("control_plane.tls.cert and control_plane.tls.key must be set together (both present enables mTLS)")
 	}
 	return nil
 }

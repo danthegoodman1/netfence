@@ -109,6 +109,9 @@ dns:
   upstream: 8.8.8.8:53
 control_plane:
   url: %s
+  # The test control plane is a plaintext local listener; plaintext is an
+  # explicit opt-in since 4A (fail-closed default).
+  insecure: true
   subscribe_ack_timeout: 10s
 filter:
   bpf_pin_dir: %q

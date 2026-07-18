@@ -134,6 +134,58 @@ netfenced start --config /etc/netfence/config.yaml
 netfenced status
 ```
 
+### Control-plane transport security (TLS / mTLS / bearer token)
+
+The control-plane channel is the highest-value attack surface in the system
+(whoever controls it can push `ALLOW` rules to every workload), so the daemon
+**fails closed**: if `control_plane.url` is set, the config must explicitly
+choose a transport — either a `control_plane.tls` block or
+`control_plane.insecure: true`. A URL with neither is rejected at startup;
+there is no implicit-plaintext default. (This is a deliberate behavior change:
+older versions silently dialed the control plane unencrypted.)
+
+```yaml
+control_plane:
+  url: cp.internal:443
+  tls:
+    # CA bundle used to verify the control-plane server certificate.
+    # Path to a PEM file or inline PEM; omit to use the system root pool.
+    ca: /etc/netfence/cp-ca.pem
+    # Client certificate + key (path or inline PEM). Setting BOTH enables
+    # mTLS: the daemon presents this cert to the control plane. Setting only
+    # one is a config error.
+    cert: /etc/netfence/daemon.pem
+    key: /etc/netfence/daemon.key
+    # Optional hostname override for server certificate verification (SNI),
+    # e.g. when dialing by IP.
+    server_name: cp.internal
+  # Optional bearer token, sent as `authorization: Bearer <token>` metadata
+  # on every control-plane RPC. Refused on a plaintext channel unless
+  # `insecure: true` was explicitly set (so a misconfiguration can't leak it).
+  auth_token: "..."
+```
+
+TLS with system roots only (public CA-issued server cert, no mTLS) is just an
+empty block:
+
+```yaml
+control_plane:
+  url: cp.example.com:443
+  tls: {}
+```
+
+Plaintext for local development is an explicit opt-in (mutually exclusive
+with `tls`):
+
+```yaml
+control_plane:
+  url: localhost:9000
+  insecure: true
+```
+
+Certificates and keys are loaded once at startup, so a bad path/PEM fails the
+start with a clear error instead of surfacing on every reconnect.
+
 ### Daemon restarts, crashes, and upgrades (pinned BPF state)
 
 The daemon pins every attachment's BPF links and rule maps to bpffs

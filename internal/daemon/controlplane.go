@@ -10,7 +10,6 @@ import (
 
 	"github.com/rs/zerolog"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/danthegoodman1/netfence/pkg/filter"
 	apiv1 "github.com/danthegoodman1/netfence/v1"
@@ -28,6 +27,11 @@ type ControlPlaneClient struct {
 	logger              zerolog.Logger
 	metadata            map[string]string
 	subscribeAckTimeout time.Duration
+	// creds holds the transport (and optional per-RPC) credentials used to
+	// dial the control plane, resolved once at startup. May be nil for
+	// clients that never dial (unit tests); connect() refuses to dial
+	// without a transport credential — there is no insecure fallback.
+	creds *ControlPlaneCreds
 
 	mu     sync.RWMutex
 	state  apiv1.ConnectionState
@@ -50,13 +54,14 @@ type outboundEvent struct {
 	requirePendingAck bool
 }
 
-func NewControlPlaneClient(url string, server *Server, logger zerolog.Logger, metadata map[string]string, subscribeAckTimeout time.Duration) *ControlPlaneClient {
+func NewControlPlaneClient(url string, server *Server, logger zerolog.Logger, metadata map[string]string, subscribeAckTimeout time.Duration, creds *ControlPlaneCreds) *ControlPlaneClient {
 	return &ControlPlaneClient{
 		url:                 url,
 		server:              server,
 		logger:              logger.With().Str("component", "controlplane").Logger(),
 		metadata:            metadata,
 		subscribeAckTimeout: subscribeAckTimeout,
+		creds:               creds,
 		state:               apiv1.ConnectionState_CONNECTION_STATE_DISCONNECTED,
 		sendCh:              make(chan outboundEvent, 100),
 		pendingAcks:         make(map[string]chan SubscribedAckResult),
@@ -96,7 +101,21 @@ func (c *ControlPlaneClient) connect(ctx context.Context) {
 	c.setState(apiv1.ConnectionState_CONNECTION_STATE_CONNECTING)
 	c.logger.Info().Str("url", c.url).Msg("connecting to control plane")
 
-	conn, err := grpc.NewClient(c.url, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	// Fail closed: never fall back to plaintext when credentials are
+	// missing. Production wiring always resolves them via
+	// BuildControlPlaneCreds before constructing the client.
+	if c.creds == nil || c.creds.Transport == nil {
+		c.logger.Error().Msg("no transport credentials configured for control plane; refusing to dial")
+		c.setState(apiv1.ConnectionState_CONNECTION_STATE_DISCONNECTED)
+		return
+	}
+
+	opts := []grpc.DialOption{grpc.WithTransportCredentials(c.creds.Transport)}
+	if c.creds.PerRPC != nil {
+		opts = append(opts, grpc.WithPerRPCCredentials(c.creds.PerRPC))
+	}
+
+	conn, err := grpc.NewClient(c.url, opts...)
 	if err != nil {
 		c.logger.Error().Err(err).Msg("failed to create grpc client")
 		c.setState(apiv1.ConnectionState_CONNECTION_STATE_DISCONNECTED)
