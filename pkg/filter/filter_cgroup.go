@@ -16,11 +16,13 @@ import (
 
 // CgroupFilter manages the cgroup-based BPF filter
 type CgroupFilter struct {
-	mu          sync.Mutex
-	objs        *cgroupObjects
-	cgroupPath  string
-	cgroupLink4 link.Link
-	cgroupLink6 link.Link
+	mu           sync.Mutex
+	objs         *cgroupObjects
+	cgroupPath   string
+	cgroupLink4  link.Link
+	cgroupLink6  link.Link
+	sendmsgLink4 link.Link
+	sendmsgLink6 link.Link
 }
 
 // NewCgroupFilter creates a new cgroup-based filter attached to the specified cgroup path
@@ -65,11 +67,42 @@ func NewCgroupFilter(cgroupPath string, mode PolicyMode) (*CgroupFilter, error) 
 		return nil, fmt.Errorf("attaching IPv6 filter to cgroup: %w", err)
 	}
 
+	// Attach IPv4 unconnected-UDP sendmsg filter to the cgroup. Unconnected
+	// sendto/sendmsg with a destination address bypasses the connect hooks,
+	// so it must be filtered separately with the same policy.
+	sendmsg4, err := link.AttachCgroup(link.CgroupOptions{
+		Path:    cgroupPath,
+		Program: objs.RestrictSendmsg4,
+		Attach:  ebpf.AttachCGroupUDP4Sendmsg,
+	})
+	if err != nil {
+		link6.Close()
+		link4.Close()
+		objs.Close()
+		return nil, fmt.Errorf("attaching IPv4 sendmsg filter to cgroup: %w", err)
+	}
+
+	// Attach IPv6 unconnected-UDP sendmsg filter to the cgroup
+	sendmsg6, err := link.AttachCgroup(link.CgroupOptions{
+		Path:    cgroupPath,
+		Program: objs.RestrictSendmsg6,
+		Attach:  ebpf.AttachCGroupUDP6Sendmsg,
+	})
+	if err != nil {
+		sendmsg4.Close()
+		link6.Close()
+		link4.Close()
+		objs.Close()
+		return nil, fmt.Errorf("attaching IPv6 sendmsg filter to cgroup: %w", err)
+	}
+
 	return &CgroupFilter{
-		objs:        objs,
-		cgroupPath:  cgroupPath,
-		cgroupLink4: link4,
-		cgroupLink6: link6,
+		objs:         objs,
+		cgroupPath:   cgroupPath,
+		cgroupLink4:  link4,
+		cgroupLink6:  link6,
+		sendmsgLink4: sendmsg4,
+		sendmsgLink6: sendmsg6,
 	}, nil
 }
 
@@ -89,6 +122,18 @@ func (f *CgroupFilter) Close() error {
 	if f.cgroupLink6 != nil {
 		if err := f.cgroupLink6.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("closing IPv6 cgroup link: %w", err))
+		}
+	}
+
+	if f.sendmsgLink4 != nil {
+		if err := f.sendmsgLink4.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("closing IPv4 sendmsg cgroup link: %w", err))
+		}
+	}
+
+	if f.sendmsgLink6 != nil {
+		if err := f.sendmsgLink6.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("closing IPv6 sendmsg cgroup link: %w", err))
 		}
 	}
 

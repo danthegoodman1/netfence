@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"syscall"
 	"testing"
 	"time"
 
@@ -401,6 +402,218 @@ func TestCgroupModeSwitch(t *testing.T) {
 		assert.True(t, runInCgroup(cgroupPath, testServerNcV4), "IPv4 should succeed")
 		assert.True(t, runInCgroup(cgroupPath, testServerNcV6), "IPv6 should succeed")
 	})
+}
+
+// moveSelfToCgroup moves the current (test) process into the given cgroup and
+// returns a restore function. Any syscall made while inside is subject to the
+// cgroup filter, which lets us exercise unconnected sendto/sendmsg directly
+// (nc connects its UDP sockets, so it never hits the sendmsg hooks).
+func moveSelfToCgroup(t *testing.T, cgroupPath string) (restore func()) {
+	t.Helper()
+	original, err := currentCgroupPath()
+	require.NoError(t, err)
+	pid := os.Getpid()
+	require.NoError(t, writeCgroupProcs(cgroupPath, pid))
+	return func() {
+		if err := writeCgroupProcs(original, pid); err != nil {
+			t.Errorf("failed to restore test process to original cgroup: %v", err)
+		}
+	}
+}
+
+// nonLoopbackIPv4 returns a local non-loopback, non-link-local IPv4 address.
+// Sending to it exercises the allowlist/denylist map path (localhost and
+// link-local are carved out) while still being deliverable locally.
+func nonLoopbackIPv4(t *testing.T) net.IP {
+	t.Helper()
+	addrs, err := net.InterfaceAddrs()
+	require.NoError(t, err)
+	for _, addr := range addrs {
+		ipNet, ok := addr.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		ip := ipNet.IP.To4()
+		if ip == nil || ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+			continue
+		}
+		return ip
+	}
+	t.Skip("no non-loopback IPv4 address available")
+	return nil
+}
+
+// startUDPReceiver listens on addr and forwards each received payload to the
+// returned channel.
+func startUDPReceiver(t *testing.T, network, addr string) (dest string, received chan string, cleanup func()) {
+	t.Helper()
+	pc, err := net.ListenPacket(network, addr)
+	require.NoError(t, err)
+	received = make(chan string, 16)
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			n, _, err := pc.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			received <- string(buf[:n])
+		}
+	}()
+	return pc.LocalAddr().String(), received, func() { pc.Close() }
+}
+
+// TestCgroupUnconnectedUDP proves the sendmsg4/sendmsg6 hooks close the
+// unconnected-UDP bypass: a sendto on a never-connected socket (which skips
+// the connect4/connect6 hooks entirely) is filtered by the same policy.
+func TestCgroupUnconnectedUDP(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("test requires root")
+	}
+
+	cgroupPath, cgroupCleanup := setupTestCgroup(t, "netfence-udp-unconnected-test")
+	defer cgroupCleanup()
+
+	localIP := nonLoopbackIPv4(t)
+
+	// Receiver outside the filtered path: delivery proof for allowed sends.
+	destV4, receivedV4, cleanupV4 := startUDPReceiver(t, "udp4", net.JoinHostPort(localIP.String(), "0"))
+	defer cleanupV4()
+
+	// IPv6 localhost receiver: proves the sendmsg6 hook passes allowed
+	// (carve-out) traffic through, even without external IPv6 connectivity.
+	destV6, receivedV6, cleanupV6 := startUDPReceiver(t, "udp6", "[::1]:0")
+	defer cleanupV6()
+
+	f, err := filter.NewCgroupFilter(cgroupPath, filter.ModeAllowlist)
+	require.NoError(t, err)
+	defer f.Close()
+
+	restore := moveSelfToCgroup(t, cgroupPath)
+	defer restore()
+
+	// Never-connected UDP sockets: WriteTo issues sendto with an address,
+	// which bypasses connect hooks and must be caught by sendmsg hooks.
+	senderV4, err := net.ListenPacket("udp4", ":0")
+	require.NoError(t, err)
+	defer senderV4.Close()
+
+	senderV6, err := net.ListenPacket("udp6", ":0")
+	if err != nil {
+		t.Logf("no IPv6 UDP socket support, skipping IPv6 subtests: %v", err)
+		senderV6 = nil
+	} else {
+		defer senderV6.Close()
+	}
+
+	destV4Addr, err := net.ResolveUDPAddr("udp4", destV4)
+	require.NoError(t, err)
+	// Documentation range (2001:db8::/32): never routed, never allowlisted.
+	// The sendmsg6 hook rejects before route lookup, so the EPERM assertion
+	// is deterministic even without IPv6 connectivity.
+	blockedV6Addr, err := net.ResolveUDPAddr("udp6", "[2001:db8::1]:53")
+	require.NoError(t, err)
+
+	expectNoDelivery := func(t *testing.T, ch chan string) {
+		select {
+		case payload := <-ch:
+			t.Fatalf("packet unexpectedly delivered: %q", payload)
+		case <-time.After(300 * time.Millisecond):
+		}
+	}
+	expectDelivery := func(t *testing.T, ch chan string, want string) {
+		select {
+		case payload := <-ch:
+			assert.Equal(t, want, payload)
+		case <-time.After(2 * time.Second):
+			t.Fatal("expected packet was not delivered")
+		}
+	}
+
+	t.Run("IPv4/not_in_allowlist_blocked", func(t *testing.T) {
+		_, err := senderV4.WriteTo([]byte("blocked-v4"), destV4Addr)
+		require.Error(t, err, "unconnected sendto to non-allowlisted IP must fail")
+		assert.ErrorIs(t, err, syscall.EPERM)
+		expectNoDelivery(t, receivedV4)
+	})
+
+	t.Run("IPv4/in_allowlist_allowed", func(t *testing.T) {
+		cidr, err := filter.ParseCIDR(localIP.String() + "/32")
+		require.NoError(t, err)
+		require.NoError(t, f.AllowIP(cidr))
+
+		_, err = senderV4.WriteTo([]byte("allowed-v4"), destV4Addr)
+		require.NoError(t, err, "unconnected sendto to allowlisted IP must succeed")
+		expectDelivery(t, receivedV4, "allowed-v4")
+	})
+
+	t.Run("IPv4/removed_from_allowlist_blocked", func(t *testing.T) {
+		cidr, err := filter.ParseCIDR(localIP.String() + "/32")
+		require.NoError(t, err)
+		require.NoError(t, f.RemoveAllowedIP(cidr))
+
+		_, err = senderV4.WriteTo([]byte("blocked-again-v4"), destV4Addr)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, syscall.EPERM)
+		expectNoDelivery(t, receivedV4)
+	})
+
+	if senderV6 != nil {
+		t.Run("IPv6/not_in_allowlist_blocked", func(t *testing.T) {
+			_, err := senderV6.WriteTo([]byte("blocked-v6"), blockedV6Addr)
+			require.Error(t, err, "unconnected sendto to non-allowlisted IPv6 must fail")
+			assert.ErrorIs(t, err, syscall.EPERM)
+		})
+
+		t.Run("IPv6/in_allowlist_not_blocked_by_policy", func(t *testing.T) {
+			cidr, err := filter.ParseCIDR("2001:db8::1/128")
+			require.NoError(t, err)
+			require.NoError(t, f.AllowIP(cidr))
+
+			// No route to 2001:db8::/32 exists, so the send may still fail,
+			// but it must no longer fail with the policy verdict (EPERM).
+			_, err = senderV6.WriteTo([]byte("allowed-v6"), blockedV6Addr)
+			assert.NotErrorIs(t, err, syscall.EPERM,
+				"allowlisted IPv6 destination must not be blocked by policy")
+			require.NoError(t, f.RemoveAllowedIP(cidr))
+		})
+
+		t.Run("IPv6/localhost_delivery_allowed", func(t *testing.T) {
+			destV6Addr, err := net.ResolveUDPAddr("udp6", destV6)
+			require.NoError(t, err)
+			_, err = senderV6.WriteTo([]byte("allowed-v6-lo"), destV6Addr)
+			require.NoError(t, err)
+			expectDelivery(t, receivedV6, "allowed-v6-lo")
+		})
+	}
+
+	t.Run("block_all_blocks_unconnected_sendto", func(t *testing.T) {
+		// Even an allowlisted destination is blocked in block-all mode.
+		cidr, err := filter.ParseCIDR(localIP.String() + "/32")
+		require.NoError(t, err)
+		require.NoError(t, f.AllowIP(cidr))
+		require.NoError(t, f.SetMode(filter.ModeBlockAll))
+		defer func() {
+			require.NoError(t, f.SetMode(filter.ModeAllowlist))
+			require.NoError(t, f.RemoveAllowedIP(cidr))
+		}()
+
+		_, err = senderV4.WriteTo([]byte("blockall-v4"), destV4Addr)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, syscall.EPERM)
+		expectNoDelivery(t, receivedV4)
+
+		if senderV6 != nil {
+			_, err := senderV6.WriteTo([]byte("blockall-v6"), blockedV6Addr)
+			require.Error(t, err)
+			assert.ErrorIs(t, err, syscall.EPERM)
+		}
+	})
+
+	stats, err := f.GetStats()
+	require.NoError(t, err)
+	assert.Greater(t, stats.Blocked, uint64(0), "expected blocked count > 0 from sendmsg hooks")
+	t.Logf("Stats: allowed=%d, blocked=%d", stats.Allowed, stats.Blocked)
 }
 
 func TestTCFilterLoad(t *testing.T) {

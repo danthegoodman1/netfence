@@ -1,7 +1,9 @@
 //go:build ignore
 
 // eBPF program for filtering outbound network connections (cgroup-based)
-// This program attaches to cgroup/connect4 and cgroup/connect6 to filter IPv4 and IPv6 connections
+// This program attaches to cgroup/connect4 and cgroup/connect6 to filter IPv4 and IPv6
+// connections, and to cgroup/sendmsg4 and cgroup/sendmsg6 to filter unconnected UDP
+// sendto/sendmsg (which never passes through the connect hooks).
 // Use this for container/cgroup-based isolation
 
 #include <linux/bpf.h>
@@ -114,8 +116,10 @@ static __always_inline int is_link_local_v6(__u32 *addr)
     return first_byte == 0xfe && (second_byte & 0xc0) == 0x80;
 }
 
-SEC("cgroup/connect4")
-int restrict_connect4(struct bpf_sock_addr *ctx)
+// Shared verdict for IPv4 destinations. Used by both the connect4 and
+// sendmsg4 hooks so a rule applies identically to connect() and to
+// unconnected UDP sendto/sendmsg. Returns 1 = allow, 0 = block.
+static __always_inline int filter_dst4(struct bpf_sock_addr *ctx)
 {
     __u32 key = 0;
     __u8 *mode = bpf_map_lookup_elem(&policy_mode, &key);
@@ -171,8 +175,9 @@ int restrict_connect4(struct bpf_sock_addr *ctx)
     return 1;
 }
 
-SEC("cgroup/connect6")
-int restrict_connect6(struct bpf_sock_addr *ctx)
+// Shared verdict for IPv6 destinations. Used by both the connect6 and
+// sendmsg6 hooks. Returns 1 = allow, 0 = block.
+static __always_inline int filter_dst6(struct bpf_sock_addr *ctx)
 {
     __u32 key = 0;
     __u8 *mode = bpf_map_lookup_elem(&policy_mode, &key);
@@ -234,6 +239,37 @@ int restrict_connect6(struct bpf_sock_addr *ctx)
 
     // Unknown mode - default allow
     return 1;
+}
+
+SEC("cgroup/connect4")
+int restrict_connect4(struct bpf_sock_addr *ctx)
+{
+    return filter_dst4(ctx);
+}
+
+SEC("cgroup/connect6")
+int restrict_connect6(struct bpf_sock_addr *ctx)
+{
+    return filter_dst6(ctx);
+}
+
+// UDP sendto/sendmsg with an explicit destination address never passes
+// through the connect hooks, so it must be filtered here. The kernel runs
+// this hook whenever a destination address is supplied in the message,
+// whether or not the socket is connected — so it also covers sendto() to a
+// different address on an already-connected socket, which the connect hooks
+// alone would miss. send()/write() on a connected socket supplies no address
+// and skips this hook entirely, so the connected warm path is unaffected.
+SEC("cgroup/sendmsg4")
+int restrict_sendmsg4(struct bpf_sock_addr *ctx)
+{
+    return filter_dst4(ctx);
+}
+
+SEC("cgroup/sendmsg6")
+int restrict_sendmsg6(struct bpf_sock_addr *ctx)
+{
+    return filter_dst6(ctx);
 }
 
 char LICENSE[] SEC("license") = "GPL";
