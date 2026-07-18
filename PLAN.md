@@ -118,7 +118,7 @@ Status ledger:
 | Incomplete | Work | 3A: bpffs pinning + restore-from-pins + `detach_on_stop` config | Missing: design note (pin layout, upgrade compat), implementation, kill-9 test. |
 | Incomplete | Decision | Default fail mode on daemon stop | Decided: keep-enforcing (`detach_on_stop: false` default) — pinned BPF state holds policy across restarts/upgrades. Missing: recording in README + config default. |
 | Incomplete | Work | 3B: persisted daemon UUID | Missing: implementation + restart identity test. |
-| Incomplete | Work | 3C: `:memory:` pooling fix, fixed-width timestamps, scanner dedupe | Missing: implementation + concurrency/pagination tests. |
+| Complete | Work | 3C: `:memory:` pooling fix, fixed-width timestamps, scanner dedupe | `SetMaxOpenConns(1)` for `:memory:` path (store.go), canonical fixed-width `attachedAtLayout` + idempotent `migrateAttachedAtFormat` + token canonicalization, `scanAttachment(scanner)` folds both scanners. Tests `TestMemoryStoreConcurrentOps` (negative-verified: "no such table" without the cap) and `TestListAttachmentsOrdersMixedPrecisionTimestamps` (negative-verified: out-of-order pre-fix), plus round-trip, migration idempotency, unparseable-row survival, legacy-token resume. Docker gate green (`make check-docker`, `make test-docker`). |
 | Incomplete | Work | 3D: netlink resubscribe + async onRemoved + shared fsnotify watcher | Missing: implementation + closed-channel test + >128-cgroup test. |
 | Incomplete | Work | 3E: single-path attach rollback; Detach vs in-flight-subscribe race | Missing: refactor + failure-injection unit tests. |
 | Incomplete | Gate | Kill-9 restart holds enforcement; watcher chaos test green | Missing: both tests. |

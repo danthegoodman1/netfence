@@ -20,7 +20,7 @@ func BenchmarkStoreListAttachmentsFirstPage(b *testing.B) {
 
 func BenchmarkStoreListAttachmentsDeepPage(b *testing.B) {
 	st := newBenchmarkStore(b, 10000)
-	token := time.Date(2026, 5, 27, 12, 0, 0, 5000, time.UTC).Format(time.RFC3339Nano) + "|005000"
+	token := time.Date(2026, 5, 27, 12, 0, 0, 5000, time.UTC).Format(attachedAtLayout) + "|005000"
 
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -65,7 +65,7 @@ func newBenchmarkStore(b *testing.B, rows int) *Store {
 			"DNS_MODE_DISABLED",
 			"127.0.0.1:12000",
 			"{}",
-			base.Add(time.Duration(i)*time.Nanosecond).Format(time.RFC3339Nano),
+			base.Add(time.Duration(i)*time.Nanosecond).Format(attachedAtLayout),
 		); err != nil {
 			b.Fatal(err)
 		}
