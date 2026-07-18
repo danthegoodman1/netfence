@@ -223,7 +223,7 @@ func TestTCVethVlanAllowlist(t *testing.T) {
 
 	// Filter attaches to the BASE host-side peer: every tagged frame from
 	// the workload crosses it.
-	f, err := filter.NewTCFilter(vethHostIf, filter.ModeAllowlist, filter.DirectionIngress)
+	f, err := filter.NewTCFilter(vethHostIf, filter.ModeAllowlist, filter.DirectionIngress, filter.DefaultCarveouts())
 	require.NoError(t, err)
 	defer f.Close()
 
@@ -267,6 +267,51 @@ func TestTCVethVlanAllowlist(t *testing.T) {
 	t.Logf("Stats: allowed=%d, blocked=%d", stats.Allowed, stats.Blocked)
 }
 
+// TestTCVethMetadataBlockable is the TC-side proof of the 1D headline fix:
+// with default carve-outs, the cloud metadata address (169.254.169.254) is
+// subject to allowlist policy at the TC layer too — blocked by default,
+// reachable only when explicitly allowlisted. The address is bound to the
+// host-side veth peer to stand in for the metadata service.
+func TestTCVethMetadataBlockable(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("test requires root")
+	}
+
+	cleanup := setupVethNetns(t)
+	defer cleanup()
+
+	const metadataIP = "169.254.169.254"
+	require.NoError(t, ipCmd("addr", "add", metadataIP+"/32", "dev", vethHostIf))
+	require.NoError(t, ipCmd("-n", vethNetns, "route", "add", metadataIP+"/32", "dev", vethNsIf))
+
+	metadataPort, closeLn := listenTCP(t, metadataIP)
+	defer closeLn()
+
+	// Sanity: reachable from the workload netns without a filter.
+	require.True(t, nsConnectTCP(metadataIP, metadataPort),
+		"metadata stand-in not reachable over veth without filter")
+
+	f, err := filter.NewTCFilter(vethHostIf, filter.ModeAllowlist, filter.DirectionIngress, filter.DefaultCarveouts())
+	require.NoError(t, err)
+	defer f.Close()
+
+	// Force a fresh ARP exchange across the attached filter.
+	flushNeighbors(t, vethHostIf)
+
+	t.Run("blocked_by_default", func(t *testing.T) {
+		assert.False(t, nsConnectTCP(metadataIP, metadataPort),
+			"metadata service must be BLOCKED by default in TC allowlist mode (1D headline)")
+	})
+
+	t.Run("allowed_when_allowlisted", func(t *testing.T) {
+		cidr, err := filter.ParseCIDR(metadataIP + "/32")
+		require.NoError(t, err)
+		require.NoError(t, f.AllowIP(cidr))
+		assert.True(t, nsConnectTCP(metadataIP, metadataPort),
+			"metadata service must be reachable once explicitly allowlisted")
+	})
+}
+
 // TestTCVethDirection is the first traffic-level TC test: it proves that on
 // the documented host-side veth topology, DirectionIngress filters the
 // workload's egress by true destination, and documents why DirectionEgress
@@ -290,7 +335,7 @@ func TestTCVethDirection(t *testing.T) {
 	require.True(t, nsConnectTCP(vethBlockedIP, blockedPort), "veth topology broken: blocked dest unreachable without filter")
 
 	t.Run("ingress_filters_workload_egress_by_destination", func(t *testing.T) {
-		f, err := filter.NewTCFilter(vethHostIf, filter.ModeAllowlist, filter.DirectionIngress)
+		f, err := filter.NewTCFilter(vethHostIf, filter.ModeAllowlist, filter.DirectionIngress, filter.DefaultCarveouts())
 		require.NoError(t, err)
 		defer f.Close()
 
@@ -320,7 +365,7 @@ func TestTCVethDirection(t *testing.T) {
 	// the workload's egress by true destination. This is the wrong-direction
 	// bug the direction field exists to fix.
 	t.Run("egress_on_host_peer_filters_wrong_direction", func(t *testing.T) {
-		f, err := filter.NewTCFilter(vethHostIf, filter.ModeAllowlist, filter.DirectionEgress)
+		f, err := filter.NewTCFilter(vethHostIf, filter.ModeAllowlist, filter.DirectionEgress, filter.DefaultCarveouts())
 		require.NoError(t, err)
 		defer f.Close()
 
@@ -356,7 +401,7 @@ func TestTCVethDirection(t *testing.T) {
 	// effect on the next packet. A UDP flow shows this deterministically;
 	// for TCP the connection stops passing data rather than emitting an RST.
 	t.Run("rule_removal_severs_established_flow", func(t *testing.T) {
-		f, err := filter.NewTCFilter(vethHostIf, filter.ModeAllowlist, filter.DirectionIngress)
+		f, err := filter.NewTCFilter(vethHostIf, filter.ModeAllowlist, filter.DirectionIngress, filter.DefaultCarveouts())
 		require.NoError(t, err)
 		defer f.Close()
 

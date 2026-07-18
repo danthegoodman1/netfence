@@ -116,6 +116,55 @@ static __always_inline int is_link_local_v6(__u32 *addr)
     return first_byte == 0xfe && (second_byte & 0xc0) == 0x80;
 }
 
+static __always_inline int is_link_local_multicast_v6(__u32 *addr)
+{
+    // ff02::/16 (link-local scope multicast, used by NDP)
+    __u8 first_byte = addr[0] & 0xff;
+    __u8 second_byte = (addr[0] >> 8) & 0xff;
+    return first_byte == 0xff && second_byte == 0x02;
+}
+
+// Carve-out flags: destination ranges always allowed regardless of
+// allowlist/denylist policy (block-all still drops before these checks).
+// Must match the carveout* constants in pkg/filter/types.go.
+#define CARVEOUT_LOCALHOST_V4  (1 << 0) // 127.0.0.0/8
+#define CARVEOUT_LOCALHOST_V6  (1 << 1) // ::1
+#define CARVEOUT_LINK_LOCAL_V4 (1 << 2) // 169.254.0.0/16 (incl. metadata service)
+#define CARVEOUT_LINK_LOCAL_V6 (1 << 3) // fe80::/10 (NDP)
+#define CARVEOUT_MULTICAST_V6  (1 << 4) // ff02::/16 (NDP)
+
+// Set by userspace before load (pkg/filter Carveouts); the JIT folds this
+// constant, so gating carve-outs on it costs nothing per packet. The
+// initializer is the default posture (v4 link-local intentionally absent so
+// the cloud metadata service is subject to policy).
+volatile const __u32 carveout_flags = CARVEOUT_LOCALHOST_V4 | CARVEOUT_LOCALHOST_V6 |
+                                      CARVEOUT_LINK_LOCAL_V6 | CARVEOUT_MULTICAST_V6;
+
+static __always_inline int is_carved_out_v4(__u32 addr)
+{
+    if ((carveout_flags & CARVEOUT_LOCALHOST_V4) && is_localhost_v4(addr)) {
+        return 1;
+    }
+    if ((carveout_flags & CARVEOUT_LINK_LOCAL_V4) && is_link_local_v4(addr)) {
+        return 1;
+    }
+    return 0;
+}
+
+static __always_inline int is_carved_out_v6(__u32 *addr)
+{
+    if ((carveout_flags & CARVEOUT_LOCALHOST_V6) && is_localhost_v6(addr)) {
+        return 1;
+    }
+    if ((carveout_flags & CARVEOUT_LINK_LOCAL_V6) && is_link_local_v6(addr)) {
+        return 1;
+    }
+    if ((carveout_flags & CARVEOUT_MULTICAST_V6) && is_link_local_multicast_v6(addr)) {
+        return 1;
+    }
+    return 0;
+}
+
 // Shared verdict for IPv4 destinations. Used by both the connect4 and
 // sendmsg4 hooks so a rule applies identically to connect() and to
 // unconnected UDP sendto/sendmsg. Returns 1 = allow, 0 = block.
@@ -137,8 +186,8 @@ static __always_inline int filter_dst4(struct bpf_sock_addr *ctx)
 
     __u32 dst_ip = ctx->user_ip4;
 
-    // Always allow localhost and link-local
-    if (is_localhost_v4(dst_ip) || is_link_local_v4(dst_ip)) {
+    // Configured carve-outs (localhost by default; see carveout_flags)
+    if (is_carved_out_v4(dst_ip)) {
         increment_stat(0); // allowed
         return 1;
     }
@@ -200,8 +249,9 @@ static __always_inline int filter_dst6(struct bpf_sock_addr *ctx)
     dst_ip6[2] = ctx->user_ip6[2];
     dst_ip6[3] = ctx->user_ip6[3];
 
-    // Always allow localhost and link-local
-    if (is_localhost_v6(dst_ip6) || is_link_local_v6(dst_ip6)) {
+    // Configured carve-outs (localhost/link-local/ND-multicast by default;
+    // see carveout_flags)
+    if (is_carved_out_v6(dst_ip6)) {
         increment_stat(0); // allowed
         return 1;
     }

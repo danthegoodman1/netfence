@@ -26,10 +26,17 @@
 // Both filters support CIDR notation for IP ranges (e.g., 10.0.0.0/8, 192.168.1.0/24).
 // Use ParseCIDR to convert strings to *net.IPNet for use with Allow/Deny methods.
 //
+// # Carve-outs
+//
+// Destinations like localhost are carved out of policy enforcement via
+// Carveouts (see DefaultCarveouts). By default IPv4 link-local
+// (169.254.0.0/16, which includes the cloud metadata service) is NOT carved
+// out and is subject to policy.
+//
 // # Example
 //
-//	// Create a cgroup filter in allowlist mode
-//	f, err := filter.NewCgroupFilter("/sys/fs/cgroup/my-container", filter.ModeAllowlist)
+//	// Create a cgroup filter in allowlist mode with default carve-outs
+//	f, err := filter.NewCgroupFilter("/sys/fs/cgroup/my-container", filter.ModeAllowlist, filter.DefaultCarveouts())
 //	if err != nil {
 //	    log.Fatal(err)
 //	}

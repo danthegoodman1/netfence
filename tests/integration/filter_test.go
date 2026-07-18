@@ -113,7 +113,7 @@ func TestCgroupFilterLoad(t *testing.T) {
 		t.Skipf("cgroup path %s does not exist", cgroupPath)
 	}
 
-	f, err := filter.NewCgroupFilter(cgroupPath, filter.ModeDisabled)
+	f, err := filter.NewCgroupFilter(cgroupPath, filter.ModeDisabled, filter.DefaultCarveouts())
 	require.NoError(t, err)
 	defer f.Close()
 
@@ -137,7 +137,7 @@ func TestCgroupBlockAll(t *testing.T) {
 	require.True(t, tryConnect(testServerAddrV4, 2*time.Second), "IPv4 test server not reachable")
 	require.True(t, tryConnect(testServerAddrV6, 2*time.Second), "IPv6 test server not reachable")
 
-	f, err := filter.NewCgroupFilter(cgroupPath, filter.ModeBlockAll)
+	f, err := filter.NewCgroupFilter(cgroupPath, filter.ModeBlockAll, filter.DefaultCarveouts())
 	require.NoError(t, err)
 	defer f.Close()
 
@@ -168,7 +168,7 @@ func TestCgroupDisabled(t *testing.T) {
 	cgroupPath, cgroupCleanup := setupTestCgroup(t, "netfence-disabled-test")
 	defer cgroupCleanup()
 
-	f, err := filter.NewCgroupFilter(cgroupPath, filter.ModeDisabled)
+	f, err := filter.NewCgroupFilter(cgroupPath, filter.ModeDisabled, filter.DefaultCarveouts())
 	require.NoError(t, err)
 	defer f.Close()
 
@@ -194,7 +194,7 @@ func TestCgroupAllowlist(t *testing.T) {
 	cgroupPath, cgroupCleanup := setupTestCgroup(t, "netfence-allowlist-test")
 	defer cgroupCleanup()
 
-	f, err := filter.NewCgroupFilter(cgroupPath, filter.ModeAllowlist)
+	f, err := filter.NewCgroupFilter(cgroupPath, filter.ModeAllowlist, filter.DefaultCarveouts())
 	require.NoError(t, err)
 	defer f.Close()
 
@@ -265,7 +265,7 @@ func TestCgroupDenylist(t *testing.T) {
 	cgroupPath, cgroupCleanup := setupTestCgroup(t, "netfence-denylist-test")
 	defer cgroupCleanup()
 
-	f, err := filter.NewCgroupFilter(cgroupPath, filter.ModeDenylist)
+	f, err := filter.NewCgroupFilter(cgroupPath, filter.ModeDenylist, filter.DefaultCarveouts())
 	require.NoError(t, err)
 	defer f.Close()
 
@@ -326,7 +326,7 @@ func TestCgroupCIDR(t *testing.T) {
 	cgroupPath, cgroupCleanup := setupTestCgroup(t, "netfence-cidr-test")
 	defer cgroupCleanup()
 
-	f, err := filter.NewCgroupFilter(cgroupPath, filter.ModeDenylist)
+	f, err := filter.NewCgroupFilter(cgroupPath, filter.ModeDenylist, filter.DefaultCarveouts())
 	require.NoError(t, err)
 	defer f.Close()
 
@@ -382,7 +382,7 @@ func TestCgroupModeSwitch(t *testing.T) {
 	cgroupPath, cgroupCleanup := setupTestCgroup(t, "netfence-modeswitch-test")
 	defer cgroupCleanup()
 
-	f, err := filter.NewCgroupFilter(cgroupPath, filter.ModeDisabled)
+	f, err := filter.NewCgroupFilter(cgroupPath, filter.ModeDisabled, filter.DefaultCarveouts())
 	require.NoError(t, err)
 	defer f.Close()
 
@@ -485,7 +485,7 @@ func TestCgroupUnconnectedUDP(t *testing.T) {
 	destV6, receivedV6, cleanupV6 := startUDPReceiver(t, "udp6", "[::1]:0")
 	defer cleanupV6()
 
-	f, err := filter.NewCgroupFilter(cgroupPath, filter.ModeAllowlist)
+	f, err := filter.NewCgroupFilter(cgroupPath, filter.ModeAllowlist, filter.DefaultCarveouts())
 	require.NoError(t, err)
 	defer f.Close()
 
@@ -616,6 +616,102 @@ func TestCgroupUnconnectedUDP(t *testing.T) {
 	t.Logf("Stats: allowed=%d, blocked=%d", stats.Allowed, stats.Blocked)
 }
 
+// TestCgroupMetadataServiceBlockable proves the 1D headline fix: IPv4
+// link-local (169.254.0.0/16) is no longer unconditionally carved out, so in
+// allowlist mode the cloud metadata service address (169.254.169.254) is
+// BLOCKED by default and reachable only when explicitly allowlisted. A local
+// listener bound to the metadata address (assigned to lo) stands in for the
+// real metadata service so the allowed path proves actual delivery.
+func TestCgroupMetadataServiceBlockable(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("test requires root")
+	}
+
+	const metadataIP = "169.254.169.254"
+
+	// Bind the metadata address locally so allowed traffic is deliverable.
+	if out, err := exec.Command("ip", "addr", "add", metadataIP+"/32", "dev", "lo").CombinedOutput(); err != nil {
+		t.Fatalf("assigning metadata IP to lo: %v: %s", err, out)
+	}
+	defer exec.Command("ip", "addr", "del", metadataIP+"/32", "dev", "lo").Run()
+
+	ln, err := net.Listen("tcp4", metadataIP+":0")
+	require.NoError(t, err)
+	defer ln.Close()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			conn.Close()
+		}
+	}()
+	_, metadataPort, err := net.SplitHostPort(ln.Addr().String())
+	require.NoError(t, err)
+	metadataNcAddr := metadataIP + " " + metadataPort
+
+	// Sanity: reachable without any filter.
+	require.True(t, tryConnect(metadataIP+":"+metadataPort, 2*time.Second),
+		"metadata stand-in not reachable without filter")
+
+	cgroupPath, cgroupCleanup := setupTestCgroup(t, "netfence-metadata-test")
+	defer cgroupCleanup()
+
+	f, err := filter.NewCgroupFilter(cgroupPath, filter.ModeAllowlist, filter.DefaultCarveouts())
+	require.NoError(t, err)
+	defer f.Close()
+
+	t.Run("blocked_by_default", func(t *testing.T) {
+		assert.False(t, runInCgroup(cgroupPath, metadataNcAddr),
+			"metadata service must be BLOCKED by default in allowlist mode (1D headline)")
+	})
+
+	t.Run("allowed_when_allowlisted", func(t *testing.T) {
+		cidr, err := filter.ParseCIDR(metadataIP + "/32")
+		require.NoError(t, err)
+		require.NoError(t, f.AllowIP(cidr))
+		assert.True(t, runInCgroup(cgroupPath, metadataNcAddr),
+			"metadata service must be reachable once explicitly allowlisted (the allowlist is the override)")
+	})
+
+	t.Run("blocked_again_after_removal", func(t *testing.T) {
+		cidr, err := filter.ParseCIDR(metadataIP + "/32")
+		require.NoError(t, err)
+		require.NoError(t, f.RemoveAllowedIP(cidr))
+		assert.False(t, runInCgroup(cgroupPath, metadataNcAddr),
+			"metadata service must be blocked again after allowlist removal")
+	})
+
+	t.Run("localhost_carveouts_still_on", func(t *testing.T) {
+		cleanup := startTestServer(t)
+		defer cleanup()
+		assert.True(t, runInCgroup(cgroupPath, testServerNcV4),
+			"127.0.0.1 must remain always-allowed by default")
+		assert.True(t, runInCgroup(cgroupPath, testServerNcV6),
+			"::1 must remain always-allowed by default")
+	})
+
+	// Proves the load-time constant actually reaches the program (the C-side
+	// default initializer equals the Go defaults, so the subtests above
+	// alone could not detect a silently ignored rewrite): flipping
+	// LinkLocalV4 ON must restore the pre-1D unconditional allow.
+	t.Run("linklocal_carveout_flag_restores_allow", func(t *testing.T) {
+		carveouts := filter.DefaultCarveouts()
+		carveouts.LinkLocalV4 = true
+
+		legacyCgroup, legacyCleanup := setupTestCgroup(t, "netfence-metadata-legacy-test")
+		defer legacyCleanup()
+
+		legacyFilter, err := filter.NewCgroupFilter(legacyCgroup, filter.ModeAllowlist, carveouts)
+		require.NoError(t, err)
+		defer legacyFilter.Close()
+
+		assert.True(t, runInCgroup(legacyCgroup, metadataNcAddr),
+			"LinkLocalV4 carve-out flag should restore the unconditional link-local allow")
+	})
+}
+
 func TestTCFilterLoad(t *testing.T) {
 	if os.Getuid() != 0 {
 		t.Skip("test requires root")
@@ -625,7 +721,7 @@ func TestTCFilterLoad(t *testing.T) {
 	require.NoError(t, createDummyInterface(ifaceName))
 	defer deleteDummyInterface(ifaceName)
 
-	f, err := filter.NewTCFilter(ifaceName, filter.ModeDisabled, filter.DirectionEgress)
+	f, err := filter.NewTCFilter(ifaceName, filter.ModeDisabled, filter.DirectionEgress, filter.DefaultCarveouts())
 	require.NoError(t, err)
 	defer f.Close()
 
@@ -643,7 +739,7 @@ func TestTCFilterModes(t *testing.T) {
 	require.NoError(t, createDummyInterface(ifaceName))
 	defer deleteDummyInterface(ifaceName)
 
-	f, err := filter.NewTCFilter(ifaceName, filter.ModeDisabled, filter.DirectionEgress)
+	f, err := filter.NewTCFilter(ifaceName, filter.ModeDisabled, filter.DirectionEgress, filter.DefaultCarveouts())
 	require.NoError(t, err)
 	defer f.Close()
 
@@ -673,7 +769,7 @@ func TestTCFilterIPManagement(t *testing.T) {
 	require.NoError(t, createDummyInterface(ifaceName))
 	defer deleteDummyInterface(ifaceName)
 
-	f, err := filter.NewTCFilter(ifaceName, filter.ModeAllowlist, filter.DirectionEgress)
+	f, err := filter.NewTCFilter(ifaceName, filter.ModeAllowlist, filter.DirectionEgress, filter.DefaultCarveouts())
 	require.NoError(t, err)
 	defer f.Close()
 

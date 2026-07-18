@@ -27,7 +27,7 @@ func BenchmarkCgroupConnectWarmAllowlist(b *testing.B) {
 	cgroupPath, restore := moveBenchmarkToCgroup(b, "netfence-connect-warm-bench")
 	defer restore()
 
-	f, err := filter.NewCgroupFilter(cgroupPath, filter.ModeAllowlist)
+	f, err := filter.NewCgroupFilter(cgroupPath, filter.ModeAllowlist, filter.DefaultCarveouts())
 	require.NoError(b, err)
 	defer f.Close()
 
@@ -46,7 +46,7 @@ func BenchmarkCgroupConnectAllowlistMiss(b *testing.B) {
 	cgroupPath, restore := moveBenchmarkToCgroup(b, "netfence-connect-miss-bench")
 	defer restore()
 
-	f, err := filter.NewCgroupFilter(cgroupPath, filter.ModeAllowlist)
+	f, err := filter.NewCgroupFilter(cgroupPath, filter.ModeAllowlist, filter.DefaultCarveouts())
 	require.NoError(b, err)
 	defer f.Close()
 

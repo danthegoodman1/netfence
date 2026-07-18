@@ -120,10 +120,57 @@ static __always_inline int is_link_local_v6(struct in6_addr *addr)
     return first_byte == 0xfe && (second_byte & 0xc0) == 0x80;
 }
 
+static __always_inline int is_link_local_multicast_v6(struct in6_addr *addr)
+{
+    // ff02::/16 (link-local scope multicast, used by NDP)
+    return addr->in6_u.u6_addr8[0] == 0xff && addr->in6_u.u6_addr8[1] == 0x02;
+}
+
+// Carve-out flags: destination ranges always allowed regardless of
+// allowlist/denylist policy (block-all still drops before these checks).
+// Must match the carveout* constants in pkg/filter/types.go.
+#define CARVEOUT_LOCALHOST_V4  (1 << 0) // 127.0.0.0/8
+#define CARVEOUT_LOCALHOST_V6  (1 << 1) // ::1
+#define CARVEOUT_LINK_LOCAL_V4 (1 << 2) // 169.254.0.0/16 (incl. metadata service)
+#define CARVEOUT_LINK_LOCAL_V6 (1 << 3) // fe80::/10 (NDP)
+#define CARVEOUT_MULTICAST_V6  (1 << 4) // ff02::/16 (NDP)
+
+// Set by userspace before load (pkg/filter Carveouts); the JIT folds this
+// constant, so gating carve-outs on it costs nothing per packet. The
+// initializer is the default posture (v4 link-local intentionally absent so
+// the cloud metadata service is subject to policy).
+volatile const __u32 carveout_flags = CARVEOUT_LOCALHOST_V4 | CARVEOUT_LOCALHOST_V6 |
+                                      CARVEOUT_LINK_LOCAL_V6 | CARVEOUT_MULTICAST_V6;
+
+static __always_inline int is_carved_out_v4(__be32 addr)
+{
+    if ((carveout_flags & CARVEOUT_LOCALHOST_V4) && is_localhost_v4(addr)) {
+        return 1;
+    }
+    if ((carveout_flags & CARVEOUT_LINK_LOCAL_V4) && is_link_local_v4(addr)) {
+        return 1;
+    }
+    return 0;
+}
+
+static __always_inline int is_carved_out_v6(struct in6_addr *addr)
+{
+    if ((carveout_flags & CARVEOUT_LOCALHOST_V6) && is_localhost_v6(addr)) {
+        return 1;
+    }
+    if ((carveout_flags & CARVEOUT_LINK_LOCAL_V6) && is_link_local_v6(addr)) {
+        return 1;
+    }
+    if ((carveout_flags & CARVEOUT_MULTICAST_V6) && is_link_local_multicast_v6(addr)) {
+        return 1;
+    }
+    return 0;
+}
+
 static __always_inline int filter_ipv4(__be32 dst_addr, __u8 mode)
 {
-    // Always allow localhost and link-local
-    if (is_localhost_v4(dst_addr) || is_link_local_v4(dst_addr)) {
+    // Configured carve-outs (localhost by default; see carveout_flags)
+    if (is_carved_out_v4(dst_addr)) {
         increment_stat(0);
         return TC_ACT_OK;
     }
@@ -159,8 +206,9 @@ static __always_inline int filter_ipv4(__be32 dst_addr, __u8 mode)
 
 static __always_inline int filter_ipv6(struct in6_addr *dst_addr, __u8 mode)
 {
-    // Always allow localhost and link-local
-    if (is_localhost_v6(dst_addr) || is_link_local_v6(dst_addr)) {
+    // Configured carve-outs (localhost/link-local/ND-multicast by default;
+    // see carveout_flags)
+    if (is_carved_out_v6(dst_addr)) {
         increment_stat(0);
         return TC_ACT_OK;
     }

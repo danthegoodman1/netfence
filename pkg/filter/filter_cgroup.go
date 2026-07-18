@@ -25,16 +25,32 @@ type CgroupFilter struct {
 	sendmsgLink6 link.Link
 }
 
-// NewCgroupFilter creates a new cgroup-based filter attached to the specified cgroup path
-func NewCgroupFilter(cgroupPath string, mode PolicyMode) (*CgroupFilter, error) {
+// NewCgroupFilter creates a new cgroup-based filter attached to the specified
+// cgroup path. The carve-outs are baked into the program as a load-time
+// constant (see Carveouts / DefaultCarveouts).
+func NewCgroupFilter(cgroupPath string, mode PolicyMode, carveouts Carveouts) (*CgroupFilter, error) {
 	// Verify cgroup path exists
 	if _, err := os.Stat(cgroupPath); os.IsNotExist(err) {
 		return nil, fmt.Errorf("cgroup path does not exist: %s", cgroupPath)
 	}
 
-	// Load the eBPF objects
+	// Load the eBPF spec and bake the carve-out flags in before load: the
+	// JIT folds the constant, so the per-packet cost is zero, and the value
+	// is per-attachment because each filter loads its own program instance.
+	spec, err := loadCgroup()
+	if err != nil {
+		return nil, fmt.Errorf("loading cgroup BPF spec: %w", err)
+	}
+	carveoutVar, ok := spec.Variables["carveout_flags"]
+	if !ok {
+		return nil, fmt.Errorf("cgroup BPF spec missing carveout_flags variable")
+	}
+	if err := carveoutVar.Set(carveouts.flags()); err != nil {
+		return nil, fmt.Errorf("setting carve-out flags: %w", err)
+	}
+
 	objs := &cgroupObjects{}
-	if err := loadCgroupObjects(objs, nil); err != nil {
+	if err := spec.LoadAndAssign(objs, nil); err != nil {
 		return nil, fmt.Errorf("loading cgroup BPF objects: %w", err)
 	}
 

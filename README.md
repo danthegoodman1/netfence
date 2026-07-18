@@ -19,6 +19,25 @@ Your control plane pushes network rules like `ALLOW *.pypi.org` or `ALLOW 10.0.0
 - Metadata on daemons and attachments for associating with VM ID, tenant, etc.
 - Support for proxying DNS queries to the control plane to make DNS decisions per-attachment
 
+### Security note: default carve-outs
+
+In allowlist mode, IPv4 link-local (169.254.0.0/16) is **no longer auto-allowed
+by default** — so the cloud metadata service (169.254.169.254) is blocked unless
+explicitly allowlisted. This is deliberate: the metadata service is a
+credential-theft target, and sandboxed workloads must not be able to reach it
+implicitly. Localhost (127.0.0.0/8, ::1) and IPv6 neighbor discovery
+(fe80::/10, ff02::/16) remain allowed by default so basic connectivity and NDP
+keep working. To permit the metadata service for a workload, allowlist
+`169.254.169.254/32` (a per-attachment carve-out override via the control plane
+is a planned follow-up).
+
+IPv4 broadcast (255.255.255.255) and multicast (224.0.0.0/4) have no carve-out
+and are subject to policy, so under TC allowlist mode traffic like DHCP-renewal
+broadcasts is blocked unless explicitly allowlisted. Carve-out checks run before
+the denylist, so a carved range can only be blocked by turning its carve-out off
+— and because IPv4 link-local is now off by default, denylist mode can block the
+metadata service too.
+
 ## Differences from other options
 
 A few major benefits to this solution that other options don't usually support:

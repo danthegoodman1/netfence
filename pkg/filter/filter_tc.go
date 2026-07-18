@@ -50,11 +50,27 @@ type TCFilter struct {
 }
 
 // NewTCFilter creates a new TC-based filter attached to the specified
-// interface in the given direction (see TCDirection for how to choose).
-func NewTCFilter(ifaceName string, mode PolicyMode, direction TCDirection) (*TCFilter, error) {
-	// Load the eBPF objects
+// interface in the given direction (see TCDirection for how to choose). The
+// carve-outs are baked into the program as a load-time constant (see
+// Carveouts / DefaultCarveouts).
+func NewTCFilter(ifaceName string, mode PolicyMode, direction TCDirection, carveouts Carveouts) (*TCFilter, error) {
+	// Load the eBPF spec and bake the carve-out flags in before load: the
+	// JIT folds the constant, so the per-packet cost is zero, and the value
+	// is per-attachment because each filter loads its own program instance.
+	spec, err := loadTc()
+	if err != nil {
+		return nil, fmt.Errorf("loading TC BPF spec: %w", err)
+	}
+	carveoutVar, ok := spec.Variables["carveout_flags"]
+	if !ok {
+		return nil, fmt.Errorf("TC BPF spec missing carveout_flags variable")
+	}
+	if err := carveoutVar.Set(carveouts.flags()); err != nil {
+		return nil, fmt.Errorf("setting carve-out flags: %w", err)
+	}
+
 	objs := &tcObjects{}
-	if err := loadTcObjects(objs, nil); err != nil {
+	if err := spec.LoadAndAssign(objs, nil); err != nil {
 		return nil, fmt.Errorf("loading TC BPF objects: %w", err)
 	}
 

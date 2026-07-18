@@ -34,6 +34,72 @@ func (m PolicyMode) String() string {
 	}
 }
 
+// Carve-out flag bits. Must match the CARVEOUT_* macros in
+// bpf/filter_cgroup.c and bpf/filter_tc.c.
+const (
+	carveoutLocalhostV4 uint32 = 1 << 0
+	carveoutLocalhostV6 uint32 = 1 << 1
+	carveoutLinkLocalV4 uint32 = 1 << 2
+	carveoutLinkLocalV6 uint32 = 1 << 3
+	carveoutMulticastV6 uint32 = 1 << 4
+)
+
+// Carveouts configures destination ranges that are always allowed regardless
+// of allowlist/denylist policy (block-all mode still blocks everything).
+// The flags are baked into the BPF program as a load-time constant, so they
+// are per-attachment and have zero per-packet cost.
+type Carveouts struct {
+	// LocalhostV4 always allows 127.0.0.0/8.
+	LocalhostV4 bool
+	// LocalhostV6 always allows ::1.
+	LocalhostV6 bool
+	// LinkLocalV4 always allows 169.254.0.0/16. OFF by default: this range
+	// includes 169.254.169.254, the cloud metadata service — a
+	// credential-theft target that sandboxing policies must be able to
+	// block. Workloads that need it can simply allowlist it.
+	LinkLocalV4 bool
+	// LinkLocalV6 always allows fe80::/10 (required for NDP; without it
+	// IPv6 allowlist connectivity breaks).
+	LinkLocalV6 bool
+	// MulticastV6 always allows ff02::/16 (link-local scope multicast,
+	// used by NDP neighbor/router solicitation).
+	MulticastV6 bool
+}
+
+// DefaultCarveouts returns the default carve-out posture: localhost and the
+// IPv6 neighbor-discovery ranges allowed, IPv4 link-local (metadata service)
+// subject to policy.
+func DefaultCarveouts() Carveouts {
+	return Carveouts{
+		LocalhostV4: true,
+		LocalhostV6: true,
+		LinkLocalV4: false,
+		LinkLocalV6: true,
+		MulticastV6: true,
+	}
+}
+
+// flags encodes the carve-outs as the BPF-side bitmask.
+func (c Carveouts) flags() uint32 {
+	var f uint32
+	if c.LocalhostV4 {
+		f |= carveoutLocalhostV4
+	}
+	if c.LocalhostV6 {
+		f |= carveoutLocalhostV6
+	}
+	if c.LinkLocalV4 {
+		f |= carveoutLinkLocalV4
+	}
+	if c.LinkLocalV6 {
+		f |= carveoutLinkLocalV6
+	}
+	if c.MulticastV6 {
+		f |= carveoutMulticastV6
+	}
+	return f
+}
+
 // Stats holds the filter statistics
 type Stats struct {
 	Allowed uint64
