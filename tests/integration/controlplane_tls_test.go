@@ -24,6 +24,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/metadata"
 
 	"github.com/danthegoodman1/netfence/internal/config"
@@ -141,7 +142,13 @@ func startControlPlaneServer(t *testing.T, serverTLS *tls.Config, rec *authRecor
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 
-	var opts []grpc.ServerOption
+	// Permit the daemon's keepalive ping cadence (the documented CP-side
+	// contract): the default gRPC enforcement policy (5min) would GOAWAY
+	// the daemon with "too_many_pings".
+	opts := []grpc.ServerOption{grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+		MinTime:             time.Second,
+		PermitWithoutStream: true,
+	})}
 	if serverTLS != nil {
 		opts = append(opts, grpc.Creds(credentials.NewTLS(serverTLS)))
 	}
@@ -187,6 +194,8 @@ func startTLSClient(t *testing.T, addr string, cpCfg config.ControlPlaneConfig) 
 	require.NoError(t, err)
 
 	cpClient := daemon.NewControlPlaneClient(addr, srv, logger, nil, cfg.ControlPlane.SubscribeAckTimeout, creds)
+	// Same wiring as production start.go: zero values keep the defaults.
+	cpClient.SetTransportTuning(cfg.ControlPlane.KeepaliveTime, cfg.ControlPlane.KeepaliveTimeout, cfg.ControlPlane.ReconnectBackoffMax)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)

@@ -186,6 +186,35 @@ control_plane:
 Certificates and keys are loaded once at startup, so a bad path/PEM fails the
 start with a clear error instead of surfacing on every reconnect.
 
+### Control-plane liveness (keepalive) and reconnect backoff
+
+The daemon sends HTTP/2 keepalive pings on the control-plane connection so a
+silently dead path (cable pull, dropped NAT mapping, blackholed route) is
+detected and torn down in roughly `keepalive_time + keepalive_timeout` —
+instead of sitting `CONNECTED` for minutes until the kernel's TCP
+retransmission timeout while every proxied DNS query eats its full timeout.
+Reconnects are paced by a jittered exponential backoff (starts at 1s,
+doubles, ±20% jitter, capped at `reconnect_backoff_max`); the backoff resets
+to the floor only after a connection has stayed healthy for 30s, so a
+control plane that accepts connections and immediately drops them keeps
+backing off instead of being hammered at the floor.
+
+```yaml
+control_plane:
+  # Send a keepalive ping after this much inactivity… (default 30s; gRPC
+  # clamps the effective interval to a 10s minimum client-side)
+  keepalive_time: 30s
+  # …and declare the peer dead if no ack arrives within this (default 10s).
+  keepalive_timeout: 10s
+  # Cap on the jittered exponential reconnect backoff (default 30s).
+  reconnect_backoff_max: 30s
+```
+
+Zero/unset values mean the defaults — they do **not** disable keepalive or
+the backoff. Your control plane must permit this ping cadence in its gRPC
+keepalive enforcement policy (see below), or it will reject the daemon with
+`ENHANCE_YOUR_CALM (too_many_pings)`.
+
 ### Daemon restarts, crashes, and upgrades (pinned BPF state)
 
 The daemon pins every attachment's BPF links and rule maps to bpffs
@@ -290,6 +319,19 @@ netfenced list --all  # fetch all pages
 ## On the control plane (you implement this)
 
 Implement `ControlPlane.Connect` RPC - a bidirectional stream:
+
+Configure your gRPC server's keepalive enforcement policy to permit the
+daemon's ping cadence (`control_plane.keepalive_time`, default 30s): set
+`MinTime` at or below that interval and `PermitWithoutStream: true`. The gRPC
+default policy (5 minutes) treats the daemon's pings as abusive and closes
+the connection with `ENHANCE_YOUR_CALM (too_many_pings)`. In Go:
+
+```go
+grpc.NewServer(grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+    MinTime:             10 * time.Second,
+    PermitWithoutStream: true,
+}))
+```
 
 **Receive from daemon:**
 - `SyncRequest` on connect/reconnect (lists current attachments)

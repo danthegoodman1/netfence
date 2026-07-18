@@ -18,6 +18,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
 
 	"github.com/danthegoodman1/netfence/internal/config"
 	"github.com/danthegoodman1/netfence/internal/daemon"
@@ -300,7 +301,13 @@ func newE2ETestEnvWithOptions(t *testing.T, portMin, portMax int, subscribeAckTi
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 
-	grpcServer := grpc.NewServer()
+	// Permit the daemon's keepalive ping cadence (the documented CP-side
+	// contract): the default gRPC enforcement policy (5min) would GOAWAY
+	// the daemon with "too_many_pings".
+	grpcServer := grpc.NewServer(grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+		MinTime:             time.Second,
+		PermitWithoutStream: true,
+	}))
 	apiv1.RegisterControlPlaneServer(grpcServer, cp)
 
 	go grpcServer.Serve(listener)

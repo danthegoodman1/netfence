@@ -80,6 +80,23 @@ type ControlPlaneConfig struct {
 	// a new subscription with initial config. If the timeout is reached, the
 	// attachment is detached. Set to 0 to disable (attach proceeds without waiting).
 	SubscribeAckTimeout time.Duration `mapstructure:"subscribe_ack_timeout"`
+	// KeepaliveTime is how long the control-plane connection may be idle
+	// before the daemon sends an HTTP/2 keepalive ping; KeepaliveTimeout is
+	// how long it waits for the ping ack before declaring the peer dead and
+	// reconnecting. Together they bound dead-peer detection to roughly
+	// keepalive_time + keepalive_timeout instead of the kernel's
+	// multi-minute TCP timeout. Zero (or unset) falls back to the defaults
+	// of 30s / 10s — it does NOT disable keepalive. Note that gRPC clamps
+	// the ping interval to a 10s client-side minimum, and the control plane
+	// must permit this cadence in its keepalive enforcement policy.
+	KeepaliveTime    time.Duration `mapstructure:"keepalive_time"`
+	KeepaliveTimeout time.Duration `mapstructure:"keepalive_timeout"`
+	// ReconnectBackoffMax caps the jittered exponential backoff between
+	// control-plane reconnect attempts (starts at 1s, doubles, ±20%
+	// jitter; resets to the floor only after a connection stayed healthy).
+	// Zero (or unset) falls back to the default of 30s — it does NOT
+	// disable the backoff.
+	ReconnectBackoffMax time.Duration `mapstructure:"reconnect_backoff_max"`
 }
 
 // ControlPlaneTLSConfig configures TLS for the control-plane channel. Each
@@ -113,6 +130,9 @@ func Load(configPath string) (*Config, error) {
 	v.SetDefault("filter.bpf_pin_dir", "/sys/fs/bpf/netfence")
 	v.SetDefault("filter.detach_on_stop", false)
 	v.SetDefault("control_plane.subscribe_ack_timeout", 5*time.Second)
+	v.SetDefault("control_plane.keepalive_time", 30*time.Second)
+	v.SetDefault("control_plane.keepalive_timeout", 10*time.Second)
+	v.SetDefault("control_plane.reconnect_backoff_max", 30*time.Second)
 	v.SetDefault("ttl_janitor_interval", time.Second)
 
 	v.SetEnvPrefix("NETFENCE")
@@ -174,6 +194,15 @@ func (c *ControlPlaneConfig) validate() error {
 	}
 	if c.TLS != nil && (c.TLS.Cert == "") != (c.TLS.Key == "") {
 		return fmt.Errorf("control_plane.tls.cert and control_plane.tls.key must be set together (both present enables mTLS)")
+	}
+	if c.KeepaliveTime < 0 {
+		return fmt.Errorf("control_plane.keepalive_time must not be negative")
+	}
+	if c.KeepaliveTimeout < 0 {
+		return fmt.Errorf("control_plane.keepalive_timeout must not be negative")
+	}
+	if c.ReconnectBackoffMax < 0 {
+		return fmt.Errorf("control_plane.reconnect_backoff_max must not be negative")
 	}
 	return nil
 }

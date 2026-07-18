@@ -10,9 +10,22 @@ import (
 
 	"github.com/rs/zerolog"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
 
 	"github.com/danthegoodman1/netfence/pkg/filter"
 	apiv1 "github.com/danthegoodman1/netfence/v1"
+)
+
+const (
+	// defaultKeepaliveTime/-Timeout drive HTTP/2 keepalive pings on the
+	// control-plane connection: a ping is sent after keepaliveTime of
+	// inactivity and the connection is torn down if no ack arrives within
+	// keepaliveTimeout, so a silently dead path (cable pull, dropped NAT
+	// mapping, blackhole) is detected in ~Time+Timeout instead of waiting
+	// for the kernel's multi-minute TCP retransmission timeout. Note that
+	// grpc-go clamps the ping interval to a 10s minimum client-side.
+	defaultKeepaliveTime    = 30 * time.Second
+	defaultKeepaliveTimeout = 10 * time.Second
 )
 
 // SubscribedAckResult contains the result of waiting for a SubscribedAck.
@@ -32,6 +45,13 @@ type ControlPlaneClient struct {
 	// clients that never dial (unit tests); connect() refuses to dial
 	// without a transport credential — there is no insecure fallback.
 	creds *ControlPlaneCreds
+
+	// Transport tuning (see SetTransportTuning): keepalive ping cadence for
+	// dead-peer detection and the reconnect backoff cap. Always non-zero
+	// after NewControlPlaneClient (defaults applied there).
+	keepaliveTime       time.Duration
+	keepaliveTimeout    time.Duration
+	reconnectBackoffMax time.Duration
 
 	mu     sync.RWMutex
 	state  apiv1.ConnectionState
@@ -62,9 +82,30 @@ func NewControlPlaneClient(url string, server *Server, logger zerolog.Logger, me
 		metadata:            metadata,
 		subscribeAckTimeout: subscribeAckTimeout,
 		creds:               creds,
+		keepaliveTime:       defaultKeepaliveTime,
+		keepaliveTimeout:    defaultKeepaliveTimeout,
+		reconnectBackoffMax: defaultReconnectBackoffMax,
 		state:               apiv1.ConnectionState_CONNECTION_STATE_DISCONNECTED,
 		sendCh:              make(chan outboundEvent, 100),
 		pendingAcks:         make(map[string]chan SubscribedAckResult),
+	}
+}
+
+// SetTransportTuning overrides the connection-liveness knobs: the HTTP/2
+// keepalive ping interval and timeout (dead-peer detection) and the cap on
+// the jittered exponential reconnect backoff. A zero value keeps the
+// corresponding default — it never disables keepalive or the backoff cap
+// (the same "0 means default, not off" convention as ttl_janitor_interval).
+// Must be called before Run.
+func (c *ControlPlaneClient) SetTransportTuning(keepaliveTime, keepaliveTimeout, reconnectBackoffMax time.Duration) {
+	if keepaliveTime > 0 {
+		c.keepaliveTime = keepaliveTime
+	}
+	if keepaliveTimeout > 0 {
+		c.keepaliveTimeout = keepaliveTimeout
+	}
+	if reconnectBackoffMax > 0 {
+		c.reconnectBackoffMax = reconnectBackoffMax
 	}
 }
 
@@ -81,23 +122,35 @@ func (c *ControlPlaneClient) setState(state apiv1.ConnectionState) {
 }
 
 func (c *ControlPlaneClient) Run(ctx context.Context) {
+	// Reconnect pacing: jittered exponential backoff from the floor up to
+	// reconnectBackoffMax, so a flapping or overloaded control plane is not
+	// hammered on a fixed cadence. The schedule resets to the floor only
+	// after a connection stayed CONNECTED for cpConnectionHealthyAge — an
+	// instantly-dying connection keeps escalating instead of thrashing.
+	backoff := newReconnectBackoff(reconnectBackoffFloor, c.reconnectBackoffMax, nil)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		default:
-			c.connect(ctx)
+			connectedAt := c.connect(ctx)
+			backoff.noteOutcome(connectedAt, time.Now())
+			delay := backoff.next()
+			c.logger.Debug().Dur("delay", delay).Msg("waiting before control plane reconnect")
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(5 * time.Second):
-				// Reconnection backoff to avoid hammering the control plane
+			case <-time.After(delay):
 			}
 		}
 	}
 }
 
-func (c *ControlPlaneClient) connect(ctx context.Context) {
+// connect dials the control plane, runs the stream until it dies, and
+// returns when it became CONNECTED (the zero time if it never did) so Run
+// can distinguish a healthy-then-lost connection from one that failed
+// outright when deciding whether to reset the reconnect backoff.
+func (c *ControlPlaneClient) connect(ctx context.Context) (connectedAt time.Time) {
 	c.setState(apiv1.ConnectionState_CONNECTION_STATE_CONNECTING)
 	c.logger.Info().Str("url", c.url).Msg("connecting to control plane")
 
@@ -114,6 +167,18 @@ func (c *ControlPlaneClient) connect(ctx context.Context) {
 	if c.creds.PerRPC != nil {
 		opts = append(opts, grpc.WithPerRPCCredentials(c.creds.PerRPC))
 	}
+	// HTTP/2 keepalive: without it a silently dead TCP path leaves this
+	// connection CONNECTED (and every proxied DNS query eating its timeout)
+	// until the kernel's TCP retransmission timeout, which takes minutes.
+	// PermitWithoutStream keeps liveness checks running even between
+	// streams. The control plane must permit this cadence via its keepalive
+	// enforcement policy (see README) or it will GOAWAY with
+	// ENHANCE_YOUR_CALM ("too_many_pings").
+	opts = append(opts, grpc.WithKeepaliveParams(keepalive.ClientParameters{
+		Time:                c.keepaliveTime,
+		Timeout:             c.keepaliveTimeout,
+		PermitWithoutStream: true,
+	}))
 
 	conn, err := grpc.NewClient(c.url, opts...)
 	if err != nil {
@@ -167,6 +232,7 @@ func (c *ControlPlaneClient) connect(ctx context.Context) {
 	}
 
 	c.setState(apiv1.ConnectionState_CONNECTION_STATE_CONNECTED)
+	connectedAt = time.Now()
 	c.logger.Info().Msg("connected to control plane")
 
 	errCh := make(chan error, 2)
@@ -185,6 +251,7 @@ func (c *ControlPlaneClient) connect(ctx context.Context) {
 
 	c.setState(apiv1.ConnectionState_CONNECTION_STATE_DISCONNECTED)
 	c.logger.Info().Msg("disconnected from control plane")
+	return connectedAt
 }
 
 func (c *ControlPlaneClient) sendLoop(ctx context.Context, stream grpc.BidiStreamingClient[apiv1.DaemonEvent, apiv1.ControlCommand], errCh chan<- error) {

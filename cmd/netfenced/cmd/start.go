@@ -85,6 +85,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 			logger.Warn().Msg("control_plane.auth_token is set with control_plane.insecure: true — the bearer token will be sent over an unencrypted connection")
 		}
 		cpClient := daemon.NewControlPlaneClient(cfg.ControlPlane.URL, server, logger, cfg.Metadata, cfg.ControlPlane.SubscribeAckTimeout, creds)
+		cpClient.SetTransportTuning(cfg.ControlPlane.KeepaliveTime, cfg.ControlPlane.KeepaliveTimeout, cfg.ControlPlane.ReconnectBackoffMax)
 		server.SetControlPlaneClient(cpClient)
 		go cpClient.Run(ctx)
 	}

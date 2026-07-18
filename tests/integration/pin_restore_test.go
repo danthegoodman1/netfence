@@ -28,6 +28,7 @@ import (
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	apiv1 "github.com/danthegoodman1/netfence/v1"
@@ -235,7 +236,13 @@ func startCP(t *testing.T) (*testControlPlane, string, func()) {
 	cp := newTestControlPlane()
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
-	gs := grpc.NewServer()
+	// Permit the daemon's keepalive ping cadence (the documented CP-side
+	// contract): the default gRPC enforcement policy (5min) would GOAWAY
+	// the daemon with "too_many_pings".
+	gs := grpc.NewServer(grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+		MinTime:             time.Second,
+		PermitWithoutStream: true,
+	}))
 	apiv1.RegisterControlPlaneServer(gs, cp)
 	go gs.Serve(lis)
 	var once sync.Once
