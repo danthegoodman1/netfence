@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -505,4 +506,120 @@ func TestDirectionMigrationAddsColumnToOldSchema(t *testing.T) {
 	got, err = st.GetAttachment("new-row")
 	require.NoError(t, err)
 	assert.Equal(t, "TC_DIRECTION_INGRESS", got.Direction)
+}
+
+func TestDaemonIDStableAcrossReopen(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "netfence.db")
+	st, err := New(dbPath)
+	require.NoError(t, err)
+
+	first, err := st.GetOrCreateDaemonID()
+	require.NoError(t, err)
+	_, err = uuid.Parse(first)
+	require.NoError(t, err, "daemon id must be a valid UUID, got %q", first)
+	assert.NotContains(t, first, "netfenced-", "daemon id must not be hostname-coupled")
+	require.NoError(t, st.Close())
+
+	// Reopen: simulates a daemon restart against the same data dir.
+	st, err = New(dbPath)
+	require.NoError(t, err)
+	defer st.Close()
+
+	second, err := st.GetOrCreateDaemonID()
+	require.NoError(t, err)
+	assert.Equal(t, first, second, "daemon id must be stable across store reopen")
+}
+
+func TestDaemonIDDistinctPerDataDir(t *testing.T) {
+	a, err := New(filepath.Join(t.TempDir(), "netfence.db"))
+	require.NoError(t, err)
+	defer a.Close()
+	b, err := New(filepath.Join(t.TempDir(), "netfence.db"))
+	require.NoError(t, err)
+	defer b.Close()
+
+	idA, err := a.GetOrCreateDaemonID()
+	require.NoError(t, err)
+	idB, err := b.GetOrCreateDaemonID()
+	require.NoError(t, err)
+	assert.NotEqual(t, idA, idB, "two daemons with different data dirs must not share an id")
+}
+
+func TestDaemonIDIdempotentSingleRow(t *testing.T) {
+	st := newTestStore(t)
+
+	first, err := st.GetOrCreateDaemonID()
+	require.NoError(t, err)
+	second, err := st.GetOrCreateDaemonID()
+	require.NoError(t, err)
+	assert.Equal(t, first, second)
+
+	var count int
+	require.NoError(t, st.db.QueryRow(
+		`SELECT COUNT(*) FROM metadata WHERE key = 'daemon_id'`,
+	).Scan(&count))
+	assert.Equal(t, 1, count, "repeated calls must not create extra rows")
+}
+
+func TestDaemonIDMemoryStore(t *testing.T) {
+	st, err := New(":memory:")
+	require.NoError(t, err)
+	defer st.Close()
+
+	first, err := st.GetOrCreateDaemonID()
+	require.NoError(t, err)
+	_, err = uuid.Parse(first)
+	require.NoError(t, err, "daemon id must be a valid UUID, got %q", first)
+
+	second, err := st.GetOrCreateDaemonID()
+	require.NoError(t, err)
+	assert.Equal(t, first, second, "daemon id must be stable within a store instance")
+}
+
+func TestDaemonIDMigrationAddsMetadataTableToOldSchema(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "netfence.db")
+
+	// Create a database that predates the metadata table (attachments only).
+	db, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	_, err = db.Exec(`
+		CREATE TABLE attachments (
+			id TEXT PRIMARY KEY,
+			target TEXT NOT NULL,
+			type TEXT NOT NULL,
+			mode TEXT NOT NULL,
+			dns_mode TEXT NOT NULL,
+			dns_address TEXT NOT NULL,
+			metadata TEXT NOT NULL,
+			attached_at TEXT NOT NULL
+		) STRICT, WITHOUT ROWID
+	`)
+	require.NoError(t, err)
+	_, err = db.Exec(`
+		INSERT INTO attachments (id, target, type, mode, dns_mode, dns_address, metadata, attached_at)
+		VALUES ('old-row', 'nf-old', 'ATTACHMENT_TYPE_TC', 'POLICY_MODE_DISABLED', 'DNS_MODE_DISABLED', '127.0.0.1:12000', '{}', '2026-05-27T12:00:00Z')
+	`)
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+
+	// Opening the store adds the metadata table additively; existing rows are
+	// untouched and an id is generated and persisted once.
+	st, err := New(dbPath)
+	require.NoError(t, err)
+	first, err := st.GetOrCreateDaemonID()
+	require.NoError(t, err)
+	_, err = uuid.Parse(first)
+	require.NoError(t, err)
+
+	got, err := st.GetAttachment("old-row")
+	require.NoError(t, err)
+	assert.Equal(t, "nf-old", got.Target)
+	require.NoError(t, st.Close())
+
+	st, err = New(dbPath)
+	require.NoError(t, err)
+	defer st.Close()
+	second, err := st.GetOrCreateDaemonID()
+	require.NoError(t, err)
+	assert.Equal(t, first, second)
 }

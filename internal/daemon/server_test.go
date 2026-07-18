@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -114,6 +115,48 @@ func TestNewServerRestoresIPv6DNSPortReservation(t *testing.T) {
 	server.mu.RLock()
 	defer server.mu.RUnlock()
 	assert.True(t, server.portPool[12005])
+}
+
+// TestDaemonIDStableAcrossRestartAndUniquePerDataDir verifies the identity
+// contract from control.proto ("stable across restarts"): a daemon built on a
+// file-backed store reports the same UUID after a simulated restart, and two
+// daemons with different data dirs never share an id (the old
+// netfenced-<hostname> scheme collided for co-hosted daemons).
+func TestDaemonIDStableAcrossRestartAndUniquePerDataDir(t *testing.T) {
+	newServerAt := func(dataDir string) (*Server, *store.Store) {
+		cfg := &config.Config{
+			DataDir: dataDir,
+			DNS: config.DNSConfig{
+				ListenAddr: "127.0.0.1",
+				PortMin:    12000,
+				PortMax:    12010,
+				Upstream:   "127.0.0.1:1",
+			},
+		}
+		st, err := store.New(cfg.DBPath())
+		require.NoError(t, err)
+		server, err := NewServer(cfg, st, zerolog.Nop(), "test")
+		require.NoError(t, err)
+		return server, st
+	}
+
+	dirA := t.TempDir()
+	serverA, stA := newServerAt(dirA)
+	idA := serverA.DaemonID()
+	_, err := uuid.Parse(idA)
+	assert.NoError(t, err, "daemon id must be a valid UUID, got %q", idA)
+	assert.NotContains(t, idA, "netfenced-", "daemon id must not be hostname-coupled")
+	require.NoError(t, stA.Close())
+
+	// Simulated restart: a fresh Server over the same data dir.
+	restartedA, stA2 := newServerAt(dirA)
+	defer stA2.Close()
+	assert.Equal(t, idA, restartedA.DaemonID(), "daemon id must be stable across restarts")
+
+	// A daemon with a different data dir must get a different id.
+	serverB, stB := newServerAt(t.TempDir())
+	defer stB.Close()
+	assert.NotEqual(t, idA, serverB.DaemonID(), "daemons with different data dirs must not share an id")
 }
 
 func TestServerReplaceDNSRulesPersists(t *testing.T) {

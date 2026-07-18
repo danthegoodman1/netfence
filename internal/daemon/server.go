@@ -73,11 +73,12 @@ type attachmentState struct {
 func NewServer(cfg *config.Config, st *store.Store, logger zerolog.Logger, version string) (*Server, error) {
 	hostname, _ := os.Hostname()
 
-	daemonID := cfg.DataDir
-	if daemonID == "" {
-		daemonID = uuid.Must(uuid.NewV7()).String()
-	} else {
-		daemonID = fmt.Sprintf("netfenced-%s", hostname)
+	// The proto promises the daemon id is stable across restarts, so it lives
+	// in the store: file-backed stores (data_dir set) yield the same UUID on
+	// every boot, while :memory: stores get a fresh ephemeral one per process.
+	daemonID, err := st.GetOrCreateDaemonID()
+	if err != nil {
+		return nil, fmt.Errorf("resolving daemon id: %w", err)
 	}
 
 	janitorInterval := cfg.TTLJanitorInterval

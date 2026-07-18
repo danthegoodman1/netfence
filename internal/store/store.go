@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	_ "github.com/mattn/go-sqlite3"
 )
 
@@ -113,6 +114,16 @@ func migrate(db *sql.DB) error {
 	`); err != nil {
 		return err
 	}
+	// Small key/value table for daemon-level state (e.g. the persisted daemon
+	// id). Additive: databases created before this table existed gain it here.
+	if _, err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS metadata (
+			key TEXT PRIMARY KEY,
+			value TEXT NOT NULL
+		) STRICT, WITHOUT ROWID
+	`); err != nil {
+		return err
+	}
 	return migrateAttachedAtFormat(db)
 }
 
@@ -170,6 +181,31 @@ func migrateAttachedAtFormat(db *sql.DB) error {
 
 func (s *Store) Close() error {
 	return s.db.Close()
+}
+
+// GetOrCreateDaemonID returns the persisted daemon identifier, generating and
+// persisting a fresh UUID on first call. The INSERT OR IGNORE + SELECT pair
+// makes it race-safe and idempotent: a pre-existing id always wins and is
+// never overwritten, so the id is stable for the lifetime of the database
+// (across restarts for file-backed stores; per-instance for :memory:).
+func (s *Store) GetOrCreateDaemonID() (string, error) {
+	fresh, err := uuid.NewV7()
+	if err != nil {
+		return "", fmt.Errorf("generating daemon id: %w", err)
+	}
+	if _, err := s.db.Exec(
+		`INSERT OR IGNORE INTO metadata (key, value) VALUES ('daemon_id', ?)`,
+		fresh.String(),
+	); err != nil {
+		return "", fmt.Errorf("persisting daemon id: %w", err)
+	}
+	var id string
+	if err := s.db.QueryRow(
+		`SELECT value FROM metadata WHERE key = 'daemon_id'`,
+	).Scan(&id); err != nil {
+		return "", fmt.Errorf("reading daemon id: %w", err)
+	}
+	return id, nil
 }
 
 func (s *Store) SaveAttachment(a *Attachment) error {
