@@ -53,6 +53,12 @@ type Server struct {
 	// maxRuleEntries sizes each eBPF rule map at filter load time
 	// (see config filter.max_rule_entries; 0 = compiled-in default).
 	maxRuleEntries uint32
+
+	// newFilter constructs the eBPF filter for an attachment. It is a struct
+	// field (always createFilter in production, set once in NewServer and
+	// never reassigned) purely so unit tests can inject fake filters and
+	// forced construction failures.
+	newFilter func(target string, attachType apiv1.AttachmentType, mode apiv1.PolicyMode, direction apiv1.TcDirection, maxRuleEntries uint32) (filter.Filter, error)
 }
 
 type attachmentState struct {
@@ -104,6 +110,7 @@ func NewServer(cfg *config.Config, st *store.Store, logger zerolog.Logger, versi
 		janitorStop:        make(chan struct{}),
 		dnsMinFilterTTL:    dnsMinFilterTTL,
 		maxRuleEntries:     maxRuleEntries,
+		newFilter:          createFilter,
 	}
 
 	s.watcher = NewTargetWatcher(logger, s.handleTargetRemoved)
@@ -119,8 +126,12 @@ func NewServer(cfg *config.Config, st *store.Store, logger zerolog.Logger, versi
 	for i := range existing {
 		s.attachments[existing[i].ID] = &attachmentState{info: &existing[i], ttls: newTTLRegistry()}
 		s.targetIndex[existing[i].Target] = existing[i].ID
+		// Only mark ports that belong to the configured pool: a persisted
+		// port outside [PortMin, PortMax] (e.g. after a config change) must
+		// not be inserted as a poolable key, or a later release would let
+		// allocatePort hand out an out-of-range port.
 		port := extractPort(existing[i].DnsAddress)
-		if port > 0 {
+		if _, ok := s.portPool[port]; ok {
 			s.portPool[port] = true
 		}
 	}
@@ -140,7 +151,7 @@ func (s *Server) Start() error {
 		mode := parsePolicyMode(state.info.Mode)
 		direction := parseTcDirection(state.info.Direction)
 
-		ebpfFilter, err := createFilter(state.info.Target, attachType, mode, direction, s.maxRuleEntries)
+		ebpfFilter, err := s.newFilter(state.info.Target, attachType, mode, direction, s.maxRuleEntries)
 		if err != nil {
 			s.logger.Warn().Err(err).
 				Str("id", id).
@@ -431,19 +442,98 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (*apiv1.A
 		attachment.Direction = direction.String()
 	}
 
-	if err := s.store.SaveAttachment(attachment); err != nil {
-		s.mu.Lock()
-		s.releasePort(port)
-		s.mu.Unlock()
-		return nil, fmt.Errorf("saving attachment: %w", err)
-	}
+	// Staged setup with a single deferred rollback. Resources are acquired
+	// in order (port -> filter -> DNS server -> store row -> registration ->
+	// watch -> CP subscribe) and the rollback unwinds exactly the stages
+	// reached, in reverse, so every failure/early return leaks nothing and
+	// frees each resource exactly once. `committed` flips only after the
+	// final under-lock liveness check.
+	var (
+		ebpfFilter filter.Filter
+		dnsServer  *DNSServer
+		ttls       = newTTLRegistry()
+		rowSaved   bool
+		registered *attachmentState
+		notifyCP   bool
+		committed  bool
+	)
+	defer func() {
+		if committed {
+			return
+		}
+		if registered != nil {
+			// The attachment was publicly visible, so a concurrent Detach or
+			// target removal may already own its teardown. Claim ownership by
+			// removing the registration under s.mu: if it is already gone,
+			// the remover tore down EVERYTHING (filter, DNS, port, store row,
+			// watch) and this rollback must be a no-op — anything else would
+			// double-free.
+			s.mu.Lock()
+			if s.attachments[id] != registered {
+				s.mu.Unlock()
+				return
+			}
+			delete(s.attachments, id)
+			delete(s.targetIndex, target)
+			s.releasePort(port)
+			switch attachType {
+			case apiv1.AttachmentType_ATTACHMENT_TYPE_TC:
+				s.watcher.UnwatchInterface(target)
+			case apiv1.AttachmentType_ATTACHMENT_TYPE_CGROUP:
+				s.watcher.UnwatchCgroup(target)
+			}
+			s.mu.Unlock()
 
-	ebpfFilter, err := createFilter(target, attachType, mode, direction, s.maxRuleEntries)
-	if err != nil {
+			// Drop TTL bookkeeping so an in-flight janitor sweep does not
+			// keep retrying removals against the filter we are closing.
+			ttls.purge()
+
+			if err := dnsServer.Stop(); err != nil {
+				s.logger.Warn().Err(err).Str("id", id).Msg("error stopping DNS server during attach rollback")
+			}
+			if err := ebpfFilter.Close(); err != nil {
+				s.logger.Warn().Err(err).Str("id", id).Msg("error closing eBPF filter during attach rollback")
+			}
+			if err := s.store.DeleteAttachment(id); err != nil {
+				s.logger.Error().Err(err).Str("id", id).Msg("error deleting attachment from store during attach rollback")
+			}
+
+			if notifyCP {
+				if cpClient := s.cpClient.Load(); cpClient != nil {
+					cpClient.SendUnsubscribed(&apiv1.Unsubscribed{
+						Id:     id,
+						Reason: apiv1.UnsubscribeReason_UNSUBSCRIBE_REASON_ERROR,
+						Error:  "control plane subscription failed",
+					})
+				}
+			}
+			return
+		}
+
+		// Pre-registration: nothing else can see these resources, so unwind
+		// whatever was staged, in reverse acquisition order.
+		if dnsServer != nil {
+			if err := dnsServer.Stop(); err != nil {
+				s.logger.Warn().Err(err).Str("id", id).Msg("error stopping DNS server during attach rollback")
+			}
+		}
+		if ebpfFilter != nil {
+			if err := ebpfFilter.Close(); err != nil {
+				s.logger.Warn().Err(err).Str("id", id).Msg("error closing eBPF filter during attach rollback")
+			}
+		}
+		if rowSaved {
+			if err := s.store.DeleteAttachment(id); err != nil {
+				s.logger.Error().Err(err).Str("id", id).Msg("error deleting attachment from store during attach rollback")
+			}
+		}
 		s.mu.Lock()
 		s.releasePort(port)
 		s.mu.Unlock()
-		s.store.DeleteAttachment(id)
+	}()
+
+	ebpfFilter, err = s.newFilter(target, attachType, mode, direction, s.maxRuleEntries)
+	if err != nil {
 		return nil, fmt.Errorf("creating eBPF filter: %w", err)
 	}
 
@@ -451,35 +541,33 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (*apiv1.A
 	if cpClient := s.cpClient.Load(); cpClient != nil {
 		proxyFunc = cpClient.MakeProxyFunc(id)
 	}
-	ttls := newTTLRegistry()
 	sink := s.newDNSFilterSink(id, ebpfFilter, ttls)
-	dnsServer := NewDNSServer(id, dnsAddr, s.cfg.DNS.Upstream, s.logger, sink, proxyFunc)
+	dnsServer = NewDNSServer(id, dnsAddr, s.cfg.DNS.Upstream, s.logger, sink, proxyFunc)
 	if err := dnsServer.Start(); err != nil {
-		if ebpfFilter != nil {
-			ebpfFilter.Close()
-		}
-		s.mu.Lock()
-		s.releasePort(port)
-		s.mu.Unlock()
-		s.store.DeleteAttachment(id)
+		dnsServer = nil // never started; nothing to stop
 		return nil, fmt.Errorf("starting DNS server: %w", err)
 	}
 
+	// Persist only after the enforcing resources (filter + DNS) exist: a
+	// crash before this point leaves no store row, so restore never
+	// resurrects an attachment that was never enforcing.
+	if err := s.store.SaveAttachment(attachment); err != nil {
+		return nil, fmt.Errorf("saving attachment: %w", err)
+	}
+	rowSaved = true
+
+	state := &attachmentState{info: attachment, dns: dnsServer, filter: ebpfFilter, ttls: ttls}
 	s.mu.Lock()
 	if existingID, ok := s.targetIndex[target]; ok {
 		s.mu.Unlock()
-		dnsServer.Stop()
-		if ebpfFilter != nil {
-			ebpfFilter.Close()
-		}
-		s.mu.Lock()
-		s.releasePort(port)
-		s.mu.Unlock()
-		s.store.DeleteAttachment(id)
 		return nil, fmt.Errorf("target already attached: %s (%s)", target, existingID)
 	}
-	s.attachments[id] = &attachmentState{info: attachment, dns: dnsServer, filter: ebpfFilter, ttls: ttls}
+	s.attachments[id] = state
 	s.targetIndex[target] = id
+	// Arm the post-registration rollback regime while still under s.mu, so the
+	// deferred cleanup can never observe a publicly-registered attachment with
+	// registered still nil.
+	registered = state
 	s.mu.Unlock()
 
 	switch attachType {
@@ -488,7 +576,6 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (*apiv1.A
 	case apiv1.AttachmentType_ATTACHMENT_TYPE_CGROUP:
 		if err := s.watcher.WatchCgroup(target); err != nil {
 			s.logger.Error().Err(err).Str("target", target).Msg("failed to watch cgroup")
-			s.cleanupAttachment(id, target, attachType, port, dnsServer, ebpfFilter, false)
 			return nil, fmt.Errorf("watching cgroup: %w", err)
 		}
 	}
@@ -503,9 +590,7 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (*apiv1.A
 	}
 	logEvent.Msg("attached filter")
 
-	cpClient := s.cpClient.Load()
-
-	if cpClient != nil {
+	if cpClient := s.cpClient.Load(); cpClient != nil {
 		sub := &apiv1.Subscribed{
 			Id:          id,
 			Target:      target,
@@ -517,13 +602,28 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (*apiv1.A
 			TcDirection: direction,
 		}
 
-		_, err := cpClient.SubscribeAndWait(ctx, sub)
-		if err != nil {
+		// s.mu is NOT held here: SubscribeAndWait can block for the full
+		// subscribe_ack_timeout.
+		if _, err := cpClient.SubscribeAndWait(ctx, sub); err != nil {
 			s.logger.Error().Err(err).Str("id", id).Msg("control plane subscription failed, detaching")
-			s.cleanupAttachment(id, target, attachType, port, dnsServer, ebpfFilter, true)
+			notifyCP = true
 			return nil, fmt.Errorf("control plane subscription failed: %w", err)
 		}
 	}
+
+	// Commit: the attachment must still be live. A concurrent Detach or
+	// target removal during the (unlocked) subscribe wait tears the
+	// attachment down completely — returning success then would hand the
+	// caller an attachment that nothing is enforcing. The rollback above is
+	// a guaranteed no-op in that case (ownership check), so this error path
+	// never double-frees.
+	s.mu.Lock()
+	if s.attachments[id] != registered {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("attachment was detached during setup: %s", id)
+	}
+	committed = true
+	s.mu.Unlock()
 
 	return &apiv1.AttachResponse{
 		Id:         id,
@@ -996,49 +1096,6 @@ func (s *Server) filterAndRegistry(id string) (filter.Filter, *ttlRegistry, erro
 		return nil, nil, fmt.Errorf("attachment not found: %s", id)
 	}
 	return state.filter, state.ttls, nil
-}
-
-func (s *Server) cleanupAttachment(id, target string, attachType apiv1.AttachmentType, port int, dnsServer *DNSServer, ebpfFilter filter.Filter, notifyControlPlane bool) {
-	s.mu.Lock()
-	// Check if attachment still exists - it may have already been cleaned up
-	// by the target watcher if the interface/cgroup was removed while we were
-	// waiting for SubscribedAck
-	state, exists := s.attachments[id]
-	if !exists {
-		s.mu.Unlock()
-		return
-	}
-
-	s.releasePort(port)
-	switch attachType {
-	case apiv1.AttachmentType_ATTACHMENT_TYPE_TC:
-		s.watcher.UnwatchInterface(target)
-	case apiv1.AttachmentType_ATTACHMENT_TYPE_CGROUP:
-		s.watcher.UnwatchCgroup(target)
-	}
-	delete(s.attachments, id)
-	delete(s.targetIndex, target)
-	s.mu.Unlock()
-
-	state.ttls.purge()
-
-	if dnsServer != nil {
-		dnsServer.Stop()
-	}
-	if ebpfFilter != nil {
-		ebpfFilter.Close()
-	}
-	s.store.DeleteAttachment(id)
-
-	if notifyControlPlane {
-		if cpClient := s.cpClient.Load(); cpClient != nil {
-			cpClient.SendUnsubscribed(&apiv1.Unsubscribed{
-				Id:     id,
-				Reason: apiv1.UnsubscribeReason_UNSUBSCRIBE_REASON_ERROR,
-				Error:  "control plane subscription failed",
-			})
-		}
-	}
 }
 
 func (s *Server) allocatePort() (int, error) {

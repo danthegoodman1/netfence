@@ -25,6 +25,7 @@ type fakeFilter struct {
 	stats        filter.Stats
 	setModeCalls int
 	allowCalls   int
+	closeCalls   int
 	allowErr     error // when set, AllowIP fails with this error
 	// removedAllowed/removedDenied record every Remove call (even for CIDRs
 	// not present, mirroring the real filter's idempotent removes), so tests
@@ -128,7 +129,21 @@ func (f *fakeFilter) GetStats() (filter.Stats, error) {
 	return f.stats, nil
 }
 
-func (f *fakeFilter) Close() error { return nil }
+func (f *fakeFilter) Close() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.closeCalls++
+	return nil
+}
+
+// closeCallCount reports how many times Close ran, so tests can prove
+// exactly-once teardown (no double-close between a racing Detach and an
+// Attach rollback).
+func (f *fakeFilter) closeCallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.closeCalls
+}
 
 func (f *fakeFilter) snapshot() (filter.PolicyMode, []string, []string, int) {
 	f.mu.Lock()
