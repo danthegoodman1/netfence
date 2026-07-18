@@ -251,7 +251,7 @@ func (c *ControlPlaneClient) handleCommand(cmd *apiv1.ControlCommand) {
 			c.logger.Error().Err(err).Str("id", cmd.Id).Str("cidr", v.AllowCidr.Cidr).Msg("failed to parse CIDR")
 			return
 		}
-		if err := c.server.AllowCIDR(cmd.Id, cidr); err != nil {
+		if err := c.server.AllowCIDR(cmd.Id, cidr, v.AllowCidr.GetTtl().AsDuration()); err != nil {
 			c.logger.Error().Err(err).Str("id", cmd.Id).Msg("failed to allow CIDR")
 		}
 
@@ -262,7 +262,7 @@ func (c *ControlPlaneClient) handleCommand(cmd *apiv1.ControlCommand) {
 			c.logger.Error().Err(err).Str("id", cmd.Id).Str("cidr", v.DenyCidr.Cidr).Msg("failed to parse CIDR")
 			return
 		}
-		if err := c.server.DenyCIDR(cmd.Id, cidr); err != nil {
+		if err := c.server.DenyCIDR(cmd.Id, cidr, v.DenyCidr.GetTtl().AsDuration()); err != nil {
 			c.logger.Error().Err(err).Str("id", cmd.Id).Msg("failed to deny CIDR")
 		}
 
@@ -434,7 +434,7 @@ func (c *ControlPlaneClient) applySubscribedAck(id string, ack *apiv1.Subscribed
 			c.logger.Error().Err(err).Str("id", id).Str("cidr", entry.Cidr).Msg("failed to parse allow CIDR in subscribed ack")
 			continue
 		}
-		if err := c.server.AllowCIDR(id, cidr); err != nil {
+		if err := c.server.AllowCIDR(id, cidr, entry.GetTtl().AsDuration()); err != nil {
 			c.logger.Error().Err(err).Str("id", id).Str("cidr", entry.Cidr).Msg("failed to allow CIDR in subscribed ack")
 		}
 	}
@@ -445,7 +445,7 @@ func (c *ControlPlaneClient) applySubscribedAck(id string, ack *apiv1.Subscribed
 			c.logger.Error().Err(err).Str("id", id).Str("cidr", entry.Cidr).Msg("failed to parse deny CIDR in subscribed ack")
 			continue
 		}
-		if err := c.server.DenyCIDR(id, cidr); err != nil {
+		if err := c.server.DenyCIDR(id, cidr, entry.GetTtl().AsDuration()); err != nil {
 			c.logger.Error().Err(err).Str("id", id).Str("cidr", entry.Cidr).Msg("failed to deny CIDR in subscribed ack")
 		}
 	}
@@ -474,15 +474,15 @@ func (c *ControlPlaneClient) applyBulkUpdate(id string, update *apiv1.BulkUpdate
 		return
 	}
 
-	for _, cidr := range allowCIDRs {
-		if err := c.server.AllowCIDR(id, cidr); err != nil {
-			c.logger.Error().Err(err).Str("id", id).Str("cidr", cidr.String()).Msg("failed to allow CIDR in bulk update")
+	for _, entry := range allowCIDRs {
+		if err := c.server.AllowCIDR(id, entry.cidr, entry.ttl); err != nil {
+			c.logger.Error().Err(err).Str("id", id).Str("cidr", entry.cidr.String()).Msg("failed to allow CIDR in bulk update")
 		}
 	}
 
-	for _, cidr := range denyCIDRs {
-		if err := c.server.DenyCIDR(id, cidr); err != nil {
-			c.logger.Error().Err(err).Str("id", id).Str("cidr", cidr.String()).Msg("failed to deny CIDR in bulk update")
+	for _, entry := range denyCIDRs {
+		if err := c.server.DenyCIDR(id, entry.cidr, entry.ttl); err != nil {
+			c.logger.Error().Err(err).Str("id", id).Str("cidr", entry.cidr.String()).Msg("failed to deny CIDR in bulk update")
 		}
 	}
 
@@ -497,14 +497,20 @@ func (c *ControlPlaneClient) applyBulkUpdate(id string, update *apiv1.BulkUpdate
 	}
 }
 
-func (c *ControlPlaneClient) parseBulkCIDRs(id string, update *apiv1.BulkUpdate) (allowCIDRs, denyCIDRs []*net.IPNet, ok bool) {
+// parsedCIDR is a parsed CIDREntry: the network plus its TTL (0 = permanent).
+type parsedCIDR struct {
+	cidr *net.IPNet
+	ttl  time.Duration
+}
+
+func (c *ControlPlaneClient) parseBulkCIDRs(id string, update *apiv1.BulkUpdate) (allowCIDRs, denyCIDRs []parsedCIDR, ok bool) {
 	for _, entry := range update.AllowCidrs {
 		cidr, err := filter.ParseCIDR(entry.Cidr)
 		if err != nil {
 			c.logger.Error().Err(err).Str("id", id).Str("cidr", entry.Cidr).Msg("failed to parse allow CIDR in bulk update")
 			return nil, nil, false
 		}
-		allowCIDRs = append(allowCIDRs, cidr)
+		allowCIDRs = append(allowCIDRs, parsedCIDR{cidr: cidr, ttl: entry.GetTtl().AsDuration()})
 	}
 
 	for _, entry := range update.DenyCidrs {
@@ -513,7 +519,7 @@ func (c *ControlPlaneClient) parseBulkCIDRs(id string, update *apiv1.BulkUpdate)
 			c.logger.Error().Err(err).Str("id", id).Str("cidr", entry.Cidr).Msg("failed to parse deny CIDR in bulk update")
 			return nil, nil, false
 		}
-		denyCIDRs = append(denyCIDRs, cidr)
+		denyCIDRs = append(denyCIDRs, parsedCIDR{cidr: cidr, ttl: entry.GetTtl().AsDuration()})
 	}
 
 	return allowCIDRs, denyCIDRs, true

@@ -35,8 +35,8 @@ func TestApplyBulkUpdateReplacesExistingState(t *testing.T) {
 	require.NoError(t, err)
 	oldDeny, err := filter.ParseCIDR("192.0.2.0/24")
 	require.NoError(t, err)
-	require.NoError(t, server.AllowCIDR(id, oldAllow))
-	require.NoError(t, server.DenyCIDR(id, oldDeny))
+	require.NoError(t, server.AllowCIDR(id, oldAllow, 0))
+	require.NoError(t, server.DenyCIDR(id, oldDeny, 0))
 	require.NoError(t, server.ReplaceDNSRules(
 		id,
 		apiv1.DnsMode_DNS_MODE_DENYLIST,
@@ -97,7 +97,7 @@ func TestApplyBulkUpdateRejectsInvalidCIDRBeforeClearingExistingState(t *testing
 
 	oldAllow, err := filter.ParseCIDR("10.0.0.0/8")
 	require.NoError(t, err)
-	require.NoError(t, server.AllowCIDR(id, oldAllow))
+	require.NoError(t, server.AllowCIDR(id, oldAllow, 0))
 	require.NoError(t, server.ReplaceDNSRules(id, apiv1.DnsMode_DNS_MODE_DENYLIST, nil, []*apiv1.DomainEntry{{Domain: "old-deny.test"}}))
 
 	c.applyBulkUpdate(id, &apiv1.BulkUpdate{

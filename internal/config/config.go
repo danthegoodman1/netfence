@@ -15,6 +15,11 @@ type Config struct {
 	LogLevel     string             `mapstructure:"log_level"`
 	Socket       string             `mapstructure:"socket"`
 	Metadata     map[string]string  `mapstructure:"metadata"`
+	// TTLJanitorInterval is how often the daemon scans attachments for
+	// expired TTL'd rules and removes them from the eBPF filters. It bounds
+	// how long past its TTL an entry can linger. Zero (or unset) falls back
+	// to the default of 1s — it does NOT disable the janitor.
+	TTLJanitorInterval time.Duration `mapstructure:"ttl_janitor_interval"`
 }
 
 type DNSConfig struct {
@@ -42,6 +47,7 @@ func Load(configPath string) (*Config, error) {
 	v.SetDefault("log_level", "info")
 	v.SetDefault("socket", "/var/run/netfence.sock")
 	v.SetDefault("control_plane.subscribe_ack_timeout", 5*time.Second)
+	v.SetDefault("ttl_janitor_interval", time.Second)
 
 	v.SetEnvPrefix("NETFENCE")
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
@@ -72,6 +78,9 @@ func (c *Config) Validate() error {
 	}
 	if c.DNS.PortMin < 1 || c.DNS.PortMax > 65535 {
 		return fmt.Errorf("dns port range must be within 1-65535")
+	}
+	if c.TTLJanitorInterval < 0 {
+		return fmt.Errorf("ttl_janitor_interval must not be negative")
 	}
 	return nil
 }

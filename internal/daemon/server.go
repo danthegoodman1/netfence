@@ -38,12 +38,22 @@ type Server struct {
 
 	cpClient atomic.Pointer[ControlPlaneClient]
 	watcher  *TargetWatcher
+
+	// TTL janitor state. now is injectable for deterministic tests.
+	now                func() time.Time
+	ttlJanitorInterval time.Duration
+	janitorStop        chan struct{}
+	janitorStopOnce    sync.Once
+	janitorWG          sync.WaitGroup
 }
 
 type attachmentState struct {
 	info   *store.Attachment
 	dns    *DNSServer
 	filter filter.Filter
+	// ttls tracks expiry deadlines for this attachment's TTL'd CIDR entries
+	// and serializes its CIDR-rule mutations. See ttlRegistry.
+	ttls *ttlRegistry
 }
 
 func NewServer(cfg *config.Config, st *store.Store, logger zerolog.Logger, version string) (*Server, error) {
@@ -56,16 +66,24 @@ func NewServer(cfg *config.Config, st *store.Store, logger zerolog.Logger, versi
 		daemonID = fmt.Sprintf("netfenced-%s", hostname)
 	}
 
+	janitorInterval := cfg.TTLJanitorInterval
+	if janitorInterval <= 0 {
+		janitorInterval = time.Second
+	}
+
 	s := &Server{
-		cfg:         cfg,
-		store:       st,
-		logger:      logger.With().Str("component", "daemon").Logger(),
-		daemonID:    daemonID,
-		hostname:    hostname,
-		version:     version,
-		portPool:    make(map[int]bool),
-		attachments: make(map[string]*attachmentState),
-		targetIndex: make(map[string]string),
+		cfg:                cfg,
+		store:              st,
+		logger:             logger.With().Str("component", "daemon").Logger(),
+		daemonID:           daemonID,
+		hostname:           hostname,
+		version:            version,
+		portPool:           make(map[int]bool),
+		attachments:        make(map[string]*attachmentState),
+		targetIndex:        make(map[string]string),
+		now:                time.Now,
+		ttlJanitorInterval: janitorInterval,
+		janitorStop:        make(chan struct{}),
 	}
 
 	s.watcher = NewTargetWatcher(logger, s.handleTargetRemoved)
@@ -79,7 +97,7 @@ func NewServer(cfg *config.Config, st *store.Store, logger zerolog.Logger, versi
 		return nil, fmt.Errorf("loading existing attachments: %w", err)
 	}
 	for i := range existing {
-		s.attachments[existing[i].ID] = &attachmentState{info: &existing[i]}
+		s.attachments[existing[i].ID] = &attachmentState{info: &existing[i], ttls: newTTLRegistry()}
 		s.targetIndex[existing[i].Target] = existing[i].ID
 		port := extractPort(existing[i].DnsAddress)
 		if port > 0 {
@@ -180,10 +198,18 @@ func (s *Server) Start() error {
 		return fmt.Errorf("starting target watcher: %w", err)
 	}
 
+	s.janitorWG.Add(1)
+	go s.runTTLJanitor()
+
 	return nil
 }
 
 func (s *Server) Stop() {
+	// Stop the janitor before closing filters so a sweep never races with
+	// wholesale filter teardown.
+	s.janitorStopOnce.Do(func() { close(s.janitorStop) })
+	s.janitorWG.Wait()
+
 	s.watcher.Stop()
 
 	s.mu.Lock()
@@ -199,6 +225,65 @@ func (s *Server) Stop() {
 		}
 		if state.filter != nil {
 			state.filter.Close()
+		}
+	}
+}
+
+// runTTLJanitor periodically removes expired TTL'd CIDR entries across all
+// attachments. Expiry work is ordinary userspace map-update syscalls —
+// identical to a control-plane remove command — and never touches the packet
+// path.
+func (s *Server) runTTLJanitor() {
+	defer s.janitorWG.Done()
+	ticker := time.NewTicker(s.ttlJanitorInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.janitorStop:
+			return
+		case <-ticker.C:
+			s.sweepExpiredTTLs(s.now())
+		}
+	}
+}
+
+// sweepExpiredTTLs runs one janitor pass over every attachment. Split from
+// runTTLJanitor so tests can drive it deterministically with a fake clock.
+// Attachment state is snapshotted under s.mu, then each registry does its
+// own expiry under its leaf lock — s.mu is never held during filter calls,
+// and an attachment detached mid-scan just yields an already-purged registry
+// (or idempotent/failed removes on a closed filter, which are retried and
+// then dropped when the detach purge lands).
+func (s *Server) sweepExpiredTTLs(now time.Time) {
+	type sweepTarget struct {
+		id     string
+		reg    *ttlRegistry
+		filter filter.Filter
+	}
+
+	s.mu.RLock()
+	targets := make([]sweepTarget, 0, len(s.attachments))
+	for id, state := range s.attachments {
+		targets = append(targets, sweepTarget{id: id, reg: state.ttls, filter: state.filter})
+	}
+	s.mu.RUnlock()
+
+	for _, t := range targets {
+		for _, swept := range t.reg.expire(t.filter, now) {
+			if swept.err != nil {
+				s.logger.Warn().Err(swept.err).
+					Str("id", t.id).
+					Str("cidr", swept.cidr).
+					Str("list", swept.list.String()).
+					Msg("failed to remove expired CIDR, will retry")
+				continue
+			}
+			s.logger.Debug().
+				Str("id", t.id).
+				Str("cidr", swept.cidr).
+				Str("list", swept.list.String()).
+				Msg("removed expired CIDR")
 		}
 	}
 }
@@ -232,6 +317,10 @@ func (s *Server) handleTargetRemoved(target string) {
 	delete(s.attachments, id)
 	delete(s.targetIndex, target)
 	s.mu.Unlock()
+
+	// Drop TTL bookkeeping so an in-flight janitor sweep does not keep
+	// retrying removals against the filter we are about to close.
+	state.ttls.purge()
 
 	if state.dns != nil {
 		if err := state.dns.Stop(); err != nil {
@@ -366,7 +455,7 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (*apiv1.A
 		s.store.DeleteAttachment(id)
 		return nil, fmt.Errorf("target already attached: %s (%s)", target, existingID)
 	}
-	s.attachments[id] = &attachmentState{info: attachment, dns: dnsServer, filter: ebpfFilter}
+	s.attachments[id] = &attachmentState{info: attachment, dns: dnsServer, filter: ebpfFilter, ttls: newTTLRegistry()}
 	s.targetIndex[target] = id
 	s.mu.Unlock()
 
@@ -442,6 +531,10 @@ func (s *Server) Detach(ctx context.Context, req *apiv1.DetachRequest) (*emptypb
 	delete(s.attachments, req.Id)
 	delete(s.targetIndex, state.info.Target)
 	s.mu.Unlock()
+
+	// Drop TTL bookkeeping so an in-flight janitor sweep does not keep
+	// retrying removals against the filter we are about to close.
+	state.ttls.purge()
 
 	if state.dns != nil {
 		if err := state.dns.Stop(); err != nil {
@@ -741,12 +834,15 @@ func (s *Server) ClearRules(id string) error {
 	}
 	ebpfFilter := state.filter
 	dnsServer := state.dns
+	reg := state.ttls
 	s.mu.RUnlock()
 
-	if ebpfFilter != nil {
-		if err := ebpfFilter.ClearRules(); err != nil {
-			return err
-		}
+	// Clearing goes through the TTL registry so pending deadlines are purged
+	// atomically with the filter wipe — the janitor must never "expire" an
+	// entry that a clear (e.g. bulk update) already removed or that a rebuild
+	// re-added as permanent.
+	if err := reg.clear(ebpfFilter); err != nil {
+		return err
 	}
 	if dnsServer != nil {
 		dnsServer.ClearDynamicCache()
@@ -786,68 +882,54 @@ func (s *Server) SetFilterMode(id string, mode apiv1.PolicyMode) error {
 	return nil
 }
 
-func (s *Server) AllowCIDR(id string, cidr *net.IPNet) error {
-	s.mu.RLock()
-	state, ok := s.attachments[id]
-	if !ok {
-		s.mu.RUnlock()
-		return fmt.Errorf("attachment not found: %s", id)
+// AllowCIDR adds the CIDR to the attachment's allowlist. A ttl > 0 schedules
+// removal by the TTL janitor after it elapses; ttl <= 0 means permanent, and
+// re-adding an existing CIDR upserts its deadline (or clears it for ttl <= 0).
+func (s *Server) AllowCIDR(id string, cidr *net.IPNet, ttl time.Duration) error {
+	ebpfFilter, reg, err := s.filterAndRegistry(id)
+	if err != nil {
+		return err
 	}
-	ebpfFilter := state.filter
-	s.mu.RUnlock()
-
-	if ebpfFilter != nil {
-		return ebpfFilter.AllowIP(cidr)
-	}
-	return nil
+	return reg.add(ebpfFilter, cidr, listAllow, ttl, s.now())
 }
 
-func (s *Server) DenyCIDR(id string, cidr *net.IPNet) error {
-	s.mu.RLock()
-	state, ok := s.attachments[id]
-	if !ok {
-		s.mu.RUnlock()
-		return fmt.Errorf("attachment not found: %s", id)
+// DenyCIDR adds the CIDR to the attachment's denylist. TTL semantics match
+// AllowCIDR.
+func (s *Server) DenyCIDR(id string, cidr *net.IPNet, ttl time.Duration) error {
+	ebpfFilter, reg, err := s.filterAndRegistry(id)
+	if err != nil {
+		return err
 	}
-	ebpfFilter := state.filter
-	s.mu.RUnlock()
-
-	if ebpfFilter != nil {
-		return ebpfFilter.DenyIP(cidr)
-	}
-	return nil
+	return reg.add(ebpfFilter, cidr, listDeny, ttl, s.now())
 }
 
 func (s *Server) RemoveAllowedCIDR(id string, cidr *net.IPNet) error {
-	s.mu.RLock()
-	state, ok := s.attachments[id]
-	if !ok {
-		s.mu.RUnlock()
-		return fmt.Errorf("attachment not found: %s", id)
+	ebpfFilter, reg, err := s.filterAndRegistry(id)
+	if err != nil {
+		return err
 	}
-	ebpfFilter := state.filter
-	s.mu.RUnlock()
-
-	if ebpfFilter != nil {
-		return ebpfFilter.RemoveAllowedIP(cidr)
-	}
-	return nil
+	return reg.remove(ebpfFilter, cidr, listAllow)
 }
 
 func (s *Server) RemoveDeniedCIDR(id string, cidr *net.IPNet) error {
+	ebpfFilter, reg, err := s.filterAndRegistry(id)
+	if err != nil {
+		return err
+	}
+	return reg.remove(ebpfFilter, cidr, listDeny)
+}
+
+// filterAndRegistry snapshots an attachment's filter and TTL registry under
+// s.mu. Callers then operate under the registry's own lock only, so s.mu is
+// never held across filter syscalls.
+func (s *Server) filterAndRegistry(id string) (filter.Filter, *ttlRegistry, error) {
 	s.mu.RLock()
+	defer s.mu.RUnlock()
 	state, ok := s.attachments[id]
 	if !ok {
-		s.mu.RUnlock()
-		return fmt.Errorf("attachment not found: %s", id)
+		return nil, nil, fmt.Errorf("attachment not found: %s", id)
 	}
-	ebpfFilter := state.filter
-	s.mu.RUnlock()
-
-	if ebpfFilter != nil {
-		return ebpfFilter.RemoveDeniedIP(cidr)
-	}
-	return nil
+	return state.filter, state.ttls, nil
 }
 
 func (s *Server) cleanupAttachment(id, target string, attachType apiv1.AttachmentType, port int, dnsServer *DNSServer, ebpfFilter filter.Filter, notifyControlPlane bool) {
@@ -855,7 +937,7 @@ func (s *Server) cleanupAttachment(id, target string, attachType apiv1.Attachmen
 	// Check if attachment still exists - it may have already been cleaned up
 	// by the target watcher if the interface/cgroup was removed while we were
 	// waiting for SubscribedAck
-	_, exists := s.attachments[id]
+	state, exists := s.attachments[id]
 	if !exists {
 		s.mu.Unlock()
 		return
@@ -871,6 +953,8 @@ func (s *Server) cleanupAttachment(id, target string, attachType apiv1.Attachmen
 	delete(s.attachments, id)
 	delete(s.targetIndex, target)
 	s.mu.Unlock()
+
+	state.ttls.purge()
 
 	if dnsServer != nil {
 		dnsServer.Stop()

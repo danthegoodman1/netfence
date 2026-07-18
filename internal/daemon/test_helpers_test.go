@@ -37,14 +37,15 @@ func (f *fakeFilter) SetMode(mode filter.PolicyMode) error {
 func (f *fakeFilter) AllowIP(cidr *net.IPNet) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.allowed = append(f.allowed, cidr.String())
+	// Upsert, matching the real BPF map's set semantics on re-add.
+	f.allowed = appendUnique(f.allowed, cidr.String())
 	return nil
 }
 
 func (f *fakeFilter) DenyIP(cidr *net.IPNet) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.denied = append(f.denied, cidr.String())
+	f.denied = appendUnique(f.denied, cidr.String())
 	return nil
 }
 
@@ -83,6 +84,15 @@ func (f *fakeFilter) snapshot() (filter.PolicyMode, []string, []string, int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.mode, append([]string(nil), f.allowed...), append([]string(nil), f.denied...), f.clearCalls
+}
+
+func appendUnique(values []string, target string) []string {
+	for _, value := range values {
+		if value == target {
+			return values
+		}
+	}
+	return append(values, target)
 }
 
 func removeString(values []string, target string) []string {
@@ -131,7 +141,7 @@ func newTestServerWithAttachment(t *testing.T) (*Server, *store.Store, string, *
 	ff := &fakeFilter{}
 	dnsServer := NewDNSServer(id, attachment.DnsAddress, cfg.DNS.Upstream, zerolog.Nop(), ff, nil)
 	server.mu.Lock()
-	server.attachments[id] = &attachmentState{info: attachment, dns: dnsServer, filter: ff}
+	server.attachments[id] = &attachmentState{info: attachment, dns: dnsServer, filter: ff, ttls: newTTLRegistry()}
 	server.targetIndex[attachment.Target] = id
 	server.portPool[12000] = true
 	server.mu.Unlock()
