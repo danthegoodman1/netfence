@@ -625,7 +625,7 @@ func TestTCFilterLoad(t *testing.T) {
 	require.NoError(t, createDummyInterface(ifaceName))
 	defer deleteDummyInterface(ifaceName)
 
-	f, err := filter.NewTCFilter(ifaceName, filter.ModeDisabled)
+	f, err := filter.NewTCFilter(ifaceName, filter.ModeDisabled, filter.DirectionEgress)
 	require.NoError(t, err)
 	defer f.Close()
 
@@ -643,7 +643,7 @@ func TestTCFilterModes(t *testing.T) {
 	require.NoError(t, createDummyInterface(ifaceName))
 	defer deleteDummyInterface(ifaceName)
 
-	f, err := filter.NewTCFilter(ifaceName, filter.ModeDisabled)
+	f, err := filter.NewTCFilter(ifaceName, filter.ModeDisabled, filter.DirectionEgress)
 	require.NoError(t, err)
 	defer f.Close()
 
@@ -673,7 +673,7 @@ func TestTCFilterIPManagement(t *testing.T) {
 	require.NoError(t, createDummyInterface(ifaceName))
 	defer deleteDummyInterface(ifaceName)
 
-	f, err := filter.NewTCFilter(ifaceName, filter.ModeAllowlist)
+	f, err := filter.NewTCFilter(ifaceName, filter.ModeAllowlist, filter.DirectionEgress)
 	require.NoError(t, err)
 	defer f.Close()
 

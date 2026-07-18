@@ -69,6 +69,9 @@ message Attachment {
   DnsMode dns_mode = 5;
   // User-defined metadata (VM ID, tenant, etc.)
   map<string, string> metadata = 6;
+  // TC attach direction for TC attachments (UNSPECIFIED = EGRESS).
+  // Not meaningful for cgroup attachments.
+  TcDirection tc_direction = 7;
 }
 
 // Subscribed notifies that a new filter attachment is now managed.
@@ -88,6 +91,9 @@ message Subscribed {
   string dns_address = 6;
   // User-defined metadata for associating with VM ID, tenant, etc.
   map<string, string> metadata = 7;
+  // TC attach direction for TC attachments (UNSPECIFIED = EGRESS).
+  // Not meaningful for cgroup attachments.
+  TcDirection tc_direction = 8;
 }
 
 // Unsubscribed notifies that an attachment is no longer managed.

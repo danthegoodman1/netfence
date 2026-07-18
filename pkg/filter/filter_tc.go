@@ -12,16 +12,46 @@ import (
 	"github.com/cilium/ebpf/link"
 )
 
+// TCDirection selects which TCX hook the TC filter attaches to.
+type TCDirection int
+
+const (
+	// DirectionEgress filters packets transmitted out through the interface.
+	// Correct for an uplink (e.g. eth0) or an interface inside the workload's
+	// own network namespace, where the packet destination is the true external
+	// destination. This is the default.
+	DirectionEgress TCDirection = iota
+	// DirectionIngress filters packets received by the host from the
+	// interface. Correct for host-side veth peers and VM tap devices, where
+	// the workload's outbound traffic arrives at the host as ingress and the
+	// packet destination is the true external destination. Attaching EGRESS
+	// there would instead see host-to-workload return traffic and filter by
+	// the workload's own address.
+	DirectionIngress
+)
+
+// String returns a human-readable name for the direction
+func (d TCDirection) String() string {
+	switch d {
+	case DirectionIngress:
+		return "ingress"
+	default:
+		return "egress"
+	}
+}
+
 // TCFilter manages the TC-based BPF filter
 type TCFilter struct {
 	mu        sync.Mutex
 	objs      *tcObjects
 	ifaceName string
+	direction TCDirection
 	tcLink    link.Link
 }
 
-// NewTCFilter creates a new TC-based filter attached to the specified interface
-func NewTCFilter(ifaceName string, mode PolicyMode) (*TCFilter, error) {
+// NewTCFilter creates a new TC-based filter attached to the specified
+// interface in the given direction (see TCDirection for how to choose).
+func NewTCFilter(ifaceName string, mode PolicyMode, direction TCDirection) (*TCFilter, error) {
 	// Load the eBPF objects
 	objs := &tcObjects{}
 	if err := loadTcObjects(objs, nil); err != nil {
@@ -41,19 +71,25 @@ func NewTCFilter(ifaceName string, mode PolicyMode) (*TCFilter, error) {
 		return nil, fmt.Errorf("getting interface %s: %w", ifaceName, err)
 	}
 
+	attach := ebpf.AttachTCXEgress
+	if direction == DirectionIngress {
+		attach = ebpf.AttachTCXIngress
+	}
+
 	tcLink, err := link.AttachTCX(link.TCXOptions{
 		Interface: iface.Index,
 		Program:   objs.FilterEgress,
-		Attach:    ebpf.AttachTCXEgress,
+		Attach:    attach,
 	})
 	if err != nil {
 		objs.Close()
-		return nil, fmt.Errorf("attaching TC filter to interface %s: %w", ifaceName, err)
+		return nil, fmt.Errorf("attaching TC filter to interface %s (%s): %w", ifaceName, direction, err)
 	}
 
 	return &TCFilter{
 		objs:      objs,
 		ifaceName: ifaceName,
+		direction: direction,
 		tcLink:    tcLink,
 	}, nil
 }
@@ -207,4 +243,9 @@ func (f *TCFilter) GetStats() (Stats, error) {
 // InterfaceName returns the interface name this filter is attached to
 func (f *TCFilter) InterfaceName() string {
 	return f.ifaceName
+}
+
+// Direction returns the direction this filter is attached in
+func (f *TCFilter) Direction() TCDirection {
+	return f.direction
 }

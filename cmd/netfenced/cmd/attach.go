@@ -18,6 +18,7 @@ var (
 	interfaceName string
 	cgroupPath    string
 	metadata      []string
+	tcDirection   string
 )
 
 var attachCmd = &cobra.Command{
@@ -28,10 +29,15 @@ var attachCmd = &cobra.Command{
 The filter starts in DISABLED mode. The control plane provides the initial
 configuration (mode, allowed CIDRs, DNS rules) via SubscribedAck.
 
+For TC attachments, --direction selects which traffic the filter sees:
+"egress" (default) for uplinks or interfaces inside the workload's own netns;
+"ingress" for host-side veth peers and VM tap devices, where the workload's
+outbound traffic arrives at the host as ingress.
+
 Examples:
   netfenced attach --interface eth0
   netfenced attach --cgroup /sys/fs/cgroup/user.slice/... --metadata vm_id=abc123
-  netfenced attach --interface veth123 --metadata tenant=acme,env=prod`,
+  netfenced attach --interface veth123 --direction ingress --metadata tenant=acme,env=prod`,
 	RunE: runAttach,
 }
 
@@ -39,6 +45,7 @@ func init() {
 	attachCmd.Flags().StringVarP(&interfaceName, "interface", "i", "", "network interface name (TC attachment)")
 	attachCmd.Flags().StringVarP(&cgroupPath, "cgroup", "g", "", "cgroup path (cgroup attachment)")
 	attachCmd.Flags().StringSliceVar(&metadata, "metadata", nil, "metadata key=value pairs")
+	attachCmd.Flags().StringVar(&tcDirection, "direction", "", "TC attach direction: egress (default) or ingress (host-side veth/tap peers); TC only")
 	rootCmd.AddCommand(attachCmd)
 }
 
@@ -50,6 +57,20 @@ func runAttach(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("cannot specify both --interface and --cgroup")
 	}
 
+	direction := apiv1.TcDirection_TC_DIRECTION_UNSPECIFIED
+	switch strings.ToLower(tcDirection) {
+	case "":
+	case "egress":
+		direction = apiv1.TcDirection_TC_DIRECTION_EGRESS
+	case "ingress":
+		direction = apiv1.TcDirection_TC_DIRECTION_INGRESS
+	default:
+		return fmt.Errorf("invalid --direction %q: must be egress or ingress", tcDirection)
+	}
+	if tcDirection != "" && interfaceName == "" {
+		return fmt.Errorf("--direction only applies to --interface (TC) attachments")
+	}
+
 	client, conn, err := newDaemonClient()
 	if err != nil {
 		return err
@@ -57,7 +78,8 @@ func runAttach(cmd *cobra.Command, args []string) error {
 	defer conn.Close()
 
 	req := &apiv1.AttachRequest{
-		Metadata: parseMetadata(metadata),
+		Metadata:    parseMetadata(metadata),
+		TcDirection: direction,
 	}
 
 	if interfaceName != "" {

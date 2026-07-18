@@ -285,7 +285,10 @@ type Attachment struct {
 	// Current DNS filtering mode
 	DnsMode DnsMode `protobuf:"varint,5,opt,name=dns_mode,json=dnsMode,proto3,enum=netfence.v1.DnsMode" json:"dns_mode,omitempty"`
 	// User-defined metadata (VM ID, tenant, etc.)
-	Metadata      map[string]string `protobuf:"bytes,6,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	Metadata map[string]string `protobuf:"bytes,6,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	// TC attach direction for TC attachments (UNSPECIFIED = EGRESS).
+	// Not meaningful for cgroup attachments.
+	TcDirection   TcDirection `protobuf:"varint,7,opt,name=tc_direction,json=tcDirection,proto3,enum=netfence.v1.TcDirection" json:"tc_direction,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -362,6 +365,13 @@ func (x *Attachment) GetMetadata() map[string]string {
 	return nil
 }
 
+func (x *Attachment) GetTcDirection() TcDirection {
+	if x != nil {
+		return x.TcDirection
+	}
+	return TcDirection_TC_DIRECTION_UNSPECIFIED
+}
+
 // Subscribed notifies that a new filter attachment is now managed.
 type Subscribed struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -379,7 +389,10 @@ type Subscribed struct {
 	// Containers should use this as their DNS resolver
 	DnsAddress string `protobuf:"bytes,6,opt,name=dns_address,json=dnsAddress,proto3" json:"dns_address,omitempty"`
 	// User-defined metadata for associating with VM ID, tenant, etc.
-	Metadata      map[string]string `protobuf:"bytes,7,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	Metadata map[string]string `protobuf:"bytes,7,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	// TC attach direction for TC attachments (UNSPECIFIED = EGRESS).
+	// Not meaningful for cgroup attachments.
+	TcDirection   TcDirection `protobuf:"varint,8,opt,name=tc_direction,json=tcDirection,proto3,enum=netfence.v1.TcDirection" json:"tc_direction,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -461,6 +474,13 @@ func (x *Subscribed) GetMetadata() map[string]string {
 		return x.Metadata
 	}
 	return nil
+}
+
+func (x *Subscribed) GetTcDirection() TcDirection {
+	if x != nil {
+		return x.TcDirection
+	}
+	return TcDirection_TC_DIRECTION_UNSPECIFIED
 }
 
 // Unsubscribed notifies that an attachment is no longer managed.
@@ -1515,7 +1535,7 @@ const file_v1_control_proto_rawDesc = "" +
 	"\bmetadata\x18\x04 \x03(\v2&.netfence.v1.SyncRequest.MetadataEntryR\bmetadata\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xc3\x02\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x80\x03\n" +
 	"\n" +
 	"Attachment\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x16\n" +
@@ -1523,10 +1543,11 @@ const file_v1_control_proto_rawDesc = "" +
 	"\x04type\x18\x03 \x01(\x0e2\x1b.netfence.v1.AttachmentTypeR\x04type\x12+\n" +
 	"\x04mode\x18\x04 \x01(\x0e2\x17.netfence.v1.PolicyModeR\x04mode\x12/\n" +
 	"\bdns_mode\x18\x05 \x01(\x0e2\x14.netfence.v1.DnsModeR\adnsMode\x12A\n" +
-	"\bmetadata\x18\x06 \x03(\v2%.netfence.v1.Attachment.MetadataEntryR\bmetadata\x1a;\n" +
+	"\bmetadata\x18\x06 \x03(\v2%.netfence.v1.Attachment.MetadataEntryR\bmetadata\x12;\n" +
+	"\ftc_direction\x18\a \x01(\x0e2\x18.netfence.v1.TcDirectionR\vtcDirection\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xe4\x02\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xa1\x03\n" +
 	"\n" +
 	"Subscribed\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x16\n" +
@@ -1536,7 +1557,8 @@ const file_v1_control_proto_rawDesc = "" +
 	"\bdns_mode\x18\x05 \x01(\x0e2\x14.netfence.v1.DnsModeR\adnsMode\x12\x1f\n" +
 	"\vdns_address\x18\x06 \x01(\tR\n" +
 	"dnsAddress\x12A\n" +
-	"\bmetadata\x18\a \x03(\v2%.netfence.v1.Subscribed.MetadataEntryR\bmetadata\x1a;\n" +
+	"\bmetadata\x18\a \x03(\v2%.netfence.v1.Subscribed.MetadataEntryR\bmetadata\x12;\n" +
+	"\ftc_direction\x18\b \x01(\x0e2\x18.netfence.v1.TcDirectionR\vtcDirection\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"l\n" +
@@ -1664,7 +1686,8 @@ var file_v1_control_proto_goTypes = []any{
 	(AttachmentType)(0),         // 22: netfence.v1.AttachmentType
 	(PolicyMode)(0),             // 23: netfence.v1.PolicyMode
 	(DnsMode)(0),                // 24: netfence.v1.DnsMode
-	(*durationpb.Duration)(nil), // 25: google.protobuf.Duration
+	(TcDirection)(0),            // 25: netfence.v1.TcDirection
+	(*durationpb.Duration)(nil), // 26: google.protobuf.Duration
 }
 var file_v1_control_proto_depIdxs = []int32{
 	2,  // 0: netfence.v1.DaemonEvent.sync:type_name -> netfence.v1.SyncRequest
@@ -1677,44 +1700,46 @@ var file_v1_control_proto_depIdxs = []int32{
 	23, // 7: netfence.v1.Attachment.mode:type_name -> netfence.v1.PolicyMode
 	24, // 8: netfence.v1.Attachment.dns_mode:type_name -> netfence.v1.DnsMode
 	20, // 9: netfence.v1.Attachment.metadata:type_name -> netfence.v1.Attachment.MetadataEntry
-	22, // 10: netfence.v1.Subscribed.type:type_name -> netfence.v1.AttachmentType
-	23, // 11: netfence.v1.Subscribed.mode:type_name -> netfence.v1.PolicyMode
-	24, // 12: netfence.v1.Subscribed.dns_mode:type_name -> netfence.v1.DnsMode
-	21, // 13: netfence.v1.Subscribed.metadata:type_name -> netfence.v1.Subscribed.MetadataEntry
-	0,  // 14: netfence.v1.Unsubscribed.reason:type_name -> netfence.v1.UnsubscribeReason
-	7,  // 15: netfence.v1.Heartbeat.stats:type_name -> netfence.v1.AttachmentStats
-	9,  // 16: netfence.v1.ControlCommand.sync_ack:type_name -> netfence.v1.SyncAck
-	11, // 17: netfence.v1.ControlCommand.set_mode:type_name -> netfence.v1.SetMode
-	14, // 18: netfence.v1.ControlCommand.allow_cidr:type_name -> netfence.v1.CIDREntry
-	14, // 19: netfence.v1.ControlCommand.deny_cidr:type_name -> netfence.v1.CIDREntry
-	12, // 20: netfence.v1.ControlCommand.bulk_update:type_name -> netfence.v1.BulkUpdate
-	16, // 21: netfence.v1.ControlCommand.set_dns_mode:type_name -> netfence.v1.SetDnsMode
-	15, // 22: netfence.v1.ControlCommand.allow_domain:type_name -> netfence.v1.DomainEntry
-	15, // 23: netfence.v1.ControlCommand.deny_domain:type_name -> netfence.v1.DomainEntry
-	10, // 24: netfence.v1.ControlCommand.subscribed_ack:type_name -> netfence.v1.SubscribedAck
-	23, // 25: netfence.v1.SubscribedAck.mode:type_name -> netfence.v1.PolicyMode
-	14, // 26: netfence.v1.SubscribedAck.allow_cidrs:type_name -> netfence.v1.CIDREntry
-	14, // 27: netfence.v1.SubscribedAck.deny_cidrs:type_name -> netfence.v1.CIDREntry
-	13, // 28: netfence.v1.SubscribedAck.dns:type_name -> netfence.v1.DnsConfig
-	23, // 29: netfence.v1.SetMode.mode:type_name -> netfence.v1.PolicyMode
-	23, // 30: netfence.v1.BulkUpdate.mode:type_name -> netfence.v1.PolicyMode
-	14, // 31: netfence.v1.BulkUpdate.allow_cidrs:type_name -> netfence.v1.CIDREntry
-	14, // 32: netfence.v1.BulkUpdate.deny_cidrs:type_name -> netfence.v1.CIDREntry
-	13, // 33: netfence.v1.BulkUpdate.dns:type_name -> netfence.v1.DnsConfig
-	24, // 34: netfence.v1.DnsConfig.mode:type_name -> netfence.v1.DnsMode
-	15, // 35: netfence.v1.DnsConfig.allow_domains:type_name -> netfence.v1.DomainEntry
-	15, // 36: netfence.v1.DnsConfig.deny_domains:type_name -> netfence.v1.DomainEntry
-	25, // 37: netfence.v1.CIDREntry.ttl:type_name -> google.protobuf.Duration
-	24, // 38: netfence.v1.SetDnsMode.mode:type_name -> netfence.v1.DnsMode
-	1,  // 39: netfence.v1.ControlPlane.Connect:input_type -> netfence.v1.DaemonEvent
-	17, // 40: netfence.v1.ControlPlane.QueryDns:input_type -> netfence.v1.DnsQueryRequest
-	8,  // 41: netfence.v1.ControlPlane.Connect:output_type -> netfence.v1.ControlCommand
-	18, // 42: netfence.v1.ControlPlane.QueryDns:output_type -> netfence.v1.DnsQueryResponse
-	41, // [41:43] is the sub-list for method output_type
-	39, // [39:41] is the sub-list for method input_type
-	39, // [39:39] is the sub-list for extension type_name
-	39, // [39:39] is the sub-list for extension extendee
-	0,  // [0:39] is the sub-list for field type_name
+	25, // 10: netfence.v1.Attachment.tc_direction:type_name -> netfence.v1.TcDirection
+	22, // 11: netfence.v1.Subscribed.type:type_name -> netfence.v1.AttachmentType
+	23, // 12: netfence.v1.Subscribed.mode:type_name -> netfence.v1.PolicyMode
+	24, // 13: netfence.v1.Subscribed.dns_mode:type_name -> netfence.v1.DnsMode
+	21, // 14: netfence.v1.Subscribed.metadata:type_name -> netfence.v1.Subscribed.MetadataEntry
+	25, // 15: netfence.v1.Subscribed.tc_direction:type_name -> netfence.v1.TcDirection
+	0,  // 16: netfence.v1.Unsubscribed.reason:type_name -> netfence.v1.UnsubscribeReason
+	7,  // 17: netfence.v1.Heartbeat.stats:type_name -> netfence.v1.AttachmentStats
+	9,  // 18: netfence.v1.ControlCommand.sync_ack:type_name -> netfence.v1.SyncAck
+	11, // 19: netfence.v1.ControlCommand.set_mode:type_name -> netfence.v1.SetMode
+	14, // 20: netfence.v1.ControlCommand.allow_cidr:type_name -> netfence.v1.CIDREntry
+	14, // 21: netfence.v1.ControlCommand.deny_cidr:type_name -> netfence.v1.CIDREntry
+	12, // 22: netfence.v1.ControlCommand.bulk_update:type_name -> netfence.v1.BulkUpdate
+	16, // 23: netfence.v1.ControlCommand.set_dns_mode:type_name -> netfence.v1.SetDnsMode
+	15, // 24: netfence.v1.ControlCommand.allow_domain:type_name -> netfence.v1.DomainEntry
+	15, // 25: netfence.v1.ControlCommand.deny_domain:type_name -> netfence.v1.DomainEntry
+	10, // 26: netfence.v1.ControlCommand.subscribed_ack:type_name -> netfence.v1.SubscribedAck
+	23, // 27: netfence.v1.SubscribedAck.mode:type_name -> netfence.v1.PolicyMode
+	14, // 28: netfence.v1.SubscribedAck.allow_cidrs:type_name -> netfence.v1.CIDREntry
+	14, // 29: netfence.v1.SubscribedAck.deny_cidrs:type_name -> netfence.v1.CIDREntry
+	13, // 30: netfence.v1.SubscribedAck.dns:type_name -> netfence.v1.DnsConfig
+	23, // 31: netfence.v1.SetMode.mode:type_name -> netfence.v1.PolicyMode
+	23, // 32: netfence.v1.BulkUpdate.mode:type_name -> netfence.v1.PolicyMode
+	14, // 33: netfence.v1.BulkUpdate.allow_cidrs:type_name -> netfence.v1.CIDREntry
+	14, // 34: netfence.v1.BulkUpdate.deny_cidrs:type_name -> netfence.v1.CIDREntry
+	13, // 35: netfence.v1.BulkUpdate.dns:type_name -> netfence.v1.DnsConfig
+	24, // 36: netfence.v1.DnsConfig.mode:type_name -> netfence.v1.DnsMode
+	15, // 37: netfence.v1.DnsConfig.allow_domains:type_name -> netfence.v1.DomainEntry
+	15, // 38: netfence.v1.DnsConfig.deny_domains:type_name -> netfence.v1.DomainEntry
+	26, // 39: netfence.v1.CIDREntry.ttl:type_name -> google.protobuf.Duration
+	24, // 40: netfence.v1.SetDnsMode.mode:type_name -> netfence.v1.DnsMode
+	1,  // 41: netfence.v1.ControlPlane.Connect:input_type -> netfence.v1.DaemonEvent
+	17, // 42: netfence.v1.ControlPlane.QueryDns:input_type -> netfence.v1.DnsQueryRequest
+	8,  // 43: netfence.v1.ControlPlane.Connect:output_type -> netfence.v1.ControlCommand
+	18, // 44: netfence.v1.ControlPlane.QueryDns:output_type -> netfence.v1.DnsQueryResponse
+	43, // [43:45] is the sub-list for method output_type
+	41, // [41:43] is the sub-list for method input_type
+	41, // [41:41] is the sub-list for extension type_name
+	41, // [41:41] is the sub-list for extension extendee
+	0,  // [0:41] is the sub-list for field type_name
 }
 
 func init() { file_v1_control_proto_init() }

@@ -9,17 +9,26 @@ import (
 	apiv1 "github.com/danthegoodman1/netfence/v1"
 )
 
-func createFilter(target string, attachType apiv1.AttachmentType, mode apiv1.PolicyMode) (filter.Filter, error) {
+func createFilter(target string, attachType apiv1.AttachmentType, mode apiv1.PolicyMode, direction apiv1.TcDirection) (filter.Filter, error) {
 	filterMode := apiModeToFilterMode(mode)
 
 	switch attachType {
 	case apiv1.AttachmentType_ATTACHMENT_TYPE_CGROUP:
+		// Direction is meaningless for cgroup filters and is ignored.
 		return filter.NewCgroupFilter(target, filterMode)
 	case apiv1.AttachmentType_ATTACHMENT_TYPE_TC:
-		return filter.NewTCFilter(target, filterMode)
+		return filter.NewTCFilter(target, filterMode, apiDirectionToFilterDirection(direction))
 	default:
 		return nil, fmt.Errorf("unsupported attachment type: %s", attachType)
 	}
+}
+
+func apiDirectionToFilterDirection(direction apiv1.TcDirection) filter.TCDirection {
+	if direction == apiv1.TcDirection_TC_DIRECTION_INGRESS {
+		return filter.DirectionIngress
+	}
+	// UNSPECIFIED defaults to EGRESS (preserves pre-direction behavior).
+	return filter.DirectionEgress
 }
 
 func apiModeToFilterMode(mode apiv1.PolicyMode) filter.PolicyMode {

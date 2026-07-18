@@ -86,7 +86,11 @@ type AttachRequest struct {
 	Target isAttachRequest_Target `protobuf_oneof:"target"`
 	// User-defined metadata (VM ID, tenant, container ID, etc.)
 	// This is passed to the control plane with the subscription.
-	Metadata      map[string]string `protobuf:"bytes,3,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	Metadata map[string]string `protobuf:"bytes,3,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	// TC attach direction. Only used for interface_name targets; ignored for
+	// cgroup_path targets. Unspecified defaults to EGRESS (see TcDirection for
+	// guidance on choosing the correct direction per topology).
+	TcDirection   TcDirection `protobuf:"varint,4,opt,name=tc_direction,json=tcDirection,proto3,enum=netfence.v1.TcDirection" json:"tc_direction,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -151,6 +155,13 @@ func (x *AttachRequest) GetMetadata() map[string]string {
 		return x.Metadata
 	}
 	return nil
+}
+
+func (x *AttachRequest) GetTcDirection() TcDirection {
+	if x != nil {
+		return x.TcDirection
+	}
+	return TcDirection_TC_DIRECTION_UNSPECIFIED
 }
 
 type isAttachRequest_Target interface {
@@ -411,7 +422,10 @@ type AttachmentInfo struct {
 	DnsQueriesAllowed uint64            `protobuf:"varint,10,opt,name=dns_queries_allowed,json=dnsQueriesAllowed,proto3" json:"dns_queries_allowed,omitempty"`
 	DnsQueriesBlocked uint64            `protobuf:"varint,11,opt,name=dns_queries_blocked,json=dnsQueriesBlocked,proto3" json:"dns_queries_blocked,omitempty"`
 	// When the filter was attached (used for stable pagination ordering)
-	AttachedAt    *timestamppb.Timestamp `protobuf:"bytes,12,opt,name=attached_at,json=attachedAt,proto3" json:"attached_at,omitempty"`
+	AttachedAt *timestamppb.Timestamp `protobuf:"bytes,12,opt,name=attached_at,json=attachedAt,proto3" json:"attached_at,omitempty"`
+	// TC attach direction for TC attachments (UNSPECIFIED = EGRESS).
+	// Not meaningful for cgroup attachments.
+	TcDirection   TcDirection `protobuf:"varint,13,opt,name=tc_direction,json=tcDirection,proto3,enum=netfence.v1.TcDirection" json:"tc_direction,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -530,6 +544,13 @@ func (x *AttachmentInfo) GetAttachedAt() *timestamppb.Timestamp {
 	return nil
 }
 
+func (x *AttachmentInfo) GetTcDirection() TcDirection {
+	if x != nil {
+		return x.TcDirection
+	}
+	return TcDirection_TC_DIRECTION_UNSPECIFIED
+}
+
 // DaemonStatus contains the current state of the daemon.
 type DaemonStatus struct {
 	state    protoimpl.MessageState `protogen:"open.v1"`
@@ -620,12 +641,13 @@ var File_v1_daemon_proto protoreflect.FileDescriptor
 
 const file_v1_daemon_proto_rawDesc = "" +
 	"\n" +
-	"\x0fv1/daemon.proto\x12\vnetfence.v1\x1a\x1bgoogle/protobuf/empty.proto\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x0ev1/types.proto\"\xe8\x01\n" +
+	"\x0fv1/daemon.proto\x12\vnetfence.v1\x1a\x1bgoogle/protobuf/empty.proto\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x0ev1/types.proto\"\xa5\x02\n" +
 	"\rAttachRequest\x12'\n" +
 	"\x0einterface_name\x18\x01 \x01(\tH\x00R\rinterfaceName\x12!\n" +
 	"\vcgroup_path\x18\x02 \x01(\tH\x00R\n" +
 	"cgroupPath\x12D\n" +
-	"\bmetadata\x18\x03 \x03(\v2(.netfence.v1.AttachRequest.MetadataEntryR\bmetadata\x1a;\n" +
+	"\bmetadata\x18\x03 \x03(\v2(.netfence.v1.AttachRequest.MetadataEntryR\bmetadata\x12;\n" +
+	"\ftc_direction\x18\x04 \x01(\x0e2\x18.netfence.v1.TcDirectionR\vtcDirection\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01B\b\n" +
@@ -644,7 +666,7 @@ const file_v1_daemon_proto_rawDesc = "" +
 	"\vattachments\x18\x01 \x03(\v2\x1b.netfence.v1.AttachmentInfoR\vattachments\x12&\n" +
 	"\x0fnext_page_token\x18\x02 \x01(\tR\rnextPageToken\x12\x1f\n" +
 	"\vtotal_count\x18\x03 \x01(\x05R\n" +
-	"totalCount\"\xdb\x04\n" +
+	"totalCount\"\x98\x05\n" +
 	"\x0eAttachmentInfo\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x16\n" +
 	"\x06target\x18\x02 \x01(\tR\x06target\x12/\n" +
@@ -660,7 +682,8 @@ const file_v1_daemon_proto_rawDesc = "" +
 	" \x01(\x04R\x11dnsQueriesAllowed\x12.\n" +
 	"\x13dns_queries_blocked\x18\v \x01(\x04R\x11dnsQueriesBlocked\x12;\n" +
 	"\vattached_at\x18\f \x01(\v2\x1a.google.protobuf.TimestampR\n" +
-	"attachedAt\x1a;\n" +
+	"attachedAt\x12;\n" +
+	"\ftc_direction\x18\r \x01(\x0e2\x18.netfence.v1.TcDirectionR\vtcDirection\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x8e\x02\n" +
@@ -707,34 +730,37 @@ var file_v1_daemon_proto_goTypes = []any{
 	(*DaemonStatus)(nil),          // 7: netfence.v1.DaemonStatus
 	nil,                           // 8: netfence.v1.AttachRequest.MetadataEntry
 	nil,                           // 9: netfence.v1.AttachmentInfo.MetadataEntry
-	(AttachmentType)(0),           // 10: netfence.v1.AttachmentType
-	(PolicyMode)(0),               // 11: netfence.v1.PolicyMode
-	(DnsMode)(0),                  // 12: netfence.v1.DnsMode
-	(*timestamppb.Timestamp)(nil), // 13: google.protobuf.Timestamp
-	(*emptypb.Empty)(nil),         // 14: google.protobuf.Empty
+	(TcDirection)(0),              // 10: netfence.v1.TcDirection
+	(AttachmentType)(0),           // 11: netfence.v1.AttachmentType
+	(PolicyMode)(0),               // 12: netfence.v1.PolicyMode
+	(DnsMode)(0),                  // 13: netfence.v1.DnsMode
+	(*timestamppb.Timestamp)(nil), // 14: google.protobuf.Timestamp
+	(*emptypb.Empty)(nil),         // 15: google.protobuf.Empty
 }
 var file_v1_daemon_proto_depIdxs = []int32{
 	8,  // 0: netfence.v1.AttachRequest.metadata:type_name -> netfence.v1.AttachRequest.MetadataEntry
-	6,  // 1: netfence.v1.ListResponse.attachments:type_name -> netfence.v1.AttachmentInfo
-	10, // 2: netfence.v1.AttachmentInfo.type:type_name -> netfence.v1.AttachmentType
-	11, // 3: netfence.v1.AttachmentInfo.mode:type_name -> netfence.v1.PolicyMode
-	12, // 4: netfence.v1.AttachmentInfo.dns_mode:type_name -> netfence.v1.DnsMode
-	9,  // 5: netfence.v1.AttachmentInfo.metadata:type_name -> netfence.v1.AttachmentInfo.MetadataEntry
-	13, // 6: netfence.v1.AttachmentInfo.attached_at:type_name -> google.protobuf.Timestamp
-	0,  // 7: netfence.v1.DaemonStatus.control_plane_state:type_name -> netfence.v1.ConnectionState
-	1,  // 8: netfence.v1.DaemonService.Attach:input_type -> netfence.v1.AttachRequest
-	3,  // 9: netfence.v1.DaemonService.Detach:input_type -> netfence.v1.DetachRequest
-	4,  // 10: netfence.v1.DaemonService.List:input_type -> netfence.v1.ListRequest
-	14, // 11: netfence.v1.DaemonService.GetStatus:input_type -> google.protobuf.Empty
-	2,  // 12: netfence.v1.DaemonService.Attach:output_type -> netfence.v1.AttachResponse
-	14, // 13: netfence.v1.DaemonService.Detach:output_type -> google.protobuf.Empty
-	5,  // 14: netfence.v1.DaemonService.List:output_type -> netfence.v1.ListResponse
-	7,  // 15: netfence.v1.DaemonService.GetStatus:output_type -> netfence.v1.DaemonStatus
-	12, // [12:16] is the sub-list for method output_type
-	8,  // [8:12] is the sub-list for method input_type
-	8,  // [8:8] is the sub-list for extension type_name
-	8,  // [8:8] is the sub-list for extension extendee
-	0,  // [0:8] is the sub-list for field type_name
+	10, // 1: netfence.v1.AttachRequest.tc_direction:type_name -> netfence.v1.TcDirection
+	6,  // 2: netfence.v1.ListResponse.attachments:type_name -> netfence.v1.AttachmentInfo
+	11, // 3: netfence.v1.AttachmentInfo.type:type_name -> netfence.v1.AttachmentType
+	12, // 4: netfence.v1.AttachmentInfo.mode:type_name -> netfence.v1.PolicyMode
+	13, // 5: netfence.v1.AttachmentInfo.dns_mode:type_name -> netfence.v1.DnsMode
+	9,  // 6: netfence.v1.AttachmentInfo.metadata:type_name -> netfence.v1.AttachmentInfo.MetadataEntry
+	14, // 7: netfence.v1.AttachmentInfo.attached_at:type_name -> google.protobuf.Timestamp
+	10, // 8: netfence.v1.AttachmentInfo.tc_direction:type_name -> netfence.v1.TcDirection
+	0,  // 9: netfence.v1.DaemonStatus.control_plane_state:type_name -> netfence.v1.ConnectionState
+	1,  // 10: netfence.v1.DaemonService.Attach:input_type -> netfence.v1.AttachRequest
+	3,  // 11: netfence.v1.DaemonService.Detach:input_type -> netfence.v1.DetachRequest
+	4,  // 12: netfence.v1.DaemonService.List:input_type -> netfence.v1.ListRequest
+	15, // 13: netfence.v1.DaemonService.GetStatus:input_type -> google.protobuf.Empty
+	2,  // 14: netfence.v1.DaemonService.Attach:output_type -> netfence.v1.AttachResponse
+	15, // 15: netfence.v1.DaemonService.Detach:output_type -> google.protobuf.Empty
+	5,  // 16: netfence.v1.DaemonService.List:output_type -> netfence.v1.ListResponse
+	7,  // 17: netfence.v1.DaemonService.GetStatus:output_type -> netfence.v1.DaemonStatus
+	14, // [14:18] is the sub-list for method output_type
+	10, // [10:14] is the sub-list for method input_type
+	10, // [10:10] is the sub-list for extension type_name
+	10, // [10:10] is the sub-list for extension extendee
+	0,  // [0:10] is the sub-list for field type_name
 }
 
 func init() { file_v1_daemon_proto_init() }

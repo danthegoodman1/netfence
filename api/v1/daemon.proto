@@ -36,6 +36,10 @@ message AttachRequest {
   // User-defined metadata (VM ID, tenant, container ID, etc.)
   // This is passed to the control plane with the subscription.
   map<string, string> metadata = 3;
+  // TC attach direction. Only used for interface_name targets; ignored for
+  // cgroup_path targets. Unspecified defaults to EGRESS (see TcDirection for
+  // guidance on choosing the correct direction per topology).
+  TcDirection tc_direction = 4;
 }
 
 // AttachResponse confirms attachment.
@@ -90,6 +94,9 @@ message AttachmentInfo {
   uint64 dns_queries_blocked = 11;
   // When the filter was attached (used for stable pagination ordering)
   google.protobuf.Timestamp attached_at = 12;
+  // TC attach direction for TC attachments (UNSPECIFIED = EGRESS).
+  // Not meaningful for cgroup attachments.
+  TcDirection tc_direction = 13;
 }
 
 // DaemonStatus contains the current state of the daemon.

@@ -135,3 +135,77 @@ func TestListAttachmentsUsesAttachedAtIDIndex(t *testing.T) {
 	require.NoError(t, rows.Err())
 	assert.Contains(t, strings.Join(plans, "\n"), "idx_attachments_attached_at_id")
 }
+
+func TestDirectionPersistsAcrossReopen(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "netfence.db")
+	st, err := New(dbPath)
+	require.NoError(t, err)
+
+	a := testAttachment("tc-ingress", time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC))
+	a.Direction = "TC_DIRECTION_INGRESS"
+	require.NoError(t, st.SaveAttachment(a))
+
+	got, err := st.GetAttachment("tc-ingress")
+	require.NoError(t, err)
+	assert.Equal(t, "TC_DIRECTION_INGRESS", got.Direction)
+	require.NoError(t, st.Close())
+
+	// Reopen: migrate() runs again on an existing DB, so the ALTER TABLE hits
+	// the duplicate-column path and must be tolerated.
+	st, err = New(dbPath)
+	require.NoError(t, err)
+	defer st.Close()
+
+	got, err = st.GetAttachment("tc-ingress")
+	require.NoError(t, err)
+	assert.Equal(t, "TC_DIRECTION_INGRESS", got.Direction)
+
+	all, err := st.GetAllAttachments()
+	require.NoError(t, err)
+	require.Len(t, all, 1)
+	assert.Equal(t, "TC_DIRECTION_INGRESS", all[0].Direction)
+}
+
+func TestDirectionMigrationAddsColumnToOldSchema(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "netfence.db")
+
+	// Create a database with the pre-direction schema and a row in it.
+	db, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	_, err = db.Exec(`
+		CREATE TABLE attachments (
+			id TEXT PRIMARY KEY,
+			target TEXT NOT NULL,
+			type TEXT NOT NULL,
+			mode TEXT NOT NULL,
+			dns_mode TEXT NOT NULL,
+			dns_address TEXT NOT NULL,
+			metadata TEXT NOT NULL,
+			attached_at TEXT NOT NULL
+		) STRICT, WITHOUT ROWID
+	`)
+	require.NoError(t, err)
+	_, err = db.Exec(`
+		INSERT INTO attachments (id, target, type, mode, dns_mode, dns_address, metadata, attached_at)
+		VALUES ('old-row', 'nf-old', 'ATTACHMENT_TYPE_TC', 'POLICY_MODE_DISABLED', 'DNS_MODE_DISABLED', '127.0.0.1:12000', '{}', '2026-05-27T12:00:00Z')
+	`)
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+
+	// Opening the store migrates the old schema in place.
+	st, err := New(dbPath)
+	require.NoError(t, err)
+	defer st.Close()
+
+	got, err := st.GetAttachment("old-row")
+	require.NoError(t, err)
+	assert.Empty(t, got.Direction, "pre-migration rows read back with empty direction")
+
+	// And the migrated table accepts direction on save.
+	a := testAttachment("new-row", time.Date(2026, 5, 27, 13, 0, 0, 0, time.UTC))
+	a.Direction = "TC_DIRECTION_INGRESS"
+	require.NoError(t, st.SaveAttachment(a))
+	got, err = st.GetAttachment("new-row")
+	require.NoError(t, err)
+	assert.Equal(t, "TC_DIRECTION_INGRESS", got.Direction)
+}

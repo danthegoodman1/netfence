@@ -24,6 +24,30 @@ enum AttachmentType {
   ATTACHMENT_TYPE_CGROUP = 2;
 }
 
+// TcDirection selects which TCX hook a TC (interface) filter attaches to.
+// It is only meaningful for interface targets; for cgroup targets it is
+// ignored (cgroup filters hook socket operations, not an interface).
+//
+// Picking the correct direction depends on which side of the link the
+// interface is on:
+//   - EGRESS is correct when the interface transmits the workload's outbound
+//     traffic: an uplink like eth0, or an interface inside the workload's own
+//     network namespace. There the packet's destination address is the true
+//     external destination.
+//   - INGRESS is correct for host-side veth peers and VM tap devices (e.g.
+//     "fcr-*"). The workload's outbound traffic arrives at the host ON that
+//     interface (ingress); attaching egress there would instead see
+//     host-to-workload return traffic and filter by the workload's own
+//     address rather than the true destination.
+enum TcDirection {
+  // Treated as TC_DIRECTION_EGRESS (preserves pre-direction behavior).
+  TC_DIRECTION_UNSPECIFIED = 0;
+  // Filter packets transmitted out through the interface.
+  TC_DIRECTION_EGRESS = 1;
+  // Filter packets received by the host from the interface.
+  TC_DIRECTION_INGRESS = 2;
+}
+
 // DnsMode defines the DNS filtering behavior.
 enum DnsMode {
   DNS_MODE_UNSPECIFIED = 0;

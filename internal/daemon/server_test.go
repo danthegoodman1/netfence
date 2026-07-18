@@ -37,6 +37,26 @@ func TestExtractPortHandlesJoinHostPortAddresses(t *testing.T) {
 	}
 }
 
+func TestParseTcDirectionDefaultsToEgress(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want apiv1.TcDirection
+	}{
+		{name: "empty (pre-migration row or cgroup)", in: "", want: apiv1.TcDirection_TC_DIRECTION_EGRESS},
+		{name: "unspecified", in: "TC_DIRECTION_UNSPECIFIED", want: apiv1.TcDirection_TC_DIRECTION_EGRESS},
+		{name: "egress", in: "TC_DIRECTION_EGRESS", want: apiv1.TcDirection_TC_DIRECTION_EGRESS},
+		{name: "ingress", in: "TC_DIRECTION_INGRESS", want: apiv1.TcDirection_TC_DIRECTION_INGRESS},
+		{name: "garbage", in: "sideways", want: apiv1.TcDirection_TC_DIRECTION_EGRESS},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, parseTcDirection(tt.in))
+		})
+	}
+}
+
 func TestServerModeChangesPersistToStoreAndSyncViews(t *testing.T) {
 	server, st, id, ff, _ := newTestServerWithAttachment(t)
 

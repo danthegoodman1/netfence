@@ -117,7 +117,7 @@ Your orchestration system calls the daemon's local API.
 **RPC:**
 
 ```
-DaemonService.Attach(interface_name: "veth123", metadata: {vm_id: "abc"})
+DaemonService.Attach(interface_name: "veth123", tc_direction: TC_DIRECTION_INGRESS, metadata: {vm_id: "abc"})
 // or
 DaemonService.Attach(cgroup_path: "/sys/fs/cgroup/...", metadata: {container_id: "xyz"})
 ```
@@ -125,15 +125,27 @@ DaemonService.Attach(cgroup_path: "/sys/fs/cgroup/...", metadata: {container_id:
 **CLI:**
 
 ```bash
-# Attach to a network interface (TC)
-netfenced attach --interface veth123 --metadata vm_id=abc
+# Attach to a host-side veth peer or VM tap (TC) - use ingress direction
+netfenced attach --interface veth123 --direction ingress --metadata vm_id=abc
 
 # Attach to a cgroup
 netfenced attach --cgroup /sys/fs/cgroup/... --metadata container_id=xyz
 
-# Attach with metadata
+# Attach to an uplink inside the workload's own netns (TC) - egress is the default
 netfenced attach --interface eth0 --metadata tenant=acme,env=prod
 ```
+
+**TC direction:** the `tc_direction` field (CLI `--direction`) selects which
+TCX hook the filter attaches to, and picking the correct one depends on which
+side of the link the interface is on:
+
+| Interface | Correct direction | Why |
+| --- | --- | --- |
+| Uplink (e.g. `eth0`), or any interface inside the workload's own netns | `egress` (default) | The workload's outbound packets are transmitted out through it; their destination address is the true destination. |
+| Host-side veth peer or VM tap (e.g. `fcr-*`) | `ingress` | The workload's outbound packets arrive at the host **on** that interface. Egress there would instead see host→workload return traffic and filter by the workload's own address rather than the true destination. |
+
+Direction only applies to interface (TC) attachments; it is ignored for
+cgroup attachments.
 
 - Daemon attaches eBPF filter to the target
 - Daemon sends `Subscribed{id, target, type, metadata}` to control plane and waits for `SubscribedAck` with initial config (mode, CIDRs, DNS rules)

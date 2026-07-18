@@ -100,8 +100,9 @@ func (s *Server) Start() error {
 	for id, state := range s.attachments {
 		attachType := parseAttachmentType(state.info.Type)
 		mode := parsePolicyMode(state.info.Mode)
+		direction := parseTcDirection(state.info.Direction)
 
-		ebpfFilter, err := createFilter(state.info.Target, attachType, mode)
+		ebpfFilter, err := createFilter(state.info.Target, attachType, mode, direction)
 		if err != nil {
 			s.logger.Warn().Err(err).
 				Str("id", id).
@@ -276,6 +277,16 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (*apiv1.A
 		return nil, fmt.Errorf("target must be interface_name or cgroup_path")
 	}
 
+	// Direction only applies to TC attachments; it is ignored for cgroups.
+	// UNSPECIFIED normalizes to EGRESS (the pre-direction behavior).
+	direction := apiv1.TcDirection_TC_DIRECTION_UNSPECIFIED
+	if attachType == apiv1.AttachmentType_ATTACHMENT_TYPE_TC {
+		direction = req.TcDirection
+		if direction == apiv1.TcDirection_TC_DIRECTION_UNSPECIFIED {
+			direction = apiv1.TcDirection_TC_DIRECTION_EGRESS
+		}
+	}
+
 	s.mu.Lock()
 	if existingID, ok := s.targetIndex[target]; ok {
 		s.mu.Unlock()
@@ -306,6 +317,9 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (*apiv1.A
 		Metadata:   req.Metadata,
 		AttachedAt: time.Now(),
 	}
+	if attachType == apiv1.AttachmentType_ATTACHMENT_TYPE_TC {
+		attachment.Direction = direction.String()
+	}
 
 	if err := s.store.SaveAttachment(attachment); err != nil {
 		s.mu.Lock()
@@ -314,7 +328,7 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (*apiv1.A
 		return nil, fmt.Errorf("saving attachment: %w", err)
 	}
 
-	ebpfFilter, err := createFilter(target, attachType, mode)
+	ebpfFilter, err := createFilter(target, attachType, mode, direction)
 	if err != nil {
 		s.mu.Lock()
 		s.releasePort(port)
@@ -367,24 +381,28 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (*apiv1.A
 		}
 	}
 
-	s.logger.Info().
+	logEvent := s.logger.Info().
 		Str("id", id).
 		Str("target", target).
 		Str("type", attachType.String()).
-		Str("dns_address", dnsAddr).
-		Msg("attached filter")
+		Str("dns_address", dnsAddr)
+	if attachType == apiv1.AttachmentType_ATTACHMENT_TYPE_TC {
+		logEvent = logEvent.Str("direction", direction.String())
+	}
+	logEvent.Msg("attached filter")
 
 	cpClient := s.cpClient.Load()
 
 	if cpClient != nil {
 		sub := &apiv1.Subscribed{
-			Id:         id,
-			Target:     target,
-			Type:       attachType,
-			Mode:       mode,
-			DnsMode:    apiv1.DnsMode_DNS_MODE_DISABLED,
-			DnsAddress: dnsAddr,
-			Metadata:   req.Metadata,
+			Id:          id,
+			Target:      target,
+			Type:        attachType,
+			Mode:        mode,
+			DnsMode:     apiv1.DnsMode_DNS_MODE_DISABLED,
+			DnsAddress:  dnsAddr,
+			Metadata:    req.Metadata,
+			TcDirection: direction,
 		}
 
 		_, err := cpClient.SubscribeAndWait(ctx, sub)
@@ -487,6 +505,9 @@ func (s *Server) List(ctx context.Context, req *apiv1.ListRequest) (*apiv1.ListR
 			Metadata:   a.Metadata,
 			AttachedAt: timestamppb.New(a.AttachedAt),
 		}
+		if info.Type == apiv1.AttachmentType_ATTACHMENT_TYPE_TC {
+			info.TcDirection = parseTcDirection(a.Direction)
+		}
 		if refs, ok := statsRefs[a.ID]; ok {
 			if refs.filter != nil {
 				if stats, err := refs.filter.GetStats(); err == nil {
@@ -536,14 +557,18 @@ func (s *Server) GetSyncAttachments() []*apiv1.Attachment {
 	var attachments []*apiv1.Attachment
 	for _, state := range s.attachments {
 		a := state.info
-		attachments = append(attachments, &apiv1.Attachment{
+		att := &apiv1.Attachment{
 			Id:       a.ID,
 			Target:   a.Target,
 			Type:     parseAttachmentType(a.Type),
 			Mode:     parsePolicyMode(a.Mode),
 			DnsMode:  parseDnsMode(a.DnsMode),
 			Metadata: a.Metadata,
-		})
+		}
+		if att.Type == apiv1.AttachmentType_ATTACHMENT_TYPE_TC {
+			att.TcDirection = parseTcDirection(a.Direction)
+		}
+		attachments = append(attachments, att)
 	}
 	return attachments
 }
@@ -927,4 +952,14 @@ func parseDnsMode(s string) apiv1.DnsMode {
 		return apiv1.DnsMode(v)
 	}
 	return apiv1.DnsMode_DNS_MODE_UNSPECIFIED
+}
+
+// parseTcDirection maps a persisted direction to the API enum. Empty (rows
+// predating the direction column, or cgroup attachments) and unknown values
+// default to EGRESS, which preserves pre-direction behavior.
+func parseTcDirection(s string) apiv1.TcDirection {
+	if v, ok := apiv1.TcDirection_value[s]; ok && apiv1.TcDirection(v) == apiv1.TcDirection_TC_DIRECTION_INGRESS {
+		return apiv1.TcDirection_TC_DIRECTION_INGRESS
+	}
+	return apiv1.TcDirection_TC_DIRECTION_EGRESS
 }
