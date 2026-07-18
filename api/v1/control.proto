@@ -16,10 +16,15 @@ service ControlPlane {
   //
   // Flow:
   // 1. Daemon connects and sends SyncRequest with current attachments
-  // 2. Control plane sends SyncAck
-  // 3. Daemon sends Subscribed when local orchestration attaches filters
-  // 4. Control plane sends filter commands (AllowCIDR, SetMode, etc.)
-  // 5. Daemon sends Unsubscribed when attachments are detached/removed
+  // 2. Control plane processes SyncRequest and sends SyncAck
+  // 3. After SyncRequest, daemon sends Subscribed for restored attachments
+  //    that still need authoritative desired state; it also sends Subscribed
+  //    whenever local orchestration attaches a new filter. The daemon orders
+  //    restored Subscribed after its outbound SyncRequest but does not wait for
+  //    SyncAck before sending it
+  // 4. Control plane answers every Subscribed with a fresh SubscribedAck
+  // 5. Control plane sends filter commands (AllowCIDR, SetMode, etc.)
+  // 6. Daemon sends Unsubscribed when attachments are detached/removed
   rpc Connect(stream DaemonEvent) returns (stream ControlCommand);
 
   // QueryDns is called by the daemon when DNS_MODE_PROXY is enabled.
@@ -56,7 +61,10 @@ message DaemonEvent {
 // when it reconnects, but a just-generated event can still race the sync
 // snapshot in either direction, so the control plane MUST apply the
 // idempotency rules documented on Subscribed and Unsubscribed to any event
-// arriving after a SyncRequest.
+// arriving after a SyncRequest. An attachment restored from persisted/pinned
+// state is present in this list and then sends Subscribed after the SyncRequest
+// until one authoritative SubscribedAck applies completely. SyncRequest
+// reconciles attachment inventory; it does not replace that policy handshake.
 message SyncRequest {
   // Daemon instance identifier (stable across restarts)
   string daemon_id = 1;
@@ -87,16 +95,20 @@ message Attachment {
   TcDirection tc_direction = 7;
 }
 
-// Subscribed notifies that a new filter attachment is now managed.
+// Subscribed declares the complete identity/current state of a managed filter
+// attachment. It is sent for a new attachment and re-sent after SyncRequest for
+// a restored attachment until fresh authoritative desired state is applied.
 //
 // Idempotency: the control plane MUST treat a Subscribed for an
 // already-known attachment id as an update to that attachment (and reply
 // with a fresh SubscribedAck), never as a duplicate registration. This
 // re-delivery is legitimate: a Subscribed whose SubscribedAck was still
-// pending when the connection dropped is re-sent on the next connection
-// AFTER the fresh SyncRequest (which may already list the same attachment),
-// because the daemon-side caller is still blocked waiting for the ack — the
-// control plane acknowledges Subscribed, not SyncRequest.
+// pending when the connection dropped is re-sent on the next connection, and
+// a restored attachment deliberately sends one on every connection until an
+// ack applies completely. It always follows the fresh SyncRequest (which may
+// already list the same attachment). The control plane acknowledges
+// Subscribed, not SyncRequest; it MUST answer each effective declaration with
+// a complete fresh SubscribedAck.
 message Subscribed {
   // Unique identifier for this attachment
   string id = 1;
@@ -104,9 +116,9 @@ message Subscribed {
   string target = 2;
   // Type of attachment
   AttachmentType type = 3;
-  // Initial IP filter policy mode
+  // Current IP filter policy mode
   PolicyMode mode = 4;
-  // Initial DNS filtering mode
+  // Current DNS filtering mode
   DnsMode dns_mode = 5;
   // DNS server address for this attachment (e.g., "10.0.0.1:53")
   // Containers should use this as their DNS resolver
@@ -189,7 +201,8 @@ message ControlCommand {
     DomainEntry deny_domain = 10;
     // Remove a domain from DNS allow/deny lists
     string remove_domain = 11;
-    // Acknowledge subscription with initial config (sent after receiving Subscribed)
+    // Acknowledge a subscription declaration with complete authoritative config
+    // (sent after receiving Subscribed, including restored declarations)
     SubscribedAck subscribed_ack = 12;
   }
 
@@ -224,7 +237,13 @@ message CommandResult {
 // SyncAck acknowledges that the control plane has processed the SyncRequest.
 message SyncAck {}
 
-// SubscribedAck acknowledges a Subscribed event and provides initial configuration.
+// SubscribedAck acknowledges a Subscribed event and provides complete,
+// authoritative desired state. It configures a new attachment and reconciles a
+// restored attachment's last-known map contents. The daemon applies it by
+// delta: unchanged CIDRs remain installed, stale CIDRs are removed, new CIDRs
+// are added, and control-plane TTLs are replaced exactly. The restore remains
+// pending after any validation or apply failure and is retried after a later
+// connection.
 //
 // Design note: This is sent over the bidirectional stream (rather than a separate
 // unary RPC) to ensure the same control plane node that holds the stream connection
@@ -232,23 +251,24 @@ message SyncAck {}
 // control plane, a separate unary RPC could be load-balanced to a different node
 // that doesn't have the stream, requiring cross-node coordination.
 message SubscribedAck {
-  // Initial IP filter policy mode
+  // Complete desired IP filter policy mode. Must be a known non-UNSPECIFIED value.
   PolicyMode mode = 1;
-  // Initial CIDRs to allow
+  // Complete desired CIDRs to allow (canonical duplicates are invalid).
   repeated CIDREntry allow_cidrs = 2;
-  // Initial CIDRs to deny
+  // Complete desired CIDRs to deny (canonical duplicates are invalid).
   repeated CIDREntry deny_cidrs = 3;
-  // Initial DNS configuration
+  // Complete desired DNS configuration. Omitted means disabled with empty lists.
   DnsConfig dns = 4;
 }
 
 // SetMode changes the policy mode for an attachment.
 message SetMode { PolicyMode mode = 1; }
 
-// BulkUpdate sets the complete state for an attachment.
-// Clears existing rules and replaces with the provided state.
+// BulkUpdate sets the complete authoritative state for an attachment. The
+// daemon reconciles by delta; an unchanged CIDR is not removed/re-added, and
+// its control-plane TTL is replaced exactly by the provided lifetime.
 message BulkUpdate {
-  // IP filter policy mode
+  // Complete desired IP filter policy mode. Must be a known non-UNSPECIFIED value.
   PolicyMode mode = 1;
   // CIDRs to allow
   repeated CIDREntry allow_cidrs = 2;
@@ -260,7 +280,7 @@ message BulkUpdate {
 
 // DnsConfig contains the complete DNS filtering configuration.
 message DnsConfig {
-  // DNS filtering mode
+  // Complete desired DNS filtering mode. Must be a known non-UNSPECIFIED value.
   DnsMode mode = 1;
   // Domains to allow (when mode is ALLOWLIST or to override in DENYLIST)
   repeated DomainEntry allow_domains = 2;
@@ -271,7 +291,10 @@ message DnsConfig {
   repeated string upstream_servers = 4;
 }
 
-// CIDREntry represents a CIDR with optional TTL.
+// CIDREntry represents a CIDR with an optional TTL. In complete
+// SubscribedAck/BulkUpdate state, TTLs must be valid and non-negative and
+// replace control-plane lifetimes exactly. Incremental AllowCIDR/DenyCIDR
+// positive-TTL re-adds extend lifetimes monotonically; absent/zero is permanent.
 message CIDREntry {
   string cidr = 1;
   google.protobuf.Duration ttl = 2;

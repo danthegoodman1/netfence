@@ -132,6 +132,31 @@ func attachInterfaceReq(name string) *apiv1.AttachRequest {
 	}
 }
 
+func dispatchAttachAck(t *testing.T, client *ControlPlaneClient, id string, epoch uint64, ack *apiv1.SubscribedAck) {
+	t.Helper()
+	require.NotZero(t, epoch)
+	pending := pendingSubscriptionFor(t, client, id)
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	for {
+		select {
+		case outbound := <-client.sendCh:
+			if outbound.pending != pending {
+				continue
+			}
+			require.Same(t, pending.sub, outbound.event.GetSubscribed())
+		case <-deadline.C:
+			t.Fatal("attach Subscribed was not queued")
+		}
+		break
+	}
+	require.True(t, client.beginPendingSend(pending, epoch))
+	client.handleCommandForEpoch(&apiv1.ControlCommand{
+		Id:      id,
+		Command: &apiv1.ControlCommand_SubscribedAck{SubscribedAck: ack},
+	}, epoch)
+}
+
 // assertUDPPortFree asserts nothing (i.e. no leaked DNS server) is bound to
 // the port.
 func assertUDPPortFree(t *testing.T, port int) {
@@ -164,12 +189,11 @@ func TestAttachDetachRaceDuringSubscribeAck(t *testing.T) {
 	// Wait for Attach to reach SubscribeAndWait: the pending-ack registration
 	// happens before it blocks, and its key is the attachment ID.
 	var id string
-	var ackCh chan SubscribedAckResult
 	require.Eventually(t, func() bool {
 		cp.pendingAcksMu.Lock()
 		defer cp.pendingAcksMu.Unlock()
-		for pendingID, ch := range cp.pendingAcks {
-			id, ackCh = pendingID, ch
+		for pendingID := range cp.pendingAcks {
+			id = pendingID
 			return true
 		}
 		return false
@@ -191,10 +215,6 @@ func TestAttachDetachRaceDuringSubscribeAck(t *testing.T) {
 	env.server.portPool[env.port] = true
 	env.server.mu.Unlock()
 
-	// Release the ack: the control plane says "subscribed", but the
-	// attachment is gone.
-	ackCh <- SubscribedAckResult{Ack: &apiv1.SubscribedAck{}}
-
 	var res attachResult
 	select {
 	case res = <-resCh:
@@ -204,7 +224,7 @@ func TestAttachDetachRaceDuringSubscribeAck(t *testing.T) {
 
 	require.Error(t, res.err, "Attach must fail when its attachment was detached during the ack wait")
 	assert.Nil(t, res.resp)
-	assert.Contains(t, res.err.Error(), "detached during setup")
+	assert.Contains(t, res.err.Error(), "attachment detached")
 
 	// Exactly-once teardown: no double close, no double port release, no
 	// resurrected bookkeeping, no store row.
@@ -290,31 +310,42 @@ func TestAttachHappyPathWithControlPlaneAck(t *testing.T) {
 	cp := NewControlPlaneClient("", env.server, zerolog.Nop(), nil, 30*time.Second, nil)
 	env.server.SetControlPlaneClient(cp)
 
-	done := make(chan struct{})
-	t.Cleanup(func() { close(done) })
+	type attachResult struct {
+		resp *apiv1.AttachResponse
+		err  error
+	}
+	done := make(chan attachResult, 1)
 	go func() {
-		for {
-			select {
-			case <-done:
-				return
-			case <-time.After(time.Millisecond):
-			}
-			cp.pendingAcksMu.Lock()
-			for id, ch := range cp.pendingAcks {
-				delete(cp.pendingAcks, id)
-				ch <- SubscribedAckResult{Ack: &apiv1.SubscribedAck{}}
-			}
-			cp.pendingAcksMu.Unlock()
-		}
+		resp, err := env.server.Attach(context.Background(), attachInterfaceReq("acked-if0"))
+		done <- attachResult{resp: resp, err: err}
 	}()
 
-	resp, err := env.server.Attach(context.Background(), attachInterfaceReq("acked-if0"))
-	require.NoError(t, err)
-	require.NotEmpty(t, resp.Id)
+	var id string
+	require.Eventually(t, func() bool {
+		cp.pendingAcksMu.Lock()
+		defer cp.pendingAcksMu.Unlock()
+		for pendingID := range cp.pendingAcks {
+			id = pendingID
+			return true
+		}
+		return false
+	}, time.Second, time.Millisecond)
+	dispatchAttachAck(t, cp, id, 1, &apiv1.SubscribedAck{Mode: apiv1.PolicyMode_POLICY_MODE_DISABLED})
+
+	result := <-done
+	require.NoError(t, result.err)
+	require.NotNil(t, result.resp)
+	require.Equal(t, id, result.resp.Id)
 
 	attachments, _ := env.attachmentCounts()
 	assert.Equal(t, 1, attachments)
 	assert.True(t, env.portInUse())
+	env.server.mu.RLock()
+	state := env.server.attachments[id]
+	needsResync := state != nil && state.needsResync
+	env.server.mu.RUnlock()
+	require.NotNil(t, state)
+	assert.False(t, needsResync, "a newly attached/acked state is not a restored state")
 }
 
 func TestAttachRollbackOnPortExhaustion(t *testing.T) {
@@ -438,4 +469,186 @@ drain:
 	unsub := events[1].GetUnsubscribed()
 	require.NotNil(t, unsub)
 	assert.Equal(t, apiv1.UnsubscribeReason_UNSUBSCRIBE_REASON_ERROR, unsub.Reason)
+}
+
+func TestAttachRollbackOnSubscribedAckApplyFailure(t *testing.T) {
+	env := newAttachTestEnv(t, 12171)
+	cp := NewControlPlaneClient("", env.server, zerolog.Nop(), nil, time.Second, nil)
+	env.server.SetControlPlaneClient(cp)
+
+	result := make(chan error, 1)
+	go func() {
+		_, err := env.server.Attach(context.Background(), attachInterfaceReq("badack-if0"))
+		result <- err
+	}()
+
+	var id string
+	require.Eventually(t, func() bool {
+		cp.pendingAcksMu.Lock()
+		defer cp.pendingAcksMu.Unlock()
+		for pendingID := range cp.pendingAcks {
+			id = pendingID
+			return true
+		}
+		return false
+	}, time.Second, time.Millisecond)
+
+	// Invalid full desired state fails before mutation, and the actual apply
+	// error must reach SubscribeAndWait so Attach owns its ordinary rollback.
+	dispatchAttachAck(t, cp, id, 1, &apiv1.SubscribedAck{
+		Mode:       apiv1.PolicyMode_POLICY_MODE_ALLOWLIST,
+		AllowCidrs: []*apiv1.CIDREntry{{Cidr: "not-a-cidr"}},
+	})
+
+	select {
+	case err := <-result:
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "parsing allow CIDR")
+	case <-time.After(5 * time.Second):
+		t.Fatal("Attach did not receive the SubscribedAck apply error")
+	}
+
+	env.assertNoResidue(t)
+	filters := env.createdFilters()
+	require.Len(t, filters, 1)
+	assert.Equal(t, 1, filters[0].detachCallCount())
+}
+
+func TestAttachTimeoutRollbackWaitsForClaimedAckApply(t *testing.T) {
+	env := newAttachTestEnv(t, 12172)
+	cp := NewControlPlaneClient("", env.server, zerolog.Nop(), nil, 75*time.Millisecond, nil)
+	env.server.SetControlPlaneClient(cp)
+
+	attachDone := make(chan error, 1)
+	go func() {
+		_, err := env.server.Attach(context.Background(), attachInterfaceReq("timeout-claimed-ack-if0"))
+		attachDone <- err
+	}()
+
+	var id string
+	require.Eventually(t, func() bool {
+		cp.pendingAcksMu.Lock()
+		defer cp.pendingAcksMu.Unlock()
+		for pendingID := range cp.pendingAcks {
+			id = pendingID
+			return true
+		}
+		return false
+	}, time.Second, time.Millisecond)
+	filters := env.createdFilters()
+	require.Len(t, filters, 1)
+	ff := filters[0]
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	ff.blockSetMode(entered, release)
+	pending := pendingSubscriptionFor(t, cp, id)
+	require.True(t, cp.beginPendingSend(pending, 1))
+
+	ackDone := make(chan struct{})
+	go func() {
+		defer close(ackDone)
+		cp.handleCommandForEpoch(&apiv1.ControlCommand{
+			Id: id,
+			Command: &apiv1.ControlCommand_SubscribedAck{SubscribedAck: &apiv1.SubscribedAck{
+				Mode: apiv1.PolicyMode_POLICY_MODE_ALLOWLIST,
+			}},
+		}, 1)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("ack did not reach gated apply")
+	}
+
+	// SubscribeAndWait times out, but its deferred rollback must wait on the
+	// exact reconcileMu rather than deleting/closing underneath the claimed ack.
+	select {
+	case err := <-attachDone:
+		t.Fatalf("Attach rollback interleaved with claimed ack: %v", err)
+	case <-time.After(125 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-ackDone:
+	case <-time.After(time.Second):
+		t.Fatal("ack did not finish after gate release")
+	}
+	select {
+	case err := <-attachDone:
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "deadline exceeded")
+	case <-time.After(time.Second):
+		t.Fatal("Attach rollback did not finish after ack released reconcileMu")
+	}
+
+	env.assertNoResidue(t)
+	assert.Equal(t, 1, ff.detachCallCount())
+	assert.Zero(t, ff.mutationAfterCloseCount())
+}
+
+// Stop first publishes terminal admission state, then waits for every Attach
+// that passed the admission gate. An Attach blocked in filter construction
+// must therefore roll back before Stop snapshots terminal ownership; it can
+// never register a new attachment behind that snapshot.
+func TestStopWaitsForInFlightAttachRollbackBeforeSnapshot(t *testing.T) {
+	env := newAttachTestEnv(t, 12173)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	ff := &fakeFilter{}
+	var once sync.Once
+	env.server.newFilter = func(_, _ string, _ apiv1.AttachmentType, _ apiv1.PolicyMode, _ apiv1.TcDirection, _ uint32) (filter.Filter, error) {
+		once.Do(func() { close(entered) })
+		<-release
+		env.mu.Lock()
+		env.filters = append(env.filters, ff)
+		env.mu.Unlock()
+		return ff, nil
+	}
+
+	attachDone := make(chan error, 1)
+	go func() {
+		_, err := env.server.Attach(context.Background(), attachInterfaceReq("stop-race-if0"))
+		attachDone <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("Attach did not reach blocked filter construction")
+	}
+
+	stopDone := make(chan struct{})
+	go func() {
+		defer close(stopDone)
+		env.server.Stop()
+	}()
+	require.Eventually(t, func() bool {
+		env.server.mu.RLock()
+		defer env.server.mu.RUnlock()
+		return env.server.stopping
+	}, time.Second, time.Millisecond)
+	select {
+	case <-stopDone:
+		t.Fatal("Stop returned before the admitted Attach rolled back")
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	close(release)
+	select {
+	case err := <-attachDone:
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "daemon is stopping")
+	case <-time.After(time.Second):
+		t.Fatal("Attach did not roll back after filter construction resumed")
+	}
+	select {
+	case <-stopDone:
+	case <-time.After(time.Second):
+		t.Fatal("Stop did not finish after the in-flight Attach rolled back")
+	}
+
+	env.assertNoResidue(t)
+	assert.Equal(t, 1, ff.detachCallCount())
+	assert.Equal(t, 1, ff.closeCallCount())
+	assert.Zero(t, ff.mutationAfterCloseCount())
+	assertUDPPortFree(t, env.port)
 }

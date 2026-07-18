@@ -204,9 +204,10 @@ func (r *ttlRegistry) addSourceLocked(f filter.Filter, cidr *net.IPNet, list rul
 // reconcileCP applies a declared control-plane rule set for one list as a
 // delta against the entries with a live CP source (which ARE the current
 // CP-declared set):
-//   - declared CIDRs are (re-)added through addSourceLocked, so a CIDR in
-//     both the old and new set is NEVER removed from the kernel map — no
-//     transient allow/block window;
+//   - declared CIDRs replace the CP source lifetime exactly (a full desired
+//     state may shorten a TTL or demote a previously-permanent restored rule)
+//     while a CIDR in both old and new sets is NEVER removed/re-added in the
+//     kernel map — no transient allow/block window;
 //   - entries whose CP source is no longer declared lose ONLY that source:
 //     a live DNS source keeps them in the filter until its own TTL lapses,
 //     and only source-less entries are removed from the filter.
@@ -221,18 +222,22 @@ func (r *ttlRegistry) reconcileCP(f filter.Filter, list ruleList, desired []pars
 	desiredSet := make(map[string]struct{}, len(desired))
 	for _, d := range desired {
 		desiredSet[d.cidr.String()] = struct{}{}
-		if err := r.addSourceLocked(f, d.cidr, list, sourceCP, d.ttl, now); err != nil {
+		if err := r.replaceCPSourceLocked(f, d.cidr, list, d.ttl, now); err != nil {
 			errs = append(errs, fmt.Errorf("adding %s: %w", d.cidr, err))
 		}
 	}
 
 	for key, entry := range r.entries {
-		if key.list != list || !entry.cpLive {
+		if key.list != list {
 			continue
 		}
 		if _, ok := desiredSet[key.cidr]; ok {
 			continue
 		}
+		// Clear a formerly-declared CP source. If a prior authoritative
+		// reconcile already cleared it but its filter Remove failed, cpLive is
+		// already false; continue into the same removal path so every retry keeps
+		// reporting failure until the stale kernel rule is actually gone.
 		entry.cpLive, entry.cpDeadline = false, time.Time{}
 		if entry.dnsLive && entry.dnsDeadline.After(now) {
 			// DNS still wants it: keep the filter entry, drop only the CP
@@ -240,6 +245,7 @@ func (r *ttlRegistry) reconcileCP(f filter.Filter, list ruleList, desired []pars
 			r.entries[key] = entry
 			continue
 		}
+		entry.dnsLive, entry.dnsDeadline = false, time.Time{}
 		var err error
 		if f != nil {
 			if list == listAllow {
@@ -259,6 +265,47 @@ func (r *ttlRegistry) reconcileCP(f filter.Filter, list ruleList, desired []pars
 	}
 
 	return errors.Join(errs...)
+}
+
+// replaceCPSourceLocked applies one entry from an authoritative full desired
+// state. Unlike incremental addCP's monotonic max-deadline semantics, this
+// replaces the CP lifetime exactly: permanent may become finite and a longer
+// deadline may become shorter. An already-installed survivor is bookkeeping
+// only (no filter Remove/Add); independent DNS ownership is preserved.
+func (r *ttlRegistry) replaceCPSourceLocked(f filter.Filter, cidr *net.IPNet, list ruleList, ttl time.Duration, now time.Time) error {
+	key := ttlKey{cidr: cidr.String(), list: list}
+	entry, exists := r.entries[key]
+	if !exists {
+		entry = ttlEntry{cidr: cidr}
+	}
+
+	entry.cpLive = true
+	if ttl <= 0 {
+		entry.cpDeadline = time.Time{}
+	} else {
+		entry.cpDeadline = now.Add(ttl)
+	}
+
+	if f != nil && !entry.inFilter {
+		var err error
+		if list == listAllow {
+			err = f.AllowIP(cidr)
+		} else {
+			err = f.DenyIP(cidr)
+		}
+		if err != nil {
+			if isMapFull(err) {
+				r.mapFullDrops.Add(1)
+			}
+			// Match addSourceLocked: never record desired state that did not
+			// reach the kernel; an existing entry retains its prior lifetime.
+			return err
+		}
+		entry.inFilter = true
+	}
+
+	r.entries[key] = entry
+	return nil
 }
 
 // remove deletes the CIDR from the given filter list and purges the whole

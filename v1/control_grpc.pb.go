@@ -35,11 +35,16 @@ type ControlPlaneClient interface {
 	// plane.
 	//
 	// Flow:
-	// 1. Daemon connects and sends SyncRequest with current attachments
-	// 2. Control plane sends SyncAck
-	// 3. Daemon sends Subscribed when local orchestration attaches filters
-	// 4. Control plane sends filter commands (AllowCIDR, SetMode, etc.)
-	// 5. Daemon sends Unsubscribed when attachments are detached/removed
+	//  1. Daemon connects and sends SyncRequest with current attachments
+	//  2. Control plane processes SyncRequest and sends SyncAck
+	//  3. After SyncRequest, daemon sends Subscribed for restored attachments
+	//     that still need authoritative desired state; it also sends Subscribed
+	//     whenever local orchestration attaches a new filter. The daemon orders
+	//     restored Subscribed after its outbound SyncRequest but does not wait for
+	//     SyncAck before sending it
+	//  4. Control plane answers every Subscribed with a fresh SubscribedAck
+	//  5. Control plane sends filter commands (AllowCIDR, SetMode, etc.)
+	//  6. Daemon sends Unsubscribed when attachments are detached/removed
 	Connect(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[DaemonEvent, ControlCommand], error)
 	// QueryDns is called by the daemon when DNS_MODE_PROXY is enabled.
 	// The control plane decides whether to allow the query and can return
@@ -90,11 +95,16 @@ type ControlPlaneServer interface {
 	// plane.
 	//
 	// Flow:
-	// 1. Daemon connects and sends SyncRequest with current attachments
-	// 2. Control plane sends SyncAck
-	// 3. Daemon sends Subscribed when local orchestration attaches filters
-	// 4. Control plane sends filter commands (AllowCIDR, SetMode, etc.)
-	// 5. Daemon sends Unsubscribed when attachments are detached/removed
+	//  1. Daemon connects and sends SyncRequest with current attachments
+	//  2. Control plane processes SyncRequest and sends SyncAck
+	//  3. After SyncRequest, daemon sends Subscribed for restored attachments
+	//     that still need authoritative desired state; it also sends Subscribed
+	//     whenever local orchestration attaches a new filter. The daemon orders
+	//     restored Subscribed after its outbound SyncRequest but does not wait for
+	//     SyncAck before sending it
+	//  4. Control plane answers every Subscribed with a fresh SubscribedAck
+	//  5. Control plane sends filter commands (AllowCIDR, SetMode, etc.)
+	//  6. Daemon sends Unsubscribed when attachments are detached/removed
 	Connect(grpc.BidiStreamingServer[DaemonEvent, ControlCommand]) error
 	// QueryDns is called by the daemon when DNS_MODE_PROXY is enabled.
 	// The control plane decides whether to allow the query and can return

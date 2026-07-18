@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -13,7 +14,9 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 
+	"github.com/danthegoodman1/netfence/pkg/filter"
 	apiv1 "github.com/danthegoodman1/netfence/v1"
 )
 
@@ -216,15 +219,19 @@ func TestControlPlaneReconnectPurgesStaleQueuedEvents(t *testing.T) {
 	// A Subscribed whose SubscribedAck is still pending: the caller is
 	// still blocked in SubscribeAndWait, so this one MUST survive the
 	// purge and be re-delivered after the fresh SyncRequest.
+	pending := &pendingSubscription{
+		sub:      &apiv1.Subscribed{Id: id},
+		purpose:  subscriptionPurposeAttach,
+		resultCh: make(chan SubscribedAckResult, 1),
+	}
 	c.pendingAcksMu.Lock()
-	c.pendingAcks[id] = make(chan SubscribedAckResult, 1)
+	c.pendingAcks[id] = pending
 	c.pendingAcksMu.Unlock()
 	require.True(t, c.enqueue(outboundEvent{
 		event: &apiv1.DaemonEvent{
-			Event: &apiv1.DaemonEvent_Subscribed{Subscribed: &apiv1.Subscribed{Id: id}},
+			Event: &apiv1.DaemonEvent_Subscribed{Subscribed: pending.sub},
 		},
-		subscribedID:      id,
-		requirePendingAck: true,
+		pending: pending,
 	}))
 
 	// Connection 2: the fresh SyncRequest must be first, then only the
@@ -379,4 +386,254 @@ func TestControlPlaneReconnectDrainsFullBacklogWithoutDeadlock(t *testing.T) {
 
 	cancel()
 	waitDone(t, done, "connect() did not return after ctx cancellation")
+}
+
+// scriptedBidiClient is a focused sendLoop test stream. ClientStream's generic
+// message methods are unused; Send records exact DaemonEvent order and can fail
+// deterministically on Subscribed.
+type scriptedBidiClient struct {
+	ctx context.Context
+
+	mu             sync.Mutex
+	events         []*apiv1.DaemonEvent
+	failSubscribed bool
+}
+
+func (s *scriptedBidiClient) Send(event *apiv1.DaemonEvent) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.failSubscribed && event.GetSubscribed() != nil {
+		return fmt.Errorf("scripted subscribed send failure")
+	}
+	s.events = append(s.events, event)
+	return nil
+}
+
+func (s *scriptedBidiClient) Recv() (*apiv1.ControlCommand, error) {
+	return nil, fmt.Errorf("scripted Recv is unused")
+}
+
+func (s *scriptedBidiClient) Header() (metadata.MD, error) { return nil, nil }
+func (s *scriptedBidiClient) Trailer() metadata.MD         { return nil }
+func (s *scriptedBidiClient) CloseSend() error             { return nil }
+func (s *scriptedBidiClient) Context() context.Context     { return s.ctx }
+func (s *scriptedBidiClient) SendMsg(any) error            { return nil }
+func (s *scriptedBidiClient) RecvMsg(any) error            { return nil }
+
+func (s *scriptedBidiClient) snapshot() []*apiv1.DaemonEvent {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]*apiv1.DaemonEvent(nil), s.events...)
+}
+
+// blockingEpochStream models a transport whose SendMsg and Recv are both
+// blocked until the stream context is canceled. It also records whether a
+// CloseSend call raced the active sender; grpc-go explicitly forbids that
+// overlap.
+type blockingEpochStream struct {
+	ctx         context.Context
+	sendEntered chan struct{}
+	sendOnce    sync.Once
+
+	mu             sync.Mutex
+	sendActive     bool
+	closeSendCalls int
+	closeSendRaced bool
+}
+
+func (s *blockingEpochStream) Send(event *apiv1.DaemonEvent) error {
+	if event.GetSubscribed() == nil {
+		return nil
+	}
+	s.mu.Lock()
+	s.sendActive = true
+	s.mu.Unlock()
+	s.sendOnce.Do(func() { close(s.sendEntered) })
+	<-s.ctx.Done()
+	s.mu.Lock()
+	s.sendActive = false
+	s.mu.Unlock()
+	return s.ctx.Err()
+}
+
+func (s *blockingEpochStream) Recv() (*apiv1.ControlCommand, error) {
+	<-s.ctx.Done()
+	return nil, s.ctx.Err()
+}
+
+func (s *blockingEpochStream) Header() (metadata.MD, error) { return nil, nil }
+func (s *blockingEpochStream) Trailer() metadata.MD         { return nil }
+func (s *blockingEpochStream) Context() context.Context     { return s.ctx }
+func (s *blockingEpochStream) SendMsg(any) error            { return nil }
+func (s *blockingEpochStream) RecvMsg(any) error            { return nil }
+func (s *blockingEpochStream) CloseSend() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closeSendCalls++
+	if s.sendActive {
+		s.closeSendRaced = true
+	}
+	return nil
+}
+
+func (s *blockingEpochStream) closeSnapshot() (calls int, raced bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closeSendCalls, s.closeSendRaced
+}
+
+// Stream cancellation, not CloseSend, must release blocked transport calls.
+// runStreamEpoch cannot return until both Send and Recv have observed that
+// cancellation and all four epoch workers have joined.
+func TestRunStreamEpochCancelsBlockedSendAndJoinsWithoutCloseSend(t *testing.T) {
+	server, _, id, _, _ := newTestServerWithAttachment(t)
+	client := NewControlPlaneClient("", server, zerolog.Nop(), nil, time.Second, nil)
+	pending := &pendingSubscription{
+		sub:      &apiv1.Subscribed{Id: id},
+		purpose:  subscriptionPurposeAttach,
+		resultCh: make(chan SubscribedAckResult, 1),
+	}
+	require.NoError(t, client.publishPendingSubscription(pending))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	stream := &blockingEpochStream{ctx: ctx, sendEntered: make(chan struct{})}
+	done := make(chan error, 1)
+	go func() {
+		done <- client.runStreamEpoch(ctx, cancel, stream, 1)
+	}()
+
+	select {
+	case <-stream.sendEntered:
+	case <-time.After(time.Second):
+		t.Fatal("send loop did not enter blocked Send")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("runStreamEpoch did not cancel and join blocked stream workers")
+	}
+
+	calls, raced := stream.closeSnapshot()
+	assert.Zero(t, calls, "cancellation owns stream shutdown; CloseSend must not race Send")
+	assert.False(t, raced)
+	client.cancelSubscription(id, errors.New("test cleanup"))
+}
+
+// If Send(Subscribed) itself fails, its queue item has already been consumed.
+// The exact pending entry must retain the payload, be re-driven after the next
+// connection's Sync, and resolve from that new epoch's ack.
+func TestNormalPendingSubscribeRedrivesAfterSendFailure(t *testing.T) {
+	server, _, id, _, _ := newTestServerWithAttachment(t)
+	client := NewControlPlaneClient("", server, zerolog.Nop(), nil, 10*time.Second, nil)
+
+	type result struct {
+		ack *apiv1.SubscribedAck
+		err error
+	}
+	resultCh := make(chan result, 1)
+	go func() {
+		ack, err := client.SubscribeAndWait(context.Background(), &apiv1.Subscribed{Id: id})
+		resultCh <- result{ack: ack, err: err}
+	}()
+	require.Eventually(t, func() bool { return client.hasPendingAck(id) }, time.Second, time.Millisecond)
+
+	stream1 := &scriptedBidiClient{ctx: context.Background(), failSubscribed: true}
+	errCh1 := make(chan error, 1)
+	client.sendLoop(context.Background(), stream1, 1, errCh1)
+	require.Error(t, <-errCh1)
+	pending := pendingSubscriptionFor(t, client, id)
+	assert.Zero(t, pending.sentEpoch, "failed Send must make the exact pending eligible for redrive")
+
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	stream2 := &scriptedBidiClient{ctx: ctx2}
+	require.NoError(t, stream2.Send(&apiv1.DaemonEvent{
+		Event: &apiv1.DaemonEvent_Sync{Sync: &apiv1.SyncRequest{}},
+	}))
+	errCh2 := make(chan error, 1)
+	done2 := make(chan struct{})
+	go func() {
+		defer close(done2)
+		client.sendLoop(ctx2, stream2, 2, errCh2)
+	}()
+	require.Eventually(t, func() bool {
+		return len(stream2.snapshot()) >= 2
+	}, time.Second, time.Millisecond)
+	assert.Equal(t, []string{"sync", "subscribed:" + id}, eventKinds(stream2.snapshot()))
+
+	client.handleCommandForEpoch(&apiv1.ControlCommand{
+		Id: id,
+		Command: &apiv1.ControlCommand_SubscribedAck{SubscribedAck: &apiv1.SubscribedAck{
+			Mode: apiv1.PolicyMode_POLICY_MODE_DISABLED,
+		}},
+	}, 2)
+	select {
+	case got := <-resultCh:
+		require.NoError(t, got.err)
+		require.NotNil(t, got.ack)
+	case <-time.After(time.Second):
+		t.Fatal("redriven normal subscription did not resolve")
+	}
+	cancel2()
+	waitDone(t, done2, "epoch 2 sendLoop did not stop")
+}
+
+// A delayed ack from epoch E must not claim a restore retry that belongs to
+// epoch E+1, even though both use the same attachment ID.
+func TestRestoreRetryIgnoresDelayedAckFromOlderEpoch(t *testing.T) {
+	server, _, id, ff, _ := newTestServerWithAttachment(t)
+	server.mu.Lock()
+	state := server.attachments[id]
+	state.needsResync = true
+	server.mu.Unlock()
+	client := NewControlPlaneClient("", server, zerolog.Nop(), nil, time.Second, nil)
+
+	client.startRestoreResyncs(context.Background(), 1)
+	first := pendingSubscriptionFor(t, client, id)
+	require.True(t, client.beginPendingSend(first, 1))
+	client.cancelRestoreSubscriptions(1, errors.New("epoch 1 disconnected"))
+
+	client.startRestoreResyncs(context.Background(), 2)
+	second := pendingSubscriptionFor(t, client, id)
+	require.NotSame(t, first, second)
+	require.True(t, client.beginPendingSend(second, 2))
+
+	client.handleCommandForEpoch(&apiv1.ControlCommand{
+		Id: id,
+		Command: &apiv1.ControlCommand_SubscribedAck{SubscribedAck: &apiv1.SubscribedAck{
+			Mode: apiv1.PolicyMode_POLICY_MODE_BLOCK_ALL,
+		}},
+	}, 1)
+	assert.Same(t, second, pendingSubscriptionFor(t, client, id))
+	assert.True(t, server.restoreResyncStillNeeded(id, state))
+	mode, _, _, _ := ff.snapshot()
+	assert.Equal(t, filter.ModeDisabled, mode, "stale epoch ack must not mutate enforcement")
+
+	client.handleCommandForEpoch(&apiv1.ControlCommand{
+		Id: id,
+		Command: &apiv1.ControlCommand_SubscribedAck{SubscribedAck: &apiv1.SubscribedAck{
+			Mode: apiv1.PolicyMode_POLICY_MODE_DISABLED,
+		}},
+	}, 2)
+	assert.False(t, server.restoreResyncStillNeeded(id, state))
+}
+
+func TestRestoreSubscribedFollowsFreshSync(t *testing.T) {
+	server, _, id, _, _ := newTestServerWithAttachment(t)
+	server.mu.Lock()
+	server.attachments[id].needsResync = true
+	server.mu.Unlock()
+	cp := &testControlPlane{}
+	addr := startTestControlPlane(t, cp)
+	client := newReconnectTestClient(t, addr, server, time.Second)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := startConnect(client, ctx)
+	require.Eventually(t, func() bool {
+		return cp.connCount() == 1 && len(cp.conn(0).snapshot()) >= 2
+	}, 5*time.Second, 5*time.Millisecond)
+	assert.Equal(t, []string{"sync", "subscribed:" + id}, eventKinds(cp.conn(0).snapshot())[:2])
+
+	cancel()
+	waitDone(t, done, "connect did not join all epoch workers after cancellation")
 }

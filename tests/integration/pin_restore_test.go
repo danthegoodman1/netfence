@@ -544,52 +544,77 @@ func TestCgroupKill9RecreatedTargetNotAdopted(t *testing.T) {
 		"recreated target enforces the persisted allowlist mode empty (fail-closed) until CP resync")
 }
 
-// TestCgroupPinnedRestoreBulkUpdateReconciles: after a kill-9 restart the
-// re-adopted rules are reseeded into the daemon's rule bookkeeping, so a
-// control-plane BulkUpdate that no longer declares one of them removes it —
-// {allowed, blocked-to-be} restored from pins, then a resync declaring
-// {allowed, new} must drop the stale rule, keep the survivor connectable,
-// and add the new one.
-func TestCgroupPinnedRestoreBulkUpdateReconciles(t *testing.T) {
+// TestCgroupPinnedRestoreSubscribedAckReconciles: after a kill-9 restart the
+// daemon follows its Sync snapshot with a fresh Subscribed declaration for the
+// restored attachment. The CP's automatic authoritative SubscribedAck must
+// reconcile the re-adopted map by delta: {survivor, stale} becomes
+// {survivor, new}, with no traffic gap for the survivor.
+func TestCgroupPinnedRestoreSubscribedAckReconciles(t *testing.T) {
 	// Initial allowlist: kill9AllowedIP + kill9BlockedIP (the latter plays
 	// the "stale rule" here and must connect at first).
 	env := setupKill9Env(t, "reseed", true, false, 23400, kill9BlockedIP)
 	require.True(t, waitForCondition(5*time.Second, func() bool {
 		return runInCgroup(env.cgroup, kill9BlockedIP+" 53")
 	}), "stale-to-be IP must connect before the restart")
+	require.False(t, runInCgroup(env.cgroup, kill9NewIP+" 53"),
+		"new IP must start blocked so post-restore connectivity proves the ack admitted it")
+
+	initialSubscribeCount := env.cp.SubscribedCount(env.attachID)
+	require.GreaterOrEqual(t, initialSubscribeCount, 1, "initial Attach must have declared Subscribed")
+
+	// Probe the survivor continuously across SIGKILL, pinned enforcement,
+	// re-adoption, and the authoritative delta. Any remove/re-add
+	// implementation would create a visible failure here.
+	probeCtx, probeCancel := context.WithCancel(context.Background())
+	var probeViolations atomic.Int64
+	var probeAttempts atomic.Int64
+	probeDone := make(chan struct{})
+	var probeStopOnce sync.Once
+	stopProbe := func() {
+		probeStopOnce.Do(func() {
+			probeCancel()
+			<-probeDone
+		})
+	}
+	go func() {
+		defer close(probeDone)
+		for probeCtx.Err() == nil {
+			probeAttempts.Add(1)
+			if !runInCgroup(env.cgroup, kill9AllowedIP+" 53") {
+				probeViolations.Add(1)
+			}
+		}
+	}()
+	defer stopProbe()
 
 	env.daemon.kill9(t)
 
-	// Restart with the CP still up: the daemon syncs its restored
-	// attachment, and the CP can push a BulkUpdate to it.
+	// Change desired state while the daemon is down. The restarted daemon
+	// must solicit this full state itself; the test sends no BulkUpdate.
+	env.cp.SetConfig(env.cgroup, &apiv1.SubscribedAck{
+		Mode: apiv1.PolicyMode_POLICY_MODE_ALLOWLIST,
+		AllowCidrs: []*apiv1.CIDREntry{
+			{Cidr: kill9AllowedIP + "/32"},
+			{Cidr: kill9NewIP + "/32"},
+		},
+	})
+
+	// Restart with the CP still up. Sync must be followed by restored
+	// Subscribed, and the CP helper replies with the fresh configuration.
 	d2 := startDaemon(t, env.bin, env.cfgPath, env.socket, env.logPath)
 	defer d2.term(t)
 
 	require.True(t, waitForCondition(15*time.Second, func() bool {
-		return env.cp.HasStream(env.attachID)
-	}), "restored attachment must re-sync with the control plane")
-
-	// Resync now declares {allowed, new} — the stale rule is gone.
-	require.NoError(t, env.cp.SendCommand(env.attachID, &apiv1.ControlCommand{
-		Id:        env.attachID,
-		CommandId: "reseed-bulk",
-		Command: &apiv1.ControlCommand_BulkUpdate{BulkUpdate: &apiv1.BulkUpdate{
-			Mode: apiv1.PolicyMode_POLICY_MODE_ALLOWLIST,
-			AllowCidrs: []*apiv1.CIDREntry{
-				{Cidr: kill9AllowedIP + "/32"},
-				{Cidr: kill9NewIP + "/32"},
-			},
-		}},
-	}))
+		return env.cp.SubscribedCount(env.attachID) > initialSubscribeCount
+	}), "restored attachment must emit a fresh Subscribed after Sync")
 	require.True(t, waitForCondition(10*time.Second, func() bool {
-		res := env.cp.CommandResult("reseed-bulk")
-		return res != nil && res.Success
-	}), "bulk update must be applied and acked")
+		return !runInCgroup(env.cgroup, kill9BlockedIP+" 53") &&
+			runInCgroup(env.cgroup, kill9NewIP+" 53")
+	}), "automatic restored SubscribedAck must remove stale and admit new rules")
 
-	assert.False(t, runInCgroup(env.cgroup, kill9BlockedIP+" 53"),
-		"rule dropped by the resync must be removed even though it was re-adopted from pins")
+	stopProbe()
+	assert.Greater(t, probeAttempts.Load(), int64(5), "survivor probe must span the restart and reconcile")
+	assert.Zero(t, probeViolations.Load(), "survivor traffic must never see a remove/re-add window")
 	assert.True(t, runInCgroup(env.cgroup, kill9AllowedIP+" 53"),
-		"surviving rule must keep connecting across the resync")
-	assert.True(t, runInCgroup(env.cgroup, kill9NewIP+" 53"),
-		"rule added by the resync must connect")
+		"surviving rule must remain connectable after automatic restore reconciliation")
 }

@@ -247,10 +247,28 @@ An explicit `Detach` (RPC/CLI) or a removed target always destroys the
 pinned state along with the attachment.
 
 Notes on re-adopted state:
-- Rule TTL deadlines are not persisted: rules re-adopted after a restart are
-  treated as permanent until the next control-plane sync (a `BulkUpdate`
-  reconciles them exactly, removing anything no longer declared). This fails
-  toward the last-known policy, never toward open.
+- Every successfully restored attachment is marked for authoritative
+  reconciliation. On each control-plane connection the daemon sends the
+  `SyncRequest` first, then a complete `Subscribed` declaration for each
+  restored attachment still needing reconciliation. Reply with a fresh
+  `SubscribedAck`: its mode, CIDRs, TTLs, and DNS config are the complete
+  desired state. The daemon applies a delta (unchanged CIDRs are never
+  removed), and clears the restore marker only after the entire ack applies.
+  A timeout, disconnect, or validation failure leaves enforcement unchanged.
+  A filter/map/DNS/store apply failure can leave a partial delta, but the
+  reconcile does not use a wholesale map clear or remove/re-add unchanged
+  survivors; the restore marker remains set and the daemon retries after a
+  later connection.
+- Rule TTL deadlines themselves are not persisted. Re-adopted rules are
+  provisionally treated as permanent until the fresh `SubscribedAck` lands;
+  that authoritative ack replaces their lifetimes exactly, including
+  shortening a deadline or turning a provisionally permanent rule back into
+  a finite-TTL rule.
+- If no control plane is configured or reachable, no automatic rule changes
+  occur: an adopted pinned map continues enforcing its last-known contents. A
+  restore that cannot adopt valid pins recreates the attachment in its
+  persisted mode with empty maps (fail-closed for allowlist/block-all) and
+  uses the same `SubscribedAck` handshake to repopulate it.
 - The per-attachment DNS server is a userspace component and stops with the
   daemon; while the daemon is down, already-resolved (still unexpired) IPs
   keep working but new names cannot be resolved through it.
@@ -293,8 +311,12 @@ Direction only applies to interface (TC) attachments; it is ignored for
 cgroup attachments.
 
 - Daemon attaches eBPF filter to the target
-- Daemon sends `Subscribed{id, target, type, metadata}` to control plane and waits for `SubscribedAck` with initial config (mode, CIDRs, DNS rules)
+- Daemon sends `Subscribed{id, target, type, metadata}` to the control plane and waits for `SubscribedAck` with initial config (mode, CIDRs, DNS rules)
 - If the control plane doesn't respond within the timeout (default 5s, configurable via `control_plane.subscribe_ack_timeout`), the attachment is rolled back and the attach call fails
+- With `subscribe_ack_timeout: 0`, a new `Attach` returns after queuing
+  `Subscribed`; a later ack is still validated and applied. This zero value
+  does not disable restored-attachment reconciliation: restore attempts wait
+  up to 5s in the background and retry on a later connection if needed.
 - Daemon watches for target removal and sends `Unsubscribed` automatically
 
 **RPC:**
@@ -335,7 +357,7 @@ grpc.NewServer(grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
 
 **Receive from daemon:**
 - `SyncRequest` on connect/reconnect (lists current attachments)
-- `Subscribed` when new attachments are added
+- `Subscribed` when new attachments are added, and after `SyncRequest` for restored attachments that still need fresh authoritative state
 - `Unsubscribed` when attachments are removed
 - `Heartbeat` with stats
 - `CommandResult{command_id, id, success, error}` — outcome of any command you sent with a non-empty `command_id` (opt-in correlation nonce on `ControlCommand`; commands without one produce no result). `success` is true only if the command fully applied — a partially-applied `BulkUpdate` reports failure with the aggregated error. Results are best-effort: treat a missing result as unknown, not failed.
@@ -349,7 +371,13 @@ grpc.NewServer(grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
 - `AllowDomain{domain}` / `DenyDomain` / `RemoveDomain`
 - `BulkUpdate{mode, cidrs, dns_config}` - full state sync
 
-When the daemon receives `Subscribed`, it blocks waiting for `SubscribedAck` before returning success to the caller. This ensures the attachment has its initial configuration before traffic flows. Use the metadata to identify which VM/tenant/container this attachment belongs to and respond with the appropriate initial rules.
+When the control plane receives `Subscribed`, it must reply with a complete
+`SubscribedAck`. For a new attachment the daemon normally waits for that ack
+before returning success to the local caller. For a restored attachment the
+handshake runs in the background while the pinned last-known policy keeps
+enforcing. Use the metadata to identify the VM/tenant/container and return the
+complete desired mode, CIDRs (including TTLs), and DNS state; an omitted DNS
+config means disabled with empty domain lists.
 
 ### Reconnects and idempotency (required)
 
@@ -364,13 +392,12 @@ or `CommandResult`s from the dead connection replayed after it. Two edge
 cases remain by design, and your control plane MUST handle them
 idempotently:
 
-- A `Subscribed` whose `SubscribedAck` was still pending when the
-  connection dropped is re-sent on the new connection after the
-  `SyncRequest` (which may already list that same attachment), because the
-  daemon-side attach caller is still blocked waiting for the ack — you
-  acknowledge `Subscribed`, not `SyncRequest`. Treat a `Subscribed` for an
-  already-known attachment id as an update (and reply with a fresh
-  `SubscribedAck`), never as a duplicate.
+- A `Subscribed` can follow a `SyncRequest` that already lists the same id.
+  This happens when a new attachment's ack was pending across reconnect, and
+  deliberately for every restored attachment until one authoritative ack
+  applies completely. Treat it as an update, reply with a fresh complete
+  `SubscribedAck`, and never discard it as a duplicate. `SyncRequest`
+  reconciles attachment inventory; `SubscribedAck` reconciles desired policy.
 - An event generated concurrently with the (re)connect can race the sync
   snapshot in either direction. Treat an `Unsubscribed` for an unknown or
   already-removed attachment id as a no-op.
@@ -378,6 +405,6 @@ idempotently:
 ### Rule lifetimes (TTLs)
 
 - CIDR entries (`AllowCIDR`/`DenyCIDR` commands, and the CIDR lists in `SubscribedAck`/`BulkUpdate`) carry an optional TTL. TTL'd rules are removed by a daemon janitor once they expire (scan interval `ttl_janitor_interval`, default 1s); rules without a TTL are permanent.
-- Re-adding a CIDR extends its lifetime to the later deadline — it never shortens one — and re-adding without a TTL makes it permanent. Use `RemoveCIDR` to drop a rule early.
+- Incremental `AllowCIDR`/`DenyCIDR` re-adds extend a CIDR to the later deadline — they never shorten one — and an incremental re-add without a TTL makes it permanent. In contrast, the complete state in `SubscribedAck`/`BulkUpdate` replaces each control-plane lifetime exactly, so authoritative reconciliation can shorten a TTL or change permanent to finite without removing/re-adding the live map entry. Use `RemoveCIDR` to drop an incremental rule early.
 - DNS-resolved IPs enter the filter with the record TTL floored by `dns.min_filter_ttl` (default 60s; zero/unset means the default, not "no floor") and expire the same way. A permanent (or longer-lived) CIDR rule covering the same address is never removed by DNS expiry.
 - Each rule map holds `filter.max_rule_entries` entries per attachment (default 4096, load-time sizing with no per-packet cost). When a map is full, new adds fail loudly and are counted in the `map_full_drops` heartbeat stat instead of being silently dropped.

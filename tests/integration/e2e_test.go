@@ -117,6 +117,7 @@ type testControlPlane struct {
 	noAckTargets   map[string]bool
 	unsubscribed   map[string]*apiv1.Unsubscribed
 	commandResults map[string]*apiv1.CommandResult // command_id -> result
+	subscribed     map[string]int                  // attachment_id -> observed declarations
 }
 
 func newTestControlPlane() *testControlPlane {
@@ -127,6 +128,7 @@ func newTestControlPlane() *testControlPlane {
 		noAckTargets:   make(map[string]bool),
 		unsubscribed:   make(map[string]*apiv1.Unsubscribed),
 		commandResults: make(map[string]*apiv1.CommandResult),
+		subscribed:     make(map[string]int),
 	}
 }
 
@@ -161,6 +163,12 @@ func (cp *testControlPlane) HasStream(id string) bool {
 	defer cp.mu.RUnlock()
 	_, ok := cp.streams[id]
 	return ok
+}
+
+func (cp *testControlPlane) SubscribedCount(id string) int {
+	cp.mu.RLock()
+	defer cp.mu.RUnlock()
+	return cp.subscribed[id]
 }
 
 func (cp *testControlPlane) Unsubscribed(id string) *apiv1.Unsubscribed {
@@ -213,8 +221,9 @@ func (cp *testControlPlane) Connect(stream grpc.BidiStreamingServer[apiv1.Daemon
 		switch e := event.Event.(type) {
 		case *apiv1.DaemonEvent_Sync:
 			// Register the stream for every synced attachment so tests can
-			// SendCommand to attachments restored by a daemon restart (which
-			// re-announce via Sync, not Subscribed).
+			// SendCommand immediately after a daemon restart. Restored
+			// attachments also follow this snapshot with a fresh Subscribed
+			// declaration so the CP can return authoritative desired state.
 			cp.mu.Lock()
 			for _, att := range e.Sync.Attachments {
 				cp.streams[att.Id] = stream
@@ -229,6 +238,7 @@ func (cp *testControlPlane) Connect(stream grpc.BidiStreamingServer[apiv1.Daemon
 		case *apiv1.DaemonEvent_Subscribed:
 			cp.mu.Lock()
 			cp.streams[e.Subscribed.Id] = stream
+			cp.subscribed[e.Subscribed.Id]++
 			noAck := cp.noAckTargets[e.Subscribed.Target]
 
 			ack := cp.pendingConfig[e.Subscribed.Target]

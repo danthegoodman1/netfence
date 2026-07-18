@@ -186,6 +186,81 @@ func TestServerReplaceDNSRulesPersists(t *testing.T) {
 	assert.Equal(t, map[string]bool{"denied.test": false}, dnsServer.deniedDomains)
 }
 
+func TestStopOwnsTerminalTeardownExactlyOnce(t *testing.T) {
+	tests := []struct {
+		name       string
+		startOther func(*Server, string, *attachmentState) <-chan error
+	}{
+		{
+			name: "concurrent_detach",
+			startOther: func(server *Server, id string, _ *attachmentState) <-chan error {
+				done := make(chan error, 1)
+				go func() {
+					_, err := server.Detach(context.Background(), &apiv1.DetachRequest{Id: id})
+					done <- err
+				}()
+				return done
+			},
+		},
+		{
+			name: "concurrent_target_removal",
+			startOther: func(server *Server, _ string, state *attachmentState) <-chan error {
+				done := make(chan error, 1)
+				go func() {
+					server.handleTargetRemoved(state.watch)
+					done <- nil
+				}()
+				return done
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server, _, id, ff, _ := newTestServerWithAttachment(t)
+			server.mu.Lock()
+			state := server.attachments[id]
+			state.watch = watchToken{generation: 1, target: state.info.Target, kind: watchKindInterface, identity: 1}
+			server.mu.Unlock()
+
+			// Gate both terminal contenders on the exact state. Once Stop has
+			// published stopping, Detach/removal must decline ownership and Stop
+			// must close the state exactly once.
+			state.reconcileMu.Lock()
+			otherDone := tt.startOther(server, id, state)
+			stopDone := make(chan struct{})
+			go func() {
+				defer close(stopDone)
+				server.Stop()
+			}()
+			require.Eventually(t, func() bool {
+				server.mu.RLock()
+				defer server.mu.RUnlock()
+				return server.stopping
+			}, time.Second, time.Millisecond)
+			state.reconcileMu.Unlock()
+
+			select {
+			case err := <-otherDone:
+				if tt.name == "concurrent_detach" {
+					require.Error(t, err)
+					assert.Contains(t, err.Error(), "daemon is stopping")
+				}
+			case <-time.After(time.Second):
+				t.Fatal("concurrent terminal path did not return")
+			}
+			select {
+			case <-stopDone:
+			case <-time.After(time.Second):
+				t.Fatal("Stop did not finish")
+			}
+			assert.Equal(t, 1, ff.closeCallCount())
+			assert.Zero(t, ff.detachCallCount())
+			assert.Zero(t, ff.mutationAfterCloseCount())
+		})
+	}
+}
+
 func netIP(t *testing.T, value string) net.IP {
 	t.Helper()
 	ip := net.ParseIP(value)

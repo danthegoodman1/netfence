@@ -226,7 +226,10 @@ func (*DaemonEvent_CommandResult) isDaemonEvent_Event() {}
 // when it reconnects, but a just-generated event can still race the sync
 // snapshot in either direction, so the control plane MUST apply the
 // idempotency rules documented on Subscribed and Unsubscribed to any event
-// arriving after a SyncRequest.
+// arriving after a SyncRequest. An attachment restored from persisted/pinned
+// state is present in this list and then sends Subscribed after the SyncRequest
+// until one authoritative SubscribedAck applies completely. SyncRequest
+// reconciles attachment inventory; it does not replace that policy handshake.
 type SyncRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Daemon instance identifier (stable across restarts)
@@ -400,16 +403,20 @@ func (x *Attachment) GetTcDirection() TcDirection {
 	return TcDirection_TC_DIRECTION_UNSPECIFIED
 }
 
-// Subscribed notifies that a new filter attachment is now managed.
+// Subscribed declares the complete identity/current state of a managed filter
+// attachment. It is sent for a new attachment and re-sent after SyncRequest for
+// a restored attachment until fresh authoritative desired state is applied.
 //
 // Idempotency: the control plane MUST treat a Subscribed for an
 // already-known attachment id as an update to that attachment (and reply
 // with a fresh SubscribedAck), never as a duplicate registration. This
 // re-delivery is legitimate: a Subscribed whose SubscribedAck was still
-// pending when the connection dropped is re-sent on the next connection
-// AFTER the fresh SyncRequest (which may already list the same attachment),
-// because the daemon-side caller is still blocked waiting for the ack — the
-// control plane acknowledges Subscribed, not SyncRequest.
+// pending when the connection dropped is re-sent on the next connection, and
+// a restored attachment deliberately sends one on every connection until an
+// ack applies completely. It always follows the fresh SyncRequest (which may
+// already list the same attachment). The control plane acknowledges
+// Subscribed, not SyncRequest; it MUST answer each effective declaration with
+// a complete fresh SubscribedAck.
 type Subscribed struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Unique identifier for this attachment
@@ -418,9 +425,9 @@ type Subscribed struct {
 	Target string `protobuf:"bytes,2,opt,name=target,proto3" json:"target,omitempty"`
 	// Type of attachment
 	Type AttachmentType `protobuf:"varint,3,opt,name=type,proto3,enum=netfence.v1.AttachmentType" json:"type,omitempty"`
-	// Initial IP filter policy mode
+	// Current IP filter policy mode
 	Mode PolicyMode `protobuf:"varint,4,opt,name=mode,proto3,enum=netfence.v1.PolicyMode" json:"mode,omitempty"`
-	// Initial DNS filtering mode
+	// Current DNS filtering mode
 	DnsMode DnsMode `protobuf:"varint,5,opt,name=dns_mode,json=dnsMode,proto3,enum=netfence.v1.DnsMode" json:"dns_mode,omitempty"`
 	// DNS server address for this attachment (e.g., "10.0.0.1:53")
 	// Containers should use this as their DNS resolver
@@ -960,7 +967,8 @@ type ControlCommand_RemoveDomain struct {
 }
 
 type ControlCommand_SubscribedAck struct {
-	// Acknowledge subscription with initial config (sent after receiving Subscribed)
+	// Acknowledge a subscription declaration with complete authoritative config
+	// (sent after receiving Subscribed, including restored declarations)
 	SubscribedAck *SubscribedAck `protobuf:"bytes,12,opt,name=subscribed_ack,json=subscribedAck,proto3,oneof"`
 }
 
@@ -1103,7 +1111,13 @@ func (*SyncAck) Descriptor() ([]byte, []int) {
 	return file_v1_control_proto_rawDescGZIP(), []int{9}
 }
 
-// SubscribedAck acknowledges a Subscribed event and provides initial configuration.
+// SubscribedAck acknowledges a Subscribed event and provides complete,
+// authoritative desired state. It configures a new attachment and reconciles a
+// restored attachment's last-known map contents. The daemon applies it by
+// delta: unchanged CIDRs remain installed, stale CIDRs are removed, new CIDRs
+// are added, and control-plane TTLs are replaced exactly. The restore remains
+// pending after any validation or apply failure and is retried after a later
+// connection.
 //
 // Design note: This is sent over the bidirectional stream (rather than a separate
 // unary RPC) to ensure the same control plane node that holds the stream connection
@@ -1112,13 +1126,13 @@ func (*SyncAck) Descriptor() ([]byte, []int) {
 // that doesn't have the stream, requiring cross-node coordination.
 type SubscribedAck struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Initial IP filter policy mode
+	// Complete desired IP filter policy mode. Must be a known non-UNSPECIFIED value.
 	Mode PolicyMode `protobuf:"varint,1,opt,name=mode,proto3,enum=netfence.v1.PolicyMode" json:"mode,omitempty"`
-	// Initial CIDRs to allow
+	// Complete desired CIDRs to allow (canonical duplicates are invalid).
 	AllowCidrs []*CIDREntry `protobuf:"bytes,2,rep,name=allow_cidrs,json=allowCidrs,proto3" json:"allow_cidrs,omitempty"`
-	// Initial CIDRs to deny
+	// Complete desired CIDRs to deny (canonical duplicates are invalid).
 	DenyCidrs []*CIDREntry `protobuf:"bytes,3,rep,name=deny_cidrs,json=denyCidrs,proto3" json:"deny_cidrs,omitempty"`
-	// Initial DNS configuration
+	// Complete desired DNS configuration. Omitted means disabled with empty lists.
 	Dns           *DnsConfig `protobuf:"bytes,4,opt,name=dns,proto3" json:"dns,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -1227,11 +1241,12 @@ func (x *SetMode) GetMode() PolicyMode {
 	return PolicyMode_POLICY_MODE_UNSPECIFIED
 }
 
-// BulkUpdate sets the complete state for an attachment.
-// Clears existing rules and replaces with the provided state.
+// BulkUpdate sets the complete authoritative state for an attachment. The
+// daemon reconciles by delta; an unchanged CIDR is not removed/re-added, and
+// its control-plane TTL is replaced exactly by the provided lifetime.
 type BulkUpdate struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// IP filter policy mode
+	// Complete desired IP filter policy mode. Must be a known non-UNSPECIFIED value.
 	Mode PolicyMode `protobuf:"varint,1,opt,name=mode,proto3,enum=netfence.v1.PolicyMode" json:"mode,omitempty"`
 	// CIDRs to allow
 	AllowCidrs []*CIDREntry `protobuf:"bytes,2,rep,name=allow_cidrs,json=allowCidrs,proto3" json:"allow_cidrs,omitempty"`
@@ -1304,7 +1319,7 @@ func (x *BulkUpdate) GetDns() *DnsConfig {
 // DnsConfig contains the complete DNS filtering configuration.
 type DnsConfig struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// DNS filtering mode
+	// Complete desired DNS filtering mode. Must be a known non-UNSPECIFIED value.
 	Mode DnsMode `protobuf:"varint,1,opt,name=mode,proto3,enum=netfence.v1.DnsMode" json:"mode,omitempty"`
 	// Domains to allow (when mode is ALLOWLIST or to override in DENYLIST)
 	AllowDomains []*DomainEntry `protobuf:"bytes,2,rep,name=allow_domains,json=allowDomains,proto3" json:"allow_domains,omitempty"`
@@ -1375,7 +1390,10 @@ func (x *DnsConfig) GetUpstreamServers() []string {
 	return nil
 }
 
-// CIDREntry represents a CIDR with optional TTL.
+// CIDREntry represents a CIDR with an optional TTL. In complete
+// SubscribedAck/BulkUpdate state, TTLs must be valid and non-negative and
+// replace control-plane lifetimes exactly. Incremental AllowCIDR/DenyCIDR
+// positive-TTL re-adds extend lifetimes monotonically; absent/zero is permanent.
 type CIDREntry struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Cidr          string                 `protobuf:"bytes,1,opt,name=cidr,proto3" json:"cidr,omitempty"`

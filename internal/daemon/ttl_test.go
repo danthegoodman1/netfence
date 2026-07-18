@@ -231,6 +231,32 @@ func TestBulkUpdatePurgesAndTracksTTLs(t *testing.T) {
 	assert.Zero(t, registryLen(t, server, id))
 }
 
+// A full desired state replaces CP lifetimes exactly. Incremental adds remain
+// monotonic, but a BulkUpdate/SubscribedAck must be able to correct a long
+// deadline to a short one without removing/re-adding the surviving map entry.
+func TestBulkUpdateShortensSurvivingCPDeadlineWithoutRemove(t *testing.T) {
+	server, _, id, ff, _ := newTestServerWithAttachment(t)
+	clk := newFakeClock()
+	server.now = clk.Now
+	c := NewControlPlaneClient("", server, zerolog.Nop(), nil, 0, nil)
+
+	c.handleCommand(allowCidrCmd(id, "10.0.0.0/8", time.Hour))
+	require.NoError(t, c.applyBulkUpdate(id, &apiv1.BulkUpdate{
+		Mode: apiv1.PolicyMode_POLICY_MODE_ALLOWLIST,
+		AllowCidrs: []*apiv1.CIDREntry{{
+			Cidr: "10.0.0.0/8",
+			Ttl:  durationpb.New(2 * time.Second),
+		}},
+	}))
+	removed, _ := ff.removeCalls()
+	assert.Empty(t, removed, "survivor lifetime correction must be bookkeeping-only")
+
+	clk.Advance(2 * time.Second)
+	server.sweepExpiredTTLs(clk.Now())
+	_, allowed, _, _ := ff.snapshot()
+	assert.Empty(t, allowed, "the authoritative shorter deadline must replace the incremental longer deadline")
+}
+
 // TestSubscribedAckTracksTTLs covers the applySubscribedAck entry point.
 func TestSubscribedAckTracksTTLs(t *testing.T) {
 	server, _, id, ff, _ := newTestServerWithAttachment(t)

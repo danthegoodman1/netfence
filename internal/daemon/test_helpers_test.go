@@ -17,17 +17,24 @@ import (
 )
 
 type fakeFilter struct {
-	mu           sync.Mutex
-	mode         filter.PolicyMode
-	allowed      []string
-	denied       []string
-	clearCalls   int
-	stats        filter.Stats
-	setModeCalls int
-	allowCalls   int
-	closeCalls   int
-	detachCalls  int
-	allowErr     error // when set, AllowIP fails with this error
+	mu                  sync.Mutex
+	mode                filter.PolicyMode
+	allowed             []string
+	denied              []string
+	clearCalls          int
+	stats               filter.Stats
+	setModeCalls        int
+	allowCalls          int
+	closeCalls          int
+	detachCalls         int
+	allowErr            error // when set, AllowIP fails with this error
+	rulesErr            error // when set, adopted-map inventory fails
+	removeAllowErr      error
+	removeDenyErr       error
+	setModeEntered      chan struct{}
+	setModeRelease      <-chan struct{}
+	setModeOnce         sync.Once
+	mutationsAfterClose int
 	// removedAllowed/removedDenied record every Remove call (even for CIDRs
 	// not present, mirroring the real filter's idempotent removes), so tests
 	// can prove a surviving rule was NEVER removed during a transition.
@@ -43,16 +50,38 @@ type fakeFilter struct {
 
 func (f *fakeFilter) SetMode(mode filter.PolicyMode) error {
 	f.mu.Lock()
+	entered, release := f.setModeEntered, f.setModeRelease
+	f.mu.Unlock()
+	if entered != nil {
+		f.setModeOnce.Do(func() { close(entered) })
+	}
+	if release != nil {
+		<-release
+	}
+	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.closeCalls > 0 {
+		f.mutationsAfterClose++
+	}
 	f.mode = mode
 	f.setModeCalls++
 	f.events = append(f.events, "set-mode "+mode.String())
 	return nil
 }
 
+func (f *fakeFilter) blockSetMode(entered chan struct{}, release <-chan struct{}) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.setModeEntered = entered
+	f.setModeRelease = release
+}
+
 func (f *fakeFilter) AllowIP(cidr *net.IPNet) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.closeCalls > 0 {
+		f.mutationsAfterClose++
+	}
 	f.allowCalls++
 	f.events = append(f.events, "allow "+cidr.String())
 	if f.allowErr != nil {
@@ -69,6 +98,12 @@ func (f *fakeFilter) setAllowErr(err error) {
 	f.allowErr = err
 }
 
+func (f *fakeFilter) setRulesErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.rulesErr = err
+}
+
 func (f *fakeFilter) allowCallCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -78,6 +113,9 @@ func (f *fakeFilter) allowCallCount() int {
 func (f *fakeFilter) DenyIP(cidr *net.IPNet) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.closeCalls > 0 {
+		f.mutationsAfterClose++
+	}
 	f.events = append(f.events, "deny "+cidr.String())
 	f.denied = appendUnique(f.denied, cidr.String())
 	return nil
@@ -86,8 +124,14 @@ func (f *fakeFilter) DenyIP(cidr *net.IPNet) error {
 func (f *fakeFilter) RemoveAllowedIP(cidr *net.IPNet) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.closeCalls > 0 {
+		f.mutationsAfterClose++
+	}
 	f.events = append(f.events, "remove-allow "+cidr.String())
 	f.removedAllowed = append(f.removedAllowed, cidr.String())
+	if f.removeAllowErr != nil {
+		return f.removeAllowErr
+	}
 	f.allowed = removeString(f.allowed, cidr.String())
 	return nil
 }
@@ -95,10 +139,22 @@ func (f *fakeFilter) RemoveAllowedIP(cidr *net.IPNet) error {
 func (f *fakeFilter) RemoveDeniedIP(cidr *net.IPNet) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.closeCalls > 0 {
+		f.mutationsAfterClose++
+	}
 	f.events = append(f.events, "remove-deny "+cidr.String())
 	f.removedDenied = append(f.removedDenied, cidr.String())
+	if f.removeDenyErr != nil {
+		return f.removeDenyErr
+	}
 	f.denied = removeString(f.denied, cidr.String())
 	return nil
+}
+
+func (f *fakeFilter) setRemoveAllowedErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.removeAllowErr = err
 }
 
 func (f *fakeFilter) removeCalls() (removedAllowed, removedDenied []string) {
@@ -117,11 +173,20 @@ func (f *fakeFilter) eventLog() []string {
 func (f *fakeFilter) ClearRules() error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.closeCalls > 0 {
+		f.mutationsAfterClose++
+	}
 	f.events = append(f.events, "clear")
 	f.allowed = nil
 	f.denied = nil
 	f.clearCalls++
 	return nil
+}
+
+func (f *fakeFilter) mutationAfterCloseCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.mutationsAfterClose
 }
 
 func (f *fakeFilter) GetStats() (filter.Stats, error) {
@@ -165,6 +230,9 @@ func (f *fakeFilter) detachCallCount() int {
 func (f *fakeFilter) Rules() (allowed, denied []*net.IPNet, err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.rulesErr != nil {
+		return nil, nil, f.rulesErr
+	}
 	for _, s := range f.allowed {
 		_, cidr, perr := net.ParseCIDR(s)
 		if perr != nil {

@@ -34,6 +34,8 @@ type Server struct {
 	version  string
 
 	mu          sync.RWMutex
+	stopping    bool
+	attachWG    sync.WaitGroup
 	portPool    map[int]bool
 	attachments map[string]*attachmentState
 	targetIndex map[string]string // target -> attachment ID (for reverse lookup on removal)
@@ -90,6 +92,19 @@ type attachmentState struct {
 	info   *store.Attachment
 	dns    *DNSServer
 	filter filter.Filter
+	// reconcileMu serializes an authoritative SubscribedAck apply against
+	// teardown of this exact state. Server.mu is never held while waiting for
+	// it: teardown uses lookup -> lock -> revalidate, while ack uses lock ->
+	// exact-live validation, avoiding lock inversion and preventing a delayed
+	// store save/filter call from resurrecting or touching a detached state.
+	reconcileMu sync.Mutex
+	// needsResync is set only for attachments successfully restored by Start
+	// (whether their filter was re-adopted from pins or recreated empty). The
+	// control-plane client re-drives Subscribed -> SubscribedAck after each
+	// connection's fresh SyncRequest and clears this flag only after an
+	// authoritative full-state ack has been applied successfully to this exact
+	// attachmentState. Guarded by Server.mu.
+	needsResync bool
 	// watch identifies the exact watcher registration owned by this
 	// attachment. A delayed callback for an older same-target generation is
 	// ignored unless this token still matches.
@@ -225,7 +240,18 @@ func (s *Server) Start() error {
 			continue
 		}
 		if adopted {
-			s.seedAdoptedState(id, state, ebpfFilter)
+			if err := s.seedAdoptedState(id, state, ebpfFilter); err != nil {
+				// Inventory is required for an authoritative delta reconcile: if a
+				// live pinned rule is absent from the registry, a later ack could
+				// falsely report convergence while leaving stale enforcement behind.
+				// Abort startup and Close (not Detach) so the pins keep enforcing the
+				// last-known policy for a clean retry.
+				if closeErr := ebpfFilter.Close(); closeErr != nil {
+					s.logger.Warn().Err(closeErr).Str("id", id).Msg("failed to close adopted filter after inventory failure")
+				}
+				s.mu.Unlock()
+				return fmt.Errorf("inventorying re-adopted attachment %s: %w", id, err)
+			}
 		}
 
 		var proxyFunc DnsProxyFunc
@@ -282,6 +308,7 @@ func (s *Server) Start() error {
 		state.watch = token
 		state.filter = ebpfFilter
 		state.dns = dnsServer
+		state.needsResync = true
 
 		s.logger.Info().
 			Str("id", id).
@@ -423,9 +450,11 @@ func (s *Server) restoreFilter(id, target string, attachType apiv1.AttachmentTyp
 // are not persisted, so TTL'd rules come back permanent until the next
 // control-plane sync corrects them; that fails toward last-known policy.
 // Called with s.mu held during Start (no concurrent rule traffic yet).
-func (s *Server) seedAdoptedState(id string, state *attachmentState, f filter.Filter) {
+func (s *Server) seedAdoptedState(id string, state *attachmentState, f filter.Filter) error {
+	var seedErr error
 	if liveMode, err := f.GetMode(); err != nil {
 		s.logger.Warn().Err(err).Str("id", id).Msg("failed to read mode from re-adopted filter")
+		seedErr = errors.Join(seedErr, fmt.Errorf("reading adopted mode: %w", err))
 	} else if apiMode := filterModeToAPIMode(liveMode); apiMode.String() != state.info.Mode {
 		s.logger.Info().Str("id", id).
 			Str("store_mode", state.info.Mode).
@@ -434,6 +463,7 @@ func (s *Server) seedAdoptedState(id string, state *attachmentState, f filter.Fi
 		state.info.Mode = apiMode.String()
 		if err := s.store.SaveAttachment(cloneAttachment(state.info)); err != nil {
 			s.logger.Warn().Err(err).Str("id", id).Msg("failed to persist re-adopted mode")
+			seedErr = errors.Join(seedErr, fmt.Errorf("persisting adopted mode: %w", err))
 		}
 	}
 
@@ -441,29 +471,30 @@ func (s *Server) seedAdoptedState(id string, state *attachmentState, f filter.Fi
 		Rules() (allowed, denied []*net.IPNet, err error)
 	})
 	if !ok {
-		return
+		return errors.Join(seedErr, fmt.Errorf("adopted filter does not support rule inventory"))
 	}
 	allowed, denied, err := lister.Rules()
 	if err != nil {
-		s.logger.Warn().Err(err).Str("id", id).
-			Msg("failed to list re-adopted rules; later bulk updates may not remove stale entries")
-		return
+		return errors.Join(seedErr, fmt.Errorf("listing adopted rules: %w", err))
 	}
 	now := s.now()
 	for _, cidr := range allowed {
 		if err := state.ttls.addCP(f, cidr, listAllow, 0, now); err != nil {
 			s.logger.Warn().Err(err).Str("id", id).Str("cidr", cidr.String()).Msg("failed to seed re-adopted allow rule")
+			seedErr = errors.Join(seedErr, fmt.Errorf("seeding adopted allow %s: %w", cidr, err))
 		}
 	}
 	for _, cidr := range denied {
 		if err := state.ttls.addCP(f, cidr, listDeny, 0, now); err != nil {
 			s.logger.Warn().Err(err).Str("id", id).Str("cidr", cidr.String()).Msg("failed to seed re-adopted deny rule")
+			seedErr = errors.Join(seedErr, fmt.Errorf("seeding adopted deny %s: %w", cidr, err))
 		}
 	}
 	s.logger.Info().Str("id", id).
 		Int("allow_rules", len(allowed)).
 		Int("deny_rules", len(denied)).
 		Msg("re-adopted pinned rules (permanent until next control-plane sync; TTL deadlines are not persisted)")
+	return seedErr
 }
 
 // targetPresent reports whether an attachment target still exists.
@@ -492,6 +523,18 @@ func (s *Server) validateTargetIdentity(attachType apiv1.AttachmentType, target 
 }
 
 func (s *Server) Stop() {
+	// Publish terminal lifecycle state before waiting on any exact attachment
+	// lock. A claimed ack that already owns reconcileMu may finish; every later
+	// ack fails its exact-live check. Stop then joins each owner before closing
+	// its filter/DNS resources, so no apply can run against a closed handle.
+	s.mu.Lock()
+	s.stopping = true
+	s.mu.Unlock()
+	// Add is performed under the same mutex before an Attach begins, so once
+	// stopping is published no new Add can race this Wait. Let in-flight
+	// Attach calls commit or roll back before taking the terminal snapshot.
+	s.attachWG.Wait()
+
 	// Stop the janitor before closing filters so a sweep never races with
 	// wholesale filter teardown.
 	s.janitorStopOnce.Do(func() { close(s.janitorStop) })
@@ -499,12 +542,12 @@ func (s *Server) Stop() {
 
 	s.watcher.Stop()
 
-	s.mu.Lock()
+	s.mu.RLock()
 	attachments := make([]*attachmentState, 0, len(s.attachments))
 	for _, state := range s.attachments {
 		attachments = append(attachments, state)
 	}
-	s.mu.Unlock()
+	s.mu.RUnlock()
 
 	if s.detachOnStop {
 		s.logger.Info().Int("attachments", len(attachments)).
@@ -515,6 +558,14 @@ func (s *Server) Stop() {
 	}
 
 	for _, state := range attachments {
+		if cpClient := s.cpClient.Load(); cpClient != nil {
+			cpClient.cancelSubscription(state.info.ID, fmt.Errorf("daemon stopping"))
+		}
+		state.reconcileMu.Lock()
+		if !s.attachmentStatePresent(state.info.ID, state) {
+			state.reconcileMu.Unlock()
+			continue
+		}
 		if state.dns != nil {
 			state.dns.Stop()
 		}
@@ -527,6 +578,7 @@ func (s *Server) Stop() {
 				state.filter.Close()
 			}
 		}
+		state.reconcileMu.Unlock()
 	}
 }
 
@@ -590,19 +642,24 @@ func (s *Server) sweepExpiredTTLs(now time.Time) {
 }
 
 func (s *Server) handleTargetRemoved(token watchToken) {
-	s.mu.Lock()
 	target := token.target
+	s.mu.RLock()
 	id, ok := s.targetIndex[target]
 	if !ok {
-		s.mu.Unlock()
+		s.mu.RUnlock()
 		return
 	}
 	state, ok := s.attachments[id]
-	if !ok {
-		s.mu.Unlock()
+	if !ok || state.watch != token {
+		s.mu.RUnlock()
 		return
 	}
-	if state.watch != token {
+	s.mu.RUnlock()
+
+	state.reconcileMu.Lock()
+	defer state.reconcileMu.Unlock()
+	s.mu.Lock()
+	if s.stopping || s.targetIndex[target] != id || s.attachments[id] != state || state.watch != token {
 		s.mu.Unlock()
 		return
 	}
@@ -622,6 +679,13 @@ func (s *Server) handleTargetRemoved(token watchToken) {
 	delete(s.attachments, id)
 	delete(s.targetIndex, target)
 	s.mu.Unlock()
+
+	// A SubscribedAck that was in flight for this exact attachment is stale
+	// once ownership has been removed. Cancel it before tearing down the
+	// filter/DNS resources so a late ack cannot race the teardown.
+	if cpClient := s.cpClient.Load(); cpClient != nil {
+		cpClient.cancelSubscription(id, fmt.Errorf("attachment target was removed"))
+	}
 
 	// Drop TTL bookkeeping so an in-flight janitor sweep does not keep
 	// retrying removals against the filter we are about to close.
@@ -684,6 +748,12 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (*apiv1.A
 	}
 
 	s.mu.Lock()
+	if s.stopping {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("daemon is stopping")
+	}
+	s.attachWG.Add(1)
+	defer s.attachWG.Done()
 	if existingID, ok := s.targetIndex[target]; ok {
 		s.mu.Unlock()
 		return nil, fmt.Errorf("target already attached: %s (%s)", target, existingID)
@@ -738,11 +808,15 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (*apiv1.A
 		}
 		if registered != nil {
 			// The attachment was publicly visible, so a concurrent Detach or
-			// target removal may already own its teardown. Claim ownership by
-			// removing the registration under s.mu: if it is already gone,
+			// target removal (or a claimed SubscribedAck) may already own it.
+			// Wait for the exact state's reconcile lock WITHOUT Server.mu, then
+			// revalidate and claim ownership by removing the registration. If it
+			// is already gone,
 			// the remover tore down EVERYTHING (filter, DNS, port, store row,
 			// watch) and this rollback must be a no-op — anything else would
 			// double-free.
+			registered.reconcileMu.Lock()
+			defer registered.reconcileMu.Unlock()
 			s.mu.Lock()
 			if s.attachments[id] != registered {
 				s.mu.Unlock()
@@ -758,6 +832,9 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (*apiv1.A
 				s.watcher.UnwatchCgroup(registered.watch)
 			}
 			s.mu.Unlock()
+			if cpClient := s.cpClient.Load(); cpClient != nil {
+				cpClient.cancelSubscription(id, fmt.Errorf("attachment setup rolled back"))
+			}
 
 			// Drop TTL bookkeeping so an in-flight janitor sweep does not
 			// keep retrying removals against the filter we are closing.
@@ -845,6 +922,10 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (*apiv1.A
 
 	state := &attachmentState{info: attachment, dns: dnsServer, filter: ebpfFilter, ttls: ttls}
 	s.mu.Lock()
+	if s.stopping {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("daemon is stopping")
+	}
 	if existingID, ok := s.targetIndex[target]; ok {
 		s.mu.Unlock()
 		return nil, fmt.Errorf("target already attached: %s (%s)", target, existingID)
@@ -887,16 +968,7 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (*apiv1.A
 	logEvent.Msg("attached filter")
 
 	if cpClient := s.cpClient.Load(); cpClient != nil {
-		sub := &apiv1.Subscribed{
-			Id:          id,
-			Target:      target,
-			Type:        attachType,
-			Mode:        mode,
-			DnsMode:     apiv1.DnsMode_DNS_MODE_DISABLED,
-			DnsAddress:  dnsAddr,
-			Metadata:    req.Metadata,
-			TcDirection: direction,
-		}
+		sub := subscribedFromAttachment(attachment)
 
 		// s.mu is NOT held here: SubscribeAndWait can block for the full
 		// subscribe_ack_timeout.
@@ -914,6 +986,10 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (*apiv1.A
 	// a guaranteed no-op in that case (ownership check), so this error path
 	// never double-frees.
 	s.mu.Lock()
+	if s.stopping {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("daemon is stopping")
+	}
 	if s.attachments[id] != registered {
 		s.mu.Unlock()
 		return nil, fmt.Errorf("attachment was detached during setup: %s", id)
@@ -928,9 +1004,24 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (*apiv1.A
 }
 
 func (s *Server) Detach(ctx context.Context, req *apiv1.DetachRequest) (*emptypb.Empty, error) {
-	s.mu.Lock()
+	s.mu.RLock()
 	state, ok := s.attachments[req.Id]
+	s.mu.RUnlock()
 	if !ok {
+		return nil, fmt.Errorf("attachment not found: %s", req.Id)
+	}
+
+	// Never hold Server.mu while waiting: an ack that won reconcileMu may be
+	// inside a server method that needs Server.mu. After acquiring the exact
+	// state lock, revalidate registration before claiming teardown ownership.
+	state.reconcileMu.Lock()
+	defer state.reconcileMu.Unlock()
+	s.mu.Lock()
+	if s.stopping {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("daemon is stopping")
+	}
+	if s.attachments[req.Id] != state {
 		s.mu.Unlock()
 		return nil, fmt.Errorf("attachment not found: %s", req.Id)
 	}
@@ -950,6 +1041,13 @@ func (s *Server) Detach(ctx context.Context, req *apiv1.DetachRequest) (*emptypb
 	delete(s.attachments, req.Id)
 	delete(s.targetIndex, state.info.Target)
 	s.mu.Unlock()
+
+	// Remove any exact pending Subscribed handshake before resource teardown.
+	// The waiter (a new Attach) is unblocked with an error; a background
+	// restore attempt simply retains needsResync for a later connection.
+	if cpClient := s.cpClient.Load(); cpClient != nil {
+		cpClient.cancelSubscription(req.Id, fmt.Errorf("attachment detached"))
+	}
 
 	// Drop TTL bookkeeping so an in-flight janitor sweep does not keep
 	// retrying removals against the filter we are about to close.
@@ -1085,6 +1183,82 @@ func (s *Server) GetSyncAttachments() []*apiv1.Attachment {
 		attachments = append(attachments, att)
 	}
 	return attachments
+}
+
+// restoreResyncSubscription binds a complete Subscribed snapshot to the exact
+// restored attachmentState it represents. The pointer is an ownership token:
+// success may clear needsResync only while that same state is still registered.
+type restoreResyncSubscription struct {
+	state *attachmentState
+	sub   *apiv1.Subscribed
+}
+
+// GetRestoreResyncSubscriptions snapshots the restored attachments that still
+// need authoritative control-plane state. It performs no mutation and is safe
+// when no control plane is configured: the flags simply remain set while the
+// kernel continues enforcing the restored last-known policy.
+func (s *Server) GetRestoreResyncSubscriptions() []restoreResyncSubscription {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	resyncs := make([]restoreResyncSubscription, 0)
+	if s.stopping {
+		return resyncs
+	}
+	for _, state := range s.attachments {
+		if !state.needsResync {
+			continue
+		}
+		resyncs = append(resyncs, restoreResyncSubscription{
+			state: state,
+			sub:   subscribedFromAttachment(state.info),
+		})
+	}
+	return resyncs
+}
+
+func (s *Server) getAttachmentState(id string) *attachmentState {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.stopping {
+		return nil
+	}
+	return s.attachments[id]
+}
+
+func (s *Server) attachmentStateStillLive(id string, expected *attachmentState) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return !s.stopping && expected != nil && s.attachments[id] == expected
+}
+
+func (s *Server) attachmentStatePresent(id string, expected *attachmentState) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return expected != nil && s.attachments[id] == expected
+}
+
+// restoreResyncStillNeeded validates the exact-state ownership token before a
+// pending restore ack is registered or applied.
+func (s *Server) restoreResyncStillNeeded(id string, expected *attachmentState) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	state := s.attachments[id]
+	return !s.stopping && state == expected && state != nil && state.needsResync
+}
+
+// clearRestoreResync marks an authoritative restore ack complete only if the
+// same attachmentState is still live. A detach/replacement race therefore
+// cannot clear a newer state's flag or resurrect removed bookkeeping.
+func (s *Server) clearRestoreResync(id string, expected *attachmentState) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state := s.attachments[id]
+	if s.stopping || state != expected || state == nil || !state.needsResync {
+		return false
+	}
+	state.needsResync = false
+	return true
 }
 
 func (s *Server) GetAttachmentStats() []*apiv1.AttachmentStats {
@@ -1436,6 +1610,30 @@ func cloneAttachment(a *store.Attachment) *store.Attachment {
 		}
 	}
 	return &clone
+}
+
+// subscribedFromAttachment builds the complete control-plane snapshot used by
+// both a brand-new Attach and a restored-attachment re-sync. Keeping one builder
+// prevents restart handshakes from silently omitting fields the initial
+// subscription carries (notably DNS address, metadata, and TC direction).
+func subscribedFromAttachment(a *store.Attachment) *apiv1.Subscribed {
+	if a == nil {
+		return nil
+	}
+	metadata := make(map[string]string, len(a.Metadata))
+	for key, value := range a.Metadata {
+		metadata[key] = value
+	}
+	return &apiv1.Subscribed{
+		Id:          a.ID,
+		Target:      a.Target,
+		Type:        parseAttachmentType(a.Type),
+		Mode:        parsePolicyMode(a.Mode),
+		DnsMode:     parseDnsMode(a.DnsMode),
+		DnsAddress:  a.DnsAddress,
+		Metadata:    metadata,
+		TcDirection: parseTcDirection(a.Direction),
+	}
 }
 
 func parseAttachmentType(s string) apiv1.AttachmentType {

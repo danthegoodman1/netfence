@@ -136,6 +136,96 @@ func TestApplyBulkUpdateRejectsInvalidCIDRBeforeClearingExistingState(t *testing
 	assert.Equal(t, map[string]bool{"old-deny.test": false}, dnsServer.deniedDomains)
 }
 
+func TestBulkUpdateRejectsInvalidModesBeforeAnyMutation(t *testing.T) {
+	tests := []struct {
+		name      string
+		update    *apiv1.BulkUpdate
+		errorText string
+	}{
+		{
+			name: "unspecified_policy",
+			update: &apiv1.BulkUpdate{
+				Mode:       apiv1.PolicyMode_POLICY_MODE_UNSPECIFIED,
+				AllowCidrs: []*apiv1.CIDREntry{{Cidr: "192.0.2.0/24"}},
+				Dns:        &apiv1.DnsConfig{Mode: apiv1.DnsMode_DNS_MODE_ALLOWLIST},
+			},
+			errorText: "invalid policy mode",
+		},
+		{
+			name: "unknown_policy",
+			update: &apiv1.BulkUpdate{
+				Mode:       apiv1.PolicyMode(99),
+				AllowCidrs: []*apiv1.CIDREntry{{Cidr: "192.0.2.0/24"}},
+				Dns:        &apiv1.DnsConfig{Mode: apiv1.DnsMode_DNS_MODE_ALLOWLIST},
+			},
+			errorText: "invalid policy mode",
+		},
+		{
+			name: "unspecified_dns",
+			update: &apiv1.BulkUpdate{
+				Mode:       apiv1.PolicyMode_POLICY_MODE_ALLOWLIST,
+				AllowCidrs: []*apiv1.CIDREntry{{Cidr: "192.0.2.0/24"}},
+				Dns:        &apiv1.DnsConfig{Mode: apiv1.DnsMode_DNS_MODE_UNSPECIFIED},
+			},
+			errorText: "invalid DNS mode",
+		},
+		{
+			name: "unknown_dns",
+			update: &apiv1.BulkUpdate{
+				Mode:       apiv1.PolicyMode_POLICY_MODE_ALLOWLIST,
+				AllowCidrs: []*apiv1.CIDREntry{{Cidr: "192.0.2.0/24"}},
+				Dns:        &apiv1.DnsConfig{Mode: apiv1.DnsMode(99)},
+			},
+			errorText: "invalid DNS mode",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server, st, id, ff, dnsServer := newTestServerWithAttachment(t)
+			client := NewControlPlaneClient("", server, zerolog.Nop(), nil, 0, nil)
+			oldAllow, err := filter.ParseCIDR("10.0.0.0/8")
+			require.NoError(t, err)
+			require.NoError(t, server.AllowCIDR(id, oldAllow, 0))
+			require.NoError(t, server.ReplaceDNSRules(
+				id,
+				apiv1.DnsMode_DNS_MODE_DENYLIST,
+				nil,
+				[]*apiv1.DomainEntry{{Domain: "old-deny.test"}},
+			))
+			beforeEvents := ff.eventLog()
+			beforeStored, err := st.GetAttachment(id)
+			require.NoError(t, err)
+
+			client.handleCommand(&apiv1.ControlCommand{
+				Id:        id,
+				CommandId: "invalid-mode-" + tt.name,
+				Command:   &apiv1.ControlCommand_BulkUpdate{BulkUpdate: tt.update},
+			})
+
+			results := drainCommandResults(t, client)
+			require.Len(t, results, 1)
+			assert.False(t, results[0].Success)
+			assert.Contains(t, results[0].Error, tt.errorText)
+			assert.Equal(t, beforeEvents, ff.eventLog(), "invalid full state must make no filter calls")
+			mode, allowed, denied, clearCalls := ff.snapshot()
+			assert.Equal(t, filter.ModeDisabled, mode)
+			assert.Equal(t, []string{"10.0.0.0/8"}, allowed)
+			assert.Empty(t, denied)
+			assert.Zero(t, clearCalls)
+
+			afterStored, err := st.GetAttachment(id)
+			require.NoError(t, err)
+			assert.Equal(t, beforeStored, afterStored, "invalid full state must not persist anything")
+			dnsServer.mu.RLock()
+			assert.Equal(t, apiv1.DnsMode_DNS_MODE_DENYLIST, dnsServer.mode)
+			assert.Empty(t, dnsServer.allowedDomains)
+			assert.Equal(t, map[string]bool{"old-deny.test": false}, dnsServer.deniedDomains)
+			dnsServer.mu.RUnlock()
+		})
+	}
+}
+
 func TestSubscribeAndWaitTimeoutCleansPendingAckAndMarksOutboundStale(t *testing.T) {
 	c := NewControlPlaneClient("", nil, zerolog.Nop(), nil, 10*time.Millisecond, nil)
 
@@ -149,12 +239,162 @@ func TestSubscribeAndWaitTimeoutCleansPendingAckAndMarksOutboundStale(t *testing
 
 	select {
 	case outbound := <-c.sendCh:
-		assert.True(t, outbound.requirePendingAck)
-		assert.Equal(t, "att-timeout", outbound.subscribedID)
+		require.NotNil(t, outbound.pending)
+		assert.Equal(t, "att-timeout", outbound.pending.sub.Id)
 		assert.False(t, c.hasPendingAck("att-timeout"))
 	default:
 		t.Fatal("expected queued subscribed event")
 	}
+}
+
+func TestSubscribedAckApplySerializesWithDetach(t *testing.T) {
+	server, st, id, ff, _ := newTestServerWithAttachment(t)
+	client := NewControlPlaneClient("", server, zerolog.Nop(), nil, 5*time.Second, nil)
+	server.SetControlPlaneClient(client)
+
+	waitResult := make(chan error, 1)
+	go func() {
+		_, err := client.SubscribeAndWait(context.Background(), &apiv1.Subscribed{Id: id})
+		waitResult <- err
+	}()
+	require.Eventually(t, func() bool { return client.hasPendingAck(id) }, time.Second, time.Millisecond)
+	pending := pendingSubscriptionFor(t, client, id)
+	require.True(t, client.beginPendingSend(pending, 1))
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	ff.blockSetMode(entered, release)
+	ackDone := make(chan struct{})
+	go func() {
+		defer close(ackDone)
+		client.handleCommandForEpoch(&apiv1.ControlCommand{
+			Id: id,
+			Command: &apiv1.ControlCommand_SubscribedAck{SubscribedAck: &apiv1.SubscribedAck{
+				Mode: apiv1.PolicyMode_POLICY_MODE_ALLOWLIST,
+			}},
+		}, 1)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("ack did not reach the gated filter mutation")
+	}
+
+	detachDone := make(chan error, 1)
+	go func() {
+		_, err := server.Detach(context.Background(), &apiv1.DetachRequest{Id: id})
+		detachDone <- err
+	}()
+	select {
+	case err := <-detachDone:
+		t.Fatalf("Detach interleaved with claimed ack apply: %v", err)
+	case <-time.After(25 * time.Millisecond):
+		// Expected: Detach waits on the exact state's reconcileMu without
+		// holding Server.mu, while the ack remains free to finish.
+	}
+	_, err := st.GetAttachment(id)
+	require.NoError(t, err, "row must remain owned by the in-flight ack until teardown wins the state lock")
+
+	close(release)
+	select {
+	case <-ackDone:
+	case <-time.After(time.Second):
+		t.Fatal("ack did not finish after releasing the gate")
+	}
+	require.NoError(t, <-waitResult)
+	select {
+	case err := <-detachDone:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("Detach did not finish after the ack released state ownership")
+	}
+
+	rows, err := st.GetAllAttachments()
+	require.NoError(t, err)
+	assert.Empty(t, rows, "ack's delayed SaveAttachment must not resurrect the detached row")
+	assert.Equal(t, 1, ff.detachCallCount())
+	assert.Zero(t, ff.mutationAfterCloseCount())
+	server.mu.RLock()
+	_, live := server.attachments[id]
+	server.mu.RUnlock()
+	assert.False(t, live)
+}
+
+func TestSubscribedAckApplySerializesWithStop(t *testing.T) {
+	server, st, id, ff, _ := newTestServerWithAttachment(t)
+	client := NewControlPlaneClient("", server, zerolog.Nop(), nil, 5*time.Second, nil)
+	server.SetControlPlaneClient(client)
+
+	waitResult := make(chan error, 1)
+	go func() {
+		_, err := client.SubscribeAndWait(context.Background(), &apiv1.Subscribed{Id: id})
+		waitResult <- err
+	}()
+	require.Eventually(t, func() bool { return client.hasPendingAck(id) }, time.Second, time.Millisecond)
+	pending := pendingSubscriptionFor(t, client, id)
+	require.True(t, client.beginPendingSend(pending, 1))
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	ff.blockSetMode(entered, release)
+	ackDone := make(chan struct{})
+	go func() {
+		defer close(ackDone)
+		client.handleCommandForEpoch(&apiv1.ControlCommand{
+			Id: id,
+			Command: &apiv1.ControlCommand_SubscribedAck{SubscribedAck: &apiv1.SubscribedAck{
+				Mode: apiv1.PolicyMode_POLICY_MODE_ALLOWLIST,
+			}},
+		}, 1)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("ack did not reach the gated filter mutation")
+	}
+
+	stopDone := make(chan struct{})
+	go func() {
+		defer close(stopDone)
+		server.Stop()
+	}()
+	select {
+	case <-stopDone:
+		t.Fatal("Stop closed resources while a claimed ack owned reconcileMu")
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-ackDone:
+	case <-time.After(time.Second):
+		t.Fatal("ack did not finish after gate release")
+	}
+	require.NoError(t, <-waitResult)
+	select {
+	case <-stopDone:
+	case <-time.After(time.Second):
+		t.Fatal("Stop did not finish after ack released reconcileMu")
+	}
+
+	row, err := st.GetAttachment(id)
+	require.NoError(t, err, "Stop preserves the attachment row for restart")
+	assert.Equal(t, apiv1.PolicyMode_POLICY_MODE_ALLOWLIST.String(), row.Mode)
+	assert.Equal(t, 1, ff.closeCallCount())
+	assert.Zero(t, ff.mutationAfterCloseCount())
+}
+
+func TestPendingSubscriptionPublicationIsAtomicOnQueueFull(t *testing.T) {
+	server, _, id, _, _ := newTestServerWithAttachment(t)
+	client := NewControlPlaneClient("", server, zerolog.Nop(), nil, time.Second, nil)
+	for i := 0; i < cap(client.sendCh); i++ {
+		require.True(t, client.enqueue(staleHeartbeat()))
+	}
+
+	_, err := client.SubscribeAndWait(context.Background(), &apiv1.Subscribed{Id: id})
+	require.ErrorIs(t, err, errSubscriptionQueueFull)
+	assert.False(t, client.hasPendingAck(id))
+	assert.Empty(t, client.snapshotPendingSubscriptions(),
+		"sendLoop redrive snapshots must never observe a publication whose initial enqueue failed")
 }
 
 func TestMakeProxyFuncRequiresConnectedState(t *testing.T) {
