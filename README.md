@@ -87,7 +87,7 @@ These numbers measure the DNS server path, not the warmed socket connect path.
 | Proxy query warm | ~25.3 us |
 | Allowlist query cold with local upstream | ~68.0 us |
 | Allowlist query warm with local upstream | ~67.4 us |
-| Cached "already added to filter" check | ~66.7 ns |
+| Cached "already added to filter" check (also refreshes the entry's TTL deadline) | ~0.2 us |
 
 # Design
 
@@ -215,3 +215,10 @@ Implement `ControlPlane.Connect` RPC - a bidirectional stream:
 - `BulkUpdate{mode, cidrs, dns_config}` - full state sync
 
 When the daemon receives `Subscribed`, it blocks waiting for `SubscribedAck` before returning success to the caller. This ensures the attachment has its initial configuration before traffic flows. Use the metadata to identify which VM/tenant/container this attachment belongs to and respond with the appropriate initial rules.
+
+### Rule lifetimes (TTLs)
+
+- CIDR entries (`AllowCIDR`/`DenyCIDR` commands, and the CIDR lists in `SubscribedAck`/`BulkUpdate`) carry an optional TTL. TTL'd rules are removed by a daemon janitor once they expire (scan interval `ttl_janitor_interval`, default 1s); rules without a TTL are permanent.
+- Re-adding a CIDR extends its lifetime to the later deadline — it never shortens one — and re-adding without a TTL makes it permanent. Use `RemoveCIDR` to drop a rule early.
+- DNS-resolved IPs enter the filter with the record TTL floored by `dns.min_filter_ttl` (default 60s; zero/unset means the default, not "no floor") and expire the same way. A permanent (or longer-lived) CIDR rule covering the same address is never removed by DNS expiry.
+- Each rule map holds `filter.max_rule_entries` entries per attachment (default 4096, load-time sizing with no per-packet cost). When a map is full, new adds fail loudly and are counted in the `map_full_drops` heartbeat stat instead of being silently dropped.

@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -10,6 +11,7 @@ import (
 
 type Config struct {
 	DNS          DNSConfig          `mapstructure:"dns"`
+	Filter       FilterConfig       `mapstructure:"filter"`
 	ControlPlane ControlPlaneConfig `mapstructure:"control_plane"`
 	DataDir      string             `mapstructure:"data_dir"`
 	LogLevel     string             `mapstructure:"log_level"`
@@ -27,6 +29,20 @@ type DNSConfig struct {
 	PortMin    int    `mapstructure:"port_min"`
 	PortMax    int    `mapstructure:"port_max"`
 	Upstream   string `mapstructure:"upstream"`
+	// MinFilterTTL is the minimum lifetime a DNS-resolved IP stays in the
+	// eBPF filter, regardless of a smaller DNS record TTL (the filter
+	// deadline is max(record TTL, this floor)). Prevents tiny record TTLs
+	// from churning the rule maps. Zero (or unset) falls back to the default
+	// of 60s — it does NOT disable the floor.
+	MinFilterTTL time.Duration `mapstructure:"min_filter_ttl"`
+}
+
+type FilterConfig struct {
+	// MaxRuleEntries sets the capacity of each eBPF rule map
+	// (allowed/denied, IPv4/IPv6) per attachment at filter load time.
+	// Zero (or unset) keeps the compiled-in default of 4096. This is
+	// load-time map sizing only; it has no per-packet cost.
+	MaxRuleEntries int `mapstructure:"max_rule_entries"`
 }
 
 type ControlPlaneConfig struct {
@@ -46,6 +62,8 @@ func Load(configPath string) (*Config, error) {
 	v.SetDefault("dns.upstream", "8.8.8.8:53")
 	v.SetDefault("log_level", "info")
 	v.SetDefault("socket", "/var/run/netfence.sock")
+	v.SetDefault("dns.min_filter_ttl", 60*time.Second)
+	v.SetDefault("filter.max_rule_entries", 4096)
 	v.SetDefault("control_plane.subscribe_ack_timeout", 5*time.Second)
 	v.SetDefault("ttl_janitor_interval", time.Second)
 
@@ -81,6 +99,14 @@ func (c *Config) Validate() error {
 	}
 	if c.TTLJanitorInterval < 0 {
 		return fmt.Errorf("ttl_janitor_interval must not be negative")
+	}
+	if c.DNS.MinFilterTTL < 0 {
+		return fmt.Errorf("dns.min_filter_ttl must not be negative")
+	}
+	// 0 means "use the compiled-in default" (4096); anything else must fit
+	// the kernel's u32 max_entries without truncation.
+	if c.Filter.MaxRuleEntries < 0 || int64(c.Filter.MaxRuleEntries) > math.MaxUint32 {
+		return fmt.Errorf("filter.max_rule_entries must be between 0 (default) and %d", uint32(math.MaxUint32))
 	}
 	return nil
 }

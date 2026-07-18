@@ -2,7 +2,6 @@ package daemon
 
 import (
 	"net"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -12,27 +11,21 @@ import (
 	apiv1 "github.com/danthegoodman1/netfence/v1"
 )
 
-type benchmarkIPAllower struct {
-	calls atomic.Uint64
-}
-
-func (b *benchmarkIPAllower) AllowIP(*net.IPNet) error {
-	b.calls.Add(1)
-	return nil
-}
-
+// BenchmarkDNSAddIPToFilterCached measures the repeated-resolution path
+// through the real registry-backed sink: the first add writes to the filter,
+// subsequent adds for the tracked IP only refresh the deadline (no filter
+// call).
 func BenchmarkDNSAddIPToFilterCached(b *testing.B) {
-	filter := &recordingIPAllower{}
-	server := NewDNSServer("bench", "127.0.0.1:0", "127.0.0.1:1", zerolog.Nop(), filter, nil)
+	_, _, _, ff, dnsServer := newTestServerWithAttachment(b)
 	ip := net.ParseIP("203.0.113.8")
 
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		server.addIPToFilter("example.com", ip, 32, 300)
+		dnsServer.addIPToFilter("example.com", ip, 32, 300)
 	}
 	b.StopTimer()
-	if calls := filter.calls(); calls != 1 {
+	if calls := ff.allowCallCount(); calls != 1 {
 		b.Fatalf("expected exactly one AllowIP call, got %d", calls)
 	}
 }
@@ -101,10 +94,20 @@ func benchmarkDNSServer() *DNSServer {
 	return server
 }
 
+// benchmarkRegistrySink builds the real registry-backed sink (as the daemon
+// wires per attachment) so the benchmarks exercise the true resolved-IP
+// path: cold resets the registry each iteration (filter write-through),
+// warm keeps the entry tracked (deadline refresh only, no filter call).
+func benchmarkRegistrySink(b *testing.B) (DNSFilterSink, *ttlRegistry) {
+	srv, _, id, ff, _ := newTestServerWithAttachment(b)
+	reg := newTTLRegistry()
+	return srv.newDNSFilterSink(id, ff, reg), reg
+}
+
 func benchmarkDNSProxyQuery(b *testing.B, cold bool) {
-	filter := &benchmarkIPAllower{}
+	sink, reg := benchmarkRegistrySink(b)
 	addr := freeUDPAddress(b)
-	server := NewDNSServer("bench", addr, "127.0.0.1:1", zerolog.Nop(), filter, func(string, string) (DnsProxyDecision, error) {
+	server := NewDNSServer("bench", addr, "127.0.0.1:1", zerolog.Nop(), sink, func(string, string) (DnsProxyDecision, error) {
 		return DnsProxyDecision{
 			Allow:       true,
 			AddToFilter: true,
@@ -115,20 +118,20 @@ func benchmarkDNSProxyQuery(b *testing.B, cold bool) {
 	server.SetMode(apiv1.DnsMode_DNS_MODE_PROXY)
 	startBenchmarkDNSServer(b, server)
 
-	benchmarkDNSLookup(b, server, addr, cold)
+	benchmarkDNSLookup(b, addr, cold, reg.purge)
 }
 
 func benchmarkDNSAllowlistQuery(b *testing.B, cold bool) {
-	filter := &benchmarkIPAllower{}
+	sink, reg := benchmarkRegistrySink(b)
 	addr := freeUDPAddress(b)
-	server := NewDNSServer("bench", addr, startTestUpstream(b), zerolog.Nop(), filter, nil)
+	server := NewDNSServer("bench", addr, startTestUpstream(b), zerolog.Nop(), sink, nil)
 	server.ReplaceRules(apiv1.DnsMode_DNS_MODE_ALLOWLIST, []*apiv1.DomainEntry{{Domain: "example.com"}}, nil)
 	startBenchmarkDNSServer(b, server)
 
-	benchmarkDNSLookup(b, server, addr, cold)
+	benchmarkDNSLookup(b, addr, cold, reg.purge)
 }
 
-func benchmarkDNSLookup(b *testing.B, server *DNSServer, addr string, cold bool) {
+func benchmarkDNSLookup(b *testing.B, addr string, cold bool, reset func()) {
 	client := &dns.Client{Timeout: 2 * time.Second}
 	request := new(dns.Msg)
 	request.SetQuestion("example.com.", dns.TypeA)
@@ -146,7 +149,7 @@ func benchmarkDNSLookup(b *testing.B, server *DNSServer, addr string, cold bool)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		if cold {
-			server.ClearDynamicCache()
+			reset()
 		}
 		resp, _, err := client.Exchange(request.Copy(), addr)
 		if err != nil {

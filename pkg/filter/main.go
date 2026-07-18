@@ -55,6 +55,27 @@ func ipv6CIDRToKey(cidr *net.IPNet) IPv6LPMKey {
 	return key
 }
 
+// ruleMapNames are the LPM rule maps whose capacity Options.MaxRuleEntries
+// overrides. They must match the map names in bpf/filter_tc.c and
+// bpf/filter_cgroup.c.
+var ruleMapNames = []string{"allowed_ipv4", "denied_ipv4", "allowed_ipv6", "denied_ipv6"}
+
+// applyOptions applies load-time tuning to a BPF collection spec before load.
+// It only resizes maps; program instructions are never modified.
+func applyOptions(spec *ebpf.CollectionSpec, opts Options) error {
+	if opts.MaxRuleEntries == 0 {
+		return nil
+	}
+	for _, name := range ruleMapNames {
+		m, ok := spec.Maps[name]
+		if !ok {
+			return fmt.Errorf("BPF spec missing rule map %s", name)
+		}
+		m.MaxEntries = opts.MaxRuleEntries
+	}
+	return nil
+}
+
 func clearMap[K any](m *ebpf.Map) error {
 	var keys []K
 	var value uint8

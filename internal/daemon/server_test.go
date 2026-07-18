@@ -116,10 +116,15 @@ func TestNewServerRestoresIPv6DNSPortReservation(t *testing.T) {
 	assert.True(t, server.portPool[12005])
 }
 
-func TestServerReplaceDNSRulesPersistsAndClearsDynamicCache(t *testing.T) {
-	server, st, id, _, dnsServer := newTestServerWithAttachment(t)
+func TestServerReplaceDNSRulesPersists(t *testing.T) {
+	server, st, id, ff, dnsServer := newTestServerWithAttachment(t)
 	dnsServer.addIPToFilter("example.com", netIP(t, "203.0.113.20"), 32, 60)
-	require.NotEmpty(t, dnsServer.ipCache)
+
+	// DNS-populated IPs are tracked in the TTL registry (janitor-expired),
+	// not a per-DNS-server cache; replacing domain rules leaves them in the
+	// filter until their TTL lapses.
+	_, allowed, _, _ := ff.snapshot()
+	require.Equal(t, []string{"203.0.113.20/32"}, allowed)
 
 	require.NoError(t, server.ReplaceDNSRules(
 		id,
@@ -134,7 +139,6 @@ func TestServerReplaceDNSRulesPersistsAndClearsDynamicCache(t *testing.T) {
 
 	dnsServer.mu.RLock()
 	defer dnsServer.mu.RUnlock()
-	assert.Empty(t, dnsServer.ipCache)
 	assert.Equal(t, map[string]bool{"allowed.test": true}, dnsServer.allowedDomains)
 	assert.Equal(t, map[string]bool{"denied.test": false}, dnsServer.deniedDomains)
 }

@@ -15,11 +15,6 @@ import (
 	apiv1 "github.com/danthegoodman1/netfence/v1"
 )
 
-// IPAllower is the interface for adding IPs to a filter
-type IPAllower interface {
-	AllowIP(cidr *net.IPNet) error
-}
-
 // DnsProxyFunc is called when DNS_MODE_PROXY is enabled to get a decision from the control plane
 type DnsProxyFunc func(domain, queryType string) (DnsProxyDecision, error)
 
@@ -32,20 +27,21 @@ type DnsProxyDecision struct {
 	TTLSeconds  uint32
 }
 
-// DNSServer is a per-attachment DNS server that filters queries and populates the IP filter
+// DNSServer is a per-attachment DNS server that filters queries and populates
+// the IP filter via its DNSFilterSink (which bounds each entry's lifetime;
+// resolved-IP dedup and expiry live behind the sink, not here).
 type DNSServer struct {
 	attachmentID string
 	listenAddr   string
 	upstream     string
 	logger       zerolog.Logger
-	filter       IPAllower
+	sink         DNSFilterSink
 	proxyFunc    DnsProxyFunc
 
 	mu             sync.RWMutex
 	mode           apiv1.DnsMode
 	allowedDomains map[string]bool // domain -> includeSubdomains
 	deniedDomains  map[string]bool // domain -> includeSubdomains
-	ipCache        map[string]time.Time
 
 	serverMu sync.Mutex
 	server   *dns.Server
@@ -55,18 +51,17 @@ type DNSServer struct {
 	queriesBlocked atomic.Uint64
 }
 
-func NewDNSServer(attachmentID, listenAddr, upstream string, logger zerolog.Logger, filter IPAllower, proxyFunc DnsProxyFunc) *DNSServer {
+func NewDNSServer(attachmentID, listenAddr, upstream string, logger zerolog.Logger, sink DNSFilterSink, proxyFunc DnsProxyFunc) *DNSServer {
 	return &DNSServer{
 		attachmentID:   attachmentID,
 		listenAddr:     listenAddr,
 		upstream:       upstream,
 		logger:         logger.With().Str("component", "dns").Str("addr", listenAddr).Logger(),
-		filter:         filter,
+		sink:           sink,
 		proxyFunc:      proxyFunc,
 		mode:           apiv1.DnsMode_DNS_MODE_DISABLED,
 		allowedDomains: make(map[string]bool),
 		deniedDomains:  make(map[string]bool),
-		ipCache:        make(map[string]time.Time),
 	}
 }
 
@@ -160,7 +155,6 @@ func (s *DNSServer) ReplaceRules(mode apiv1.DnsMode, allowDomains, denyDomains [
 	s.mode = mode
 	s.allowedDomains = make(map[string]bool, len(allowDomains))
 	s.deniedDomains = make(map[string]bool, len(denyDomains))
-	s.ipCache = make(map[string]time.Time)
 	for _, entry := range allowDomains {
 		if entry == nil {
 			continue
@@ -174,12 +168,6 @@ func (s *DNSServer) ReplaceRules(mode apiv1.DnsMode, allowDomains, denyDomains [
 		s.deniedDomains[normalizeDomain(entry.Domain)] = entry.IncludeSubdomains
 	}
 	s.logger.Debug().Str("mode", mode.String()).Msg("DNS rules replaced")
-}
-
-func (s *DNSServer) ClearDynamicCache() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.ipCache = make(map[string]time.Time)
 }
 
 func (s *DNSServer) Stats() (allowed, blocked uint64) {
@@ -276,7 +264,7 @@ func (s *DNSServer) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 		return
 	}
 
-	if shouldAddToFilter && s.filter != nil {
+	if shouldAddToFilter && s.sink != nil {
 		for _, rr := range resp.Answer {
 			switch a := rr.(type) {
 			case *dns.A:
@@ -394,8 +382,14 @@ func (s *DNSServer) sendProxyResponse(w dns.ResponseWriter, req *dns.Msg, domain
 	}
 }
 
+// addIPToFilter forwards a resolved IP to the filter sink with the record's
+// TTL. The sink owns dedup (repeated resolutions of a tracked IP cost no
+// kernel syscall), the minimum-TTL floor, and expiry via the TTL janitor —
+// so unlike the old unbounded ipCache there is no per-DNS-server cache to
+// grow without bound. Errors are logged by the sink (rate-limited for
+// map-full), so only a debug line is emitted here.
 func (s *DNSServer) addIPToFilter(domain string, ip net.IP, bits int, ttlSeconds uint32) {
-	if s.filter == nil {
+	if s.sink == nil {
 		return
 	}
 	if ttlSeconds == 0 {
@@ -405,26 +399,13 @@ func (s *DNSServer) addIPToFilter(domain string, ip net.IP, bits int, ttlSeconds
 	if ip == nil {
 		return
 	}
-	key := ip.String()
-	now := time.Now()
-
-	s.mu.RLock()
-	expiresAt, cached := s.ipCache[key]
-	s.mu.RUnlock()
-	if cached && now.Before(expiresAt) {
-		return
-	}
 
 	cidr := &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)}
-	if err := s.filter.AllowIP(cidr); err != nil {
-		s.logger.Warn().Err(err).Str("ip", key).Msg("failed to add IP to filter")
+	if err := s.sink.AllowIPWithTTL(cidr, time.Duration(ttlSeconds)*time.Second); err != nil {
+		s.logger.Debug().Err(err).Str("domain", domain).Str("ip", ip.String()).Msg("failed to add IP to filter")
 		return
 	}
-
-	s.mu.Lock()
-	s.ipCache[key] = now.Add(time.Duration(ttlSeconds) * time.Second)
-	s.mu.Unlock()
-	s.logger.Debug().Str("domain", domain).Str("ip", key).Msg("added IP to filter")
+	s.logger.Debug().Str("domain", domain).Str("ip", ip.String()).Msg("added IP to filter")
 }
 
 func normalizeIP(ip net.IP) net.IP {

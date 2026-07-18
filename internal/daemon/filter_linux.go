@@ -9,7 +9,7 @@ import (
 	apiv1 "github.com/danthegoodman1/netfence/v1"
 )
 
-func createFilter(target string, attachType apiv1.AttachmentType, mode apiv1.PolicyMode, direction apiv1.TcDirection) (filter.Filter, error) {
+func createFilter(target string, attachType apiv1.AttachmentType, mode apiv1.PolicyMode, direction apiv1.TcDirection, maxRuleEntries uint32) (filter.Filter, error) {
 	filterMode := apiModeToFilterMode(mode)
 
 	// Default carve-out posture (localhost + IPv6 ND allowed, IPv4
@@ -18,13 +18,14 @@ func createFilter(target string, attachType apiv1.AttachmentType, mode apiv1.Pol
 	// follow-up; allowlisting 169.254.169.254/32 is the override for
 	// workloads that need the metadata service.
 	carveouts := filter.DefaultCarveouts()
+	opts := filter.Options{MaxRuleEntries: maxRuleEntries}
 
 	switch attachType {
 	case apiv1.AttachmentType_ATTACHMENT_TYPE_CGROUP:
 		// Direction is meaningless for cgroup filters and is ignored.
-		return filter.NewCgroupFilter(target, filterMode, carveouts)
+		return filter.NewCgroupFilterWithOptions(target, filterMode, carveouts, opts)
 	case apiv1.AttachmentType_ATTACHMENT_TYPE_TC:
-		return filter.NewTCFilter(target, filterMode, apiDirectionToFilterDirection(direction), carveouts)
+		return filter.NewTCFilterWithOptions(target, filterMode, apiDirectionToFilterDirection(direction), carveouts, opts)
 	default:
 		return nil, fmt.Errorf("unsupported attachment type: %s", attachType)
 	}

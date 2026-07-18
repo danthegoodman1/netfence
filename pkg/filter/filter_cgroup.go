@@ -29,6 +29,12 @@ type CgroupFilter struct {
 // cgroup path. The carve-outs are baked into the program as a load-time
 // constant (see Carveouts / DefaultCarveouts).
 func NewCgroupFilter(cgroupPath string, mode PolicyMode, carveouts Carveouts) (*CgroupFilter, error) {
+	return NewCgroupFilterWithOptions(cgroupPath, mode, carveouts, Options{})
+}
+
+// NewCgroupFilterWithOptions is NewCgroupFilter with load-time tuning (see
+// Options).
+func NewCgroupFilterWithOptions(cgroupPath string, mode PolicyMode, carveouts Carveouts, opts Options) (*CgroupFilter, error) {
 	// Verify cgroup path exists
 	if _, err := os.Stat(cgroupPath); os.IsNotExist(err) {
 		return nil, fmt.Errorf("cgroup path does not exist: %s", cgroupPath)
@@ -40,6 +46,9 @@ func NewCgroupFilter(cgroupPath string, mode PolicyMode, carveouts Carveouts) (*
 	spec, err := loadCgroup()
 	if err != nil {
 		return nil, fmt.Errorf("loading cgroup BPF spec: %w", err)
+	}
+	if err := applyOptions(spec, opts); err != nil {
+		return nil, fmt.Errorf("applying cgroup filter options: %w", err)
 	}
 	carveoutVar, ok := spec.Variables["carveout_flags"]
 	if !ok {

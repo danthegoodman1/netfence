@@ -600,8 +600,14 @@ type AttachmentStats struct {
 	PacketsBlocked    uint64                 `protobuf:"varint,3,opt,name=packets_blocked,json=packetsBlocked,proto3" json:"packets_blocked,omitempty"`
 	DnsQueriesAllowed uint64                 `protobuf:"varint,4,opt,name=dns_queries_allowed,json=dnsQueriesAllowed,proto3" json:"dns_queries_allowed,omitempty"`
 	DnsQueriesBlocked uint64                 `protobuf:"varint,5,opt,name=dns_queries_blocked,json=dnsQueriesBlocked,proto3" json:"dns_queries_blocked,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	// Cumulative count of rule insertions (control-plane CIDRs or
+	// DNS-resolved IPs) dropped because the filter's rule map was at
+	// capacity. A non-zero, growing value means the map is full and new
+	// allows are NOT taking effect; raise filter.max_rule_entries or reduce
+	// rule volume/TTLs.
+	MapFullDrops  uint64 `protobuf:"varint,6,opt,name=map_full_drops,json=mapFullDrops,proto3" json:"map_full_drops,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *AttachmentStats) Reset() {
@@ -665,6 +671,13 @@ func (x *AttachmentStats) GetDnsQueriesAllowed() uint64 {
 func (x *AttachmentStats) GetDnsQueriesBlocked() uint64 {
 	if x != nil {
 		return x.DnsQueriesBlocked
+	}
+	return 0
+}
+
+func (x *AttachmentStats) GetMapFullDrops() uint64 {
+	if x != nil {
+		return x.MapFullDrops
 	}
 	return 0
 }
@@ -1567,13 +1580,14 @@ const file_v1_control_proto_rawDesc = "" +
 	"\x06reason\x18\x02 \x01(\x0e2\x1e.netfence.v1.UnsubscribeReasonR\x06reason\x12\x14\n" +
 	"\x05error\x18\x03 \x01(\tR\x05error\"?\n" +
 	"\tHeartbeat\x122\n" +
-	"\x05stats\x18\x01 \x03(\v2\x1c.netfence.v1.AttachmentStatsR\x05stats\"\xd3\x01\n" +
+	"\x05stats\x18\x01 \x03(\v2\x1c.netfence.v1.AttachmentStatsR\x05stats\"\xf9\x01\n" +
 	"\x0fAttachmentStats\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12'\n" +
 	"\x0fpackets_allowed\x18\x02 \x01(\x04R\x0epacketsAllowed\x12'\n" +
 	"\x0fpackets_blocked\x18\x03 \x01(\x04R\x0epacketsBlocked\x12.\n" +
 	"\x13dns_queries_allowed\x18\x04 \x01(\x04R\x11dnsQueriesAllowed\x12.\n" +
-	"\x13dns_queries_blocked\x18\x05 \x01(\x04R\x11dnsQueriesBlocked\"\x85\x05\n" +
+	"\x13dns_queries_blocked\x18\x05 \x01(\x04R\x11dnsQueriesBlocked\x12$\n" +
+	"\x0emap_full_drops\x18\x06 \x01(\x04R\fmapFullDrops\"\x85\x05\n" +
 	"\x0eControlCommand\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x121\n" +
 	"\bsync_ack\x18\x02 \x01(\v2\x14.netfence.v1.SyncAckH\x00R\asyncAck\x121\n" +

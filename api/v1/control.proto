@@ -127,6 +127,12 @@ message AttachmentStats {
   uint64 packets_blocked = 3;
   uint64 dns_queries_allowed = 4;
   uint64 dns_queries_blocked = 5;
+  // Cumulative count of rule insertions (control-plane CIDRs or
+  // DNS-resolved IPs) dropped because the filter's rule map was at
+  // capacity. A non-zero, growing value means the map is full and new
+  // allows are NOT taking effect; raise filter.max_rule_entries or reduce
+  // rule volume/TTLs.
+  uint64 map_full_drops = 6;
 }
 
 // ControlCommand represents commands sent from the control plane to the daemon.

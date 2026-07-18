@@ -100,6 +100,17 @@ func (c Carveouts) flags() uint32 {
 	return f
 }
 
+// Options holds optional load-time filter tuning. The zero value keeps the
+// compiled-in defaults.
+type Options struct {
+	// MaxRuleEntries sets max_entries for each of the four LPM rule maps
+	// (allowed/denied, IPv4/IPv6) at program load time. 0 keeps the
+	// compiled-in default (4096). This is pure map sizing: the BPF program
+	// bytes and per-packet lookup cost are unchanged (LPM trie lookups are
+	// bounded by key length, not capacity).
+	MaxRuleEntries uint32
+}
+
 // Stats holds the filter statistics
 type Stats struct {
 	Allowed uint64

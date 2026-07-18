@@ -1,7 +1,10 @@
 package daemon
 
 import (
+	"fmt"
+	"net"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -10,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/types/known/durationpb"
 
+	"github.com/danthegoodman1/netfence/pkg/filter"
 	apiv1 "github.com/danthegoodman1/netfence/v1"
 )
 
@@ -55,13 +59,17 @@ func removeCidrCmd(id, cidr string) *apiv1.ControlCommand {
 	return &apiv1.ControlCommand{Id: id, Command: &apiv1.ControlCommand_RemoveCidr{RemoveCidr: cidr}}
 }
 
+// registryLen reports the attachment's pending-expiry count: entries with a
+// finite deadline the janitor will eventually remove. Permanent entries are
+// tracked too (for aliasing pins and the 2C diff seam) but never expire, so
+// they are excluded here.
 func registryLen(t *testing.T, server *Server, id string) int {
 	t.Helper()
 	server.mu.RLock()
 	defer server.mu.RUnlock()
 	state, ok := server.attachments[id]
 	require.True(t, ok)
-	return state.ttls.len()
+	return state.ttls.pendingLen()
 }
 
 // TestTTLCIDRExpiresAfterSweep covers the AllowCidr/DenyCidr command entry
@@ -338,4 +346,221 @@ func TestTTLConcurrentAddAndSweep(t *testing.T) {
 			server.sweepExpiredTTLs(clk.Now())
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2B: DNS-populated IP expiry, aliasing, TTL floor, map-full handling.
+// ---------------------------------------------------------------------------
+
+func mustCIDR(t *testing.T, s string) *net.IPNet {
+	t.Helper()
+	cidr, err := filter.ParseCIDR(s)
+	require.NoError(t, err)
+	return cidr
+}
+
+// TestDNSAddedIPExpiresViaJanitor: a DNS-resolved IP whose record TTL is
+// below the floor lives for the floor (default 60s), then the janitor
+// removes it from the filter and the registry.
+func TestDNSAddedIPExpiresViaJanitor(t *testing.T) {
+	server, _, id, ff, dnsServer := newTestServerWithAttachment(t)
+	clk := newFakeClock()
+	server.now = clk.Now
+
+	dnsServer.addIPToFilter("example.com", net.ParseIP("203.0.113.10"), 32, 30)
+	_, allowed, _, _ := ff.snapshot()
+	assert.Equal(t, []string{"203.0.113.10/32"}, allowed)
+	assert.Equal(t, 1, registryLen(t, server, id))
+
+	// At the record TTL (30s) the 60s floor keeps it alive.
+	clk.Advance(30 * time.Second)
+	server.sweepExpiredTTLs(clk.Now())
+	_, allowed, _, _ = ff.snapshot()
+	assert.Equal(t, []string{"203.0.113.10/32"}, allowed, "floor must outlive the record TTL")
+
+	// At the floor it expires.
+	clk.Advance(30 * time.Second)
+	server.sweepExpiredTTLs(clk.Now())
+	_, allowed, _, _ = ff.snapshot()
+	assert.Empty(t, allowed)
+	assert.Zero(t, registryLen(t, server, id))
+}
+
+// TestDNSRecordTTLAboveFloorIsHonored: the filter deadline is
+// max(record TTL, floor), so a 300s record outlives the 60s floor.
+func TestDNSRecordTTLAboveFloorIsHonored(t *testing.T) {
+	server, _, id, ff, dnsServer := newTestServerWithAttachment(t)
+	clk := newFakeClock()
+	server.now = clk.Now
+
+	dnsServer.addIPToFilter("example.com", net.ParseIP("203.0.113.11"), 32, 300)
+
+	clk.Advance(60 * time.Second)
+	server.sweepExpiredTTLs(clk.Now())
+	_, allowed, _, _ := ff.snapshot()
+	assert.Equal(t, []string{"203.0.113.11/32"}, allowed, "record TTL above the floor must govern")
+
+	clk.Advance(240 * time.Second)
+	server.sweepExpiredTTLs(clk.Now())
+	_, allowed, _, _ = ff.snapshot()
+	assert.Empty(t, allowed)
+	assert.Zero(t, registryLen(t, server, id))
+}
+
+// TestDNSReResolutionRefreshesDeadline: re-resolving a tracked IP extends
+// its deadline (max model) without touching the kernel map again.
+func TestDNSReResolutionRefreshesDeadline(t *testing.T) {
+	server, _, id, ff, dnsServer := newTestServerWithAttachment(t)
+	clk := newFakeClock()
+	server.now = clk.Now
+
+	dnsServer.addIPToFilter("example.com", net.ParseIP("203.0.113.12"), 32, 60) // deadline t0+60
+	clk.Advance(30 * time.Second)
+	dnsServer.addIPToFilter("example.com", net.ParseIP("203.0.113.12"), 32, 60) // deadline t0+90
+	assert.Equal(t, 1, ff.allowCallCount(), "re-resolution of a tracked IP must not hit the filter")
+
+	clk.Advance(30 * time.Second) // t0+60: past the original deadline
+	server.sweepExpiredTTLs(clk.Now())
+	_, allowed, _, _ := ff.snapshot()
+	assert.Equal(t, []string{"203.0.113.12/32"}, allowed, "refreshed deadline must survive the original one")
+
+	clk.Advance(30 * time.Second) // t0+90
+	server.sweepExpiredTTLs(clk.Now())
+	_, allowed, _, _ = ff.snapshot()
+	assert.Empty(t, allowed)
+	assert.Zero(t, registryLen(t, server, id))
+}
+
+// TestPermanentCPAllowPinsAliasedDNSIP is the aliasing key test: a permanent
+// control-plane allow for the same /32 a DNS resolution produced must NEVER
+// be removed when the DNS TTL lapses — in either arrival order, and
+// including a bare-IP CP rule that canonicalizes to the same /32 key.
+func TestPermanentCPAllowPinsAliasedDNSIP(t *testing.T) {
+	server, _, id, ff, dnsServer := newTestServerWithAttachment(t)
+	clk := newFakeClock()
+	server.now = clk.Now
+	c := NewControlPlaneClient("", server, zerolog.Nop(), nil, 0)
+
+	// Order 1: CP permanent first, DNS resolution second.
+	c.handleCommand(allowCidrCmd(id, "203.0.113.10/32", 0))
+	dnsServer.addIPToFilter("one.example.com", net.ParseIP("203.0.113.10"), 32, 30)
+	assert.Zero(t, registryLen(t, server, id), "permanent pin must not gain a deadline from DNS")
+
+	// Order 2: DNS first, CP permanent (as bare IP) second.
+	dnsServer.addIPToFilter("two.example.com", net.ParseIP("203.0.113.20"), 32, 30)
+	assert.Equal(t, 1, registryLen(t, server, id))
+	c.handleCommand(allowCidrCmd(id, "203.0.113.20", 0))
+	assert.Zero(t, registryLen(t, server, id), "permanent CP re-add must clear the DNS deadline")
+
+	clk.Advance(1000 * time.Hour)
+	server.sweepExpiredTTLs(clk.Now())
+	_, allowed, _, _ := ff.snapshot()
+	assert.ElementsMatch(t, []string{"203.0.113.10/32", "203.0.113.20/32"}, allowed,
+		"CP-permanent entries aliased by DNS resolutions must never expire")
+}
+
+// TestAliasedDeadlineIsMaxOfSources: when a TTL'd CP rule and a DNS
+// resolution alias the same CIDR, the entry lives until the LATEST deadline
+// of any source.
+func TestAliasedDeadlineIsMaxOfSources(t *testing.T) {
+	server, _, id, ff, dnsServer := newTestServerWithAttachment(t)
+	clk := newFakeClock()
+	server.now = clk.Now
+	c := NewControlPlaneClient("", server, zerolog.Nop(), nil, 0)
+
+	// CP rule with 10min TTL, then a DNS resolution floored to 60s: the CP
+	// deadline is later and must win.
+	c.handleCommand(allowCidrCmd(id, "203.0.113.30/32", 10*time.Minute))
+	dnsServer.addIPToFilter("a.example.com", net.ParseIP("203.0.113.30"), 32, 30)
+
+	clk.Advance(2 * time.Minute) // far past the DNS deadline
+	server.sweepExpiredTTLs(clk.Now())
+	_, allowed, _, _ := ff.snapshot()
+	assert.Equal(t, []string{"203.0.113.30/32"}, allowed, "DNS TTL lapse must not remove a longer-lived CP rule")
+
+	clk.Advance(8 * time.Minute) // t0+10min
+	server.sweepExpiredTTLs(clk.Now())
+	_, allowed, _, _ = ff.snapshot()
+	assert.Empty(t, allowed)
+
+	// Reverse: DNS (floored 60s) first, then a longer CP TTL extends it.
+	dnsServer.addIPToFilter("b.example.com", net.ParseIP("203.0.113.31"), 32, 30)
+	c.handleCommand(allowCidrCmd(id, "203.0.113.31/32", 2*time.Minute))
+
+	clk.Advance(90 * time.Second) // past the DNS deadline, before the CP one
+	server.sweepExpiredTTLs(clk.Now())
+	_, allowed, _, _ = ff.snapshot()
+	assert.Equal(t, []string{"203.0.113.31/32"}, allowed)
+
+	clk.Advance(30 * time.Second)
+	server.sweepExpiredTTLs(clk.Now())
+	_, allowed, _, _ = ff.snapshot()
+	assert.Empty(t, allowed)
+	assert.Zero(t, registryLen(t, server, id))
+}
+
+// TestDNSEntriesDrainAfterExpiry: DNS tracking is bounded — there is no
+// per-DNS-server cache anymore, and the registry drains fully once TTLs
+// lapse instead of accumulating entries forever.
+func TestDNSEntriesDrainAfterExpiry(t *testing.T) {
+	server, _, id, ff, dnsServer := newTestServerWithAttachment(t)
+	clk := newFakeClock()
+	server.now = clk.Now
+
+	for i := 0; i < 100; i++ {
+		dnsServer.addIPToFilter("bulk.example.com", net.ParseIP(fmt.Sprintf("203.0.113.%d", i+1)).To4(), 32, 30)
+	}
+	assert.Equal(t, 100, registryLen(t, server, id))
+
+	clk.Advance(60 * time.Second)
+	server.sweepExpiredTTLs(clk.Now())
+	assert.Zero(t, registryLen(t, server, id))
+	server.mu.RLock()
+	total := server.attachments[id].ttls.len()
+	server.mu.RUnlock()
+	assert.Zero(t, total, "registry must drain fully after expiry")
+	_, allowed, _, _ := ff.snapshot()
+	assert.Empty(t, allowed)
+}
+
+// TestMapFullCountedSurfacedAndRecovers: a full rule map increments the
+// per-attachment map_full_drops stat (DNS and CP paths alike) instead of
+// silently dropping, records nothing bogus in the registry, and recovers as
+// soon as capacity frees up.
+func TestMapFullCountedSurfacedAndRecovers(t *testing.T) {
+	server, _, id, ff, dnsServer := newTestServerWithAttachment(t)
+	clk := newFakeClock()
+	server.now = clk.Now
+
+	mapFull := fmt.Errorf("updating allowed_ipv4: %w", syscall.ENOSPC)
+	ff.setAllowErr(mapFull)
+
+	dnsServer.addIPToFilter("a.example.com", net.ParseIP("203.0.113.40"), 32, 30)
+	dnsServer.addIPToFilter("b.example.com", net.ParseIP("203.0.113.41"), 32, 30)
+	assert.Zero(t, registryLen(t, server, id), "dropped adds must not be tracked")
+
+	err := server.AllowCIDR(id, mustCIDR(t, "198.51.100.1/32"), 0)
+	require.Error(t, err)
+	require.ErrorIs(t, err, syscall.ENOSPC)
+
+	var stat *apiv1.AttachmentStats
+	for _, s := range server.GetAttachmentStats() {
+		if s.Id == id {
+			stat = s
+		}
+	}
+	require.NotNil(t, stat)
+	assert.Equal(t, uint64(3), stat.MapFullDrops, "every dropped add (DNS and CP) must be counted")
+
+	// Capacity frees up (janitor expired something): adds work again and the
+	// counter stops growing.
+	ff.setAllowErr(nil)
+	dnsServer.addIPToFilter("a.example.com", net.ParseIP("203.0.113.40"), 32, 30)
+	_, allowed, _, _ := ff.snapshot()
+	assert.Equal(t, []string{"203.0.113.40/32"}, allowed)
+	assert.Equal(t, 1, registryLen(t, server, id))
+	server.mu.RLock()
+	drops := server.attachments[id].ttls.mapFullCount()
+	server.mu.RUnlock()
+	assert.Equal(t, uint64(3), drops)
 }

@@ -54,12 +54,20 @@ type TCFilter struct {
 // carve-outs are baked into the program as a load-time constant (see
 // Carveouts / DefaultCarveouts).
 func NewTCFilter(ifaceName string, mode PolicyMode, direction TCDirection, carveouts Carveouts) (*TCFilter, error) {
+	return NewTCFilterWithOptions(ifaceName, mode, direction, carveouts, Options{})
+}
+
+// NewTCFilterWithOptions is NewTCFilter with load-time tuning (see Options).
+func NewTCFilterWithOptions(ifaceName string, mode PolicyMode, direction TCDirection, carveouts Carveouts, opts Options) (*TCFilter, error) {
 	// Load the eBPF spec and bake the carve-out flags in before load: the
 	// JIT folds the constant, so the per-packet cost is zero, and the value
 	// is per-attachment because each filter loads its own program instance.
 	spec, err := loadTc()
 	if err != nil {
 		return nil, fmt.Errorf("loading TC BPF spec: %w", err)
+	}
+	if err := applyOptions(spec, opts); err != nil {
+		return nil, fmt.Errorf("applying TC filter options: %w", err)
 	}
 	carveoutVar, ok := spec.Variables["carveout_flags"]
 	if !ok {

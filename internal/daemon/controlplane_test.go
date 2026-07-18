@@ -44,7 +44,8 @@ func TestApplyBulkUpdateReplacesExistingState(t *testing.T) {
 		[]*apiv1.DomainEntry{{Domain: "old-deny.test"}},
 	))
 	dnsServer.addIPToFilter("cached.test", netIP(t, "203.0.113.200"), 32, 60)
-	require.NotEmpty(t, dnsServer.ipCache)
+	_, allowedBefore, _, _ := ff.snapshot()
+	require.Contains(t, allowedBefore, "203.0.113.200/32")
 
 	c.applyBulkUpdate(id, &apiv1.BulkUpdate{
 		Mode:       apiv1.PolicyMode_POLICY_MODE_DENYLIST,
@@ -63,10 +64,18 @@ func TestApplyBulkUpdateReplacesExistingState(t *testing.T) {
 	assert.Equal(t, []string{"198.51.100.0/24"}, allowed)
 	assert.Equal(t, []string{"2001:db8::/32"}, denied)
 
+	// The DNS-populated IP was wiped with the rest of the filter state (the
+	// allowed list above is exactly the bulk payload) and its TTL tracking
+	// went with it: nothing is pending expiry after a bulk of permanent
+	// entries, so the janitor cannot later remove a rebuilt rule.
+	server.mu.RLock()
+	reg := server.attachments[id].ttls
+	server.mu.RUnlock()
+	assert.Zero(t, reg.pendingLen())
+
 	dnsServer.mu.RLock()
 	defer dnsServer.mu.RUnlock()
 	assert.Equal(t, apiv1.DnsMode_DNS_MODE_ALLOWLIST, dnsServer.mode)
-	assert.Empty(t, dnsServer.ipCache)
 	assert.Equal(t, map[string]bool{"new-allow.test": true}, dnsServer.allowedDomains)
 	assert.Equal(t, map[string]bool{"new-deny.test": false}, dnsServer.deniedDomains)
 }

@@ -74,10 +74,12 @@ func newBenchmarkServer(b *testing.B, attachmentCount int) *Server {
 			b.Fatal(err)
 		}
 		ff := &fakeFilter{stats: filter.Stats{Allowed: uint64(i), Blocked: uint64(i / 2)}}
+		reg := newTTLRegistry()
 		server.attachments[id] = &attachmentState{
 			info:   attachment,
 			filter: ff,
-			dns:    NewDNSServer(id, attachment.DnsAddress, cfg.DNS.Upstream, zerolog.Nop(), ff, nil),
+			dns:    NewDNSServer(id, attachment.DnsAddress, cfg.DNS.Upstream, zerolog.Nop(), server.newDNSFilterSink(id, ff, reg), nil),
+			ttls:   reg,
 		}
 	}
 	return server

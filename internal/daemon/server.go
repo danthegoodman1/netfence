@@ -45,6 +45,13 @@ type Server struct {
 	janitorStop        chan struct{}
 	janitorStopOnce    sync.Once
 	janitorWG          sync.WaitGroup
+
+	// dnsMinFilterTTL floors the lifetime of DNS-resolved IPs in the filter
+	// (see config dns.min_filter_ttl).
+	dnsMinFilterTTL time.Duration
+	// maxRuleEntries sizes each eBPF rule map at filter load time
+	// (see config filter.max_rule_entries; 0 = compiled-in default).
+	maxRuleEntries uint32
 }
 
 type attachmentState struct {
@@ -70,6 +77,16 @@ func NewServer(cfg *config.Config, st *store.Store, logger zerolog.Logger, versi
 	if janitorInterval <= 0 {
 		janitorInterval = time.Second
 	}
+	// Zero/unset means the default floor, not "no floor" (mirrors the
+	// janitor-interval coercion above).
+	dnsMinFilterTTL := cfg.DNS.MinFilterTTL
+	if dnsMinFilterTTL <= 0 {
+		dnsMinFilterTTL = 60 * time.Second
+	}
+	var maxRuleEntries uint32
+	if cfg.Filter.MaxRuleEntries > 0 {
+		maxRuleEntries = uint32(cfg.Filter.MaxRuleEntries)
+	}
 
 	s := &Server{
 		cfg:                cfg,
@@ -84,6 +101,8 @@ func NewServer(cfg *config.Config, st *store.Store, logger zerolog.Logger, versi
 		now:                time.Now,
 		ttlJanitorInterval: janitorInterval,
 		janitorStop:        make(chan struct{}),
+		dnsMinFilterTTL:    dnsMinFilterTTL,
+		maxRuleEntries:     maxRuleEntries,
 	}
 
 	s.watcher = NewTargetWatcher(logger, s.handleTargetRemoved)
@@ -120,7 +139,7 @@ func (s *Server) Start() error {
 		mode := parsePolicyMode(state.info.Mode)
 		direction := parseTcDirection(state.info.Direction)
 
-		ebpfFilter, err := createFilter(state.info.Target, attachType, mode, direction)
+		ebpfFilter, err := createFilter(state.info.Target, attachType, mode, direction, s.maxRuleEntries)
 		if err != nil {
 			s.logger.Warn().Err(err).
 				Str("id", id).
@@ -134,7 +153,8 @@ func (s *Server) Start() error {
 		if cpClient := s.cpClient.Load(); cpClient != nil {
 			proxyFunc = cpClient.MakeProxyFunc(id)
 		}
-		dnsServer := NewDNSServer(id, state.info.DnsAddress, s.cfg.DNS.Upstream, s.logger, ebpfFilter, proxyFunc)
+		sink := s.newDNSFilterSink(id, ebpfFilter, state.ttls)
+		dnsServer := NewDNSServer(id, state.info.DnsAddress, s.cfg.DNS.Upstream, s.logger, sink, proxyFunc)
 		if err := dnsServer.Start(); err != nil {
 			s.logger.Warn().Err(err).
 				Str("id", id).
@@ -417,7 +437,7 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (*apiv1.A
 		return nil, fmt.Errorf("saving attachment: %w", err)
 	}
 
-	ebpfFilter, err := createFilter(target, attachType, mode, direction)
+	ebpfFilter, err := createFilter(target, attachType, mode, direction, s.maxRuleEntries)
 	if err != nil {
 		s.mu.Lock()
 		s.releasePort(port)
@@ -430,7 +450,9 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (*apiv1.A
 	if cpClient := s.cpClient.Load(); cpClient != nil {
 		proxyFunc = cpClient.MakeProxyFunc(id)
 	}
-	dnsServer := NewDNSServer(id, dnsAddr, s.cfg.DNS.Upstream, s.logger, ebpfFilter, proxyFunc)
+	ttls := newTTLRegistry()
+	sink := s.newDNSFilterSink(id, ebpfFilter, ttls)
+	dnsServer := NewDNSServer(id, dnsAddr, s.cfg.DNS.Upstream, s.logger, sink, proxyFunc)
 	if err := dnsServer.Start(); err != nil {
 		if ebpfFilter != nil {
 			ebpfFilter.Close()
@@ -455,7 +477,7 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (*apiv1.A
 		s.store.DeleteAttachment(id)
 		return nil, fmt.Errorf("target already attached: %s (%s)", target, existingID)
 	}
-	s.attachments[id] = &attachmentState{info: attachment, dns: dnsServer, filter: ebpfFilter, ttls: newTTLRegistry()}
+	s.attachments[id] = &attachmentState{info: attachment, dns: dnsServer, filter: ebpfFilter, ttls: ttls}
 	s.targetIndex[target] = id
 	s.mu.Unlock()
 
@@ -683,6 +705,7 @@ func (s *Server) GetAttachmentStats() []*apiv1.AttachmentStats {
 		if ref.dns != nil {
 			stat.DnsQueriesAllowed, stat.DnsQueriesBlocked = ref.dns.Stats()
 		}
+		stat.MapFullDrops = ref.ttls.mapFullCount()
 		stats = append(stats, stat)
 	}
 	return stats
@@ -692,6 +715,7 @@ type attachmentStatsRef struct {
 	id     string
 	filter filter.Filter
 	dns    *DNSServer
+	ttls   *ttlRegistry
 }
 
 func (s *Server) snapshotAttachmentStats() []attachmentStatsRef {
@@ -704,6 +728,7 @@ func (s *Server) snapshotAttachmentStats() []attachmentStatsRef {
 			id:     id,
 			filter: state.filter,
 			dns:    state.dns,
+			ttls:   state.ttls,
 		})
 	}
 	return refs
@@ -833,21 +858,15 @@ func (s *Server) ClearRules(id string) error {
 		return fmt.Errorf("attachment not found: %s", id)
 	}
 	ebpfFilter := state.filter
-	dnsServer := state.dns
 	reg := state.ttls
 	s.mu.RUnlock()
 
-	// Clearing goes through the TTL registry so pending deadlines are purged
-	// atomically with the filter wipe — the janitor must never "expire" an
-	// entry that a clear (e.g. bulk update) already removed or that a rebuild
-	// re-added as permanent.
-	if err := reg.clear(ebpfFilter); err != nil {
-		return err
-	}
-	if dnsServer != nil {
-		dnsServer.ClearDynamicCache()
-	}
-	return nil
+	// Clearing goes through the TTL registry so tracked entries (including
+	// DNS-populated IPs) are purged atomically with the filter wipe — the
+	// janitor must never "expire" an entry that a clear (e.g. bulk update)
+	// already removed or that a rebuild re-added as permanent, and cleared
+	// DNS IPs must be re-addable on the next resolution.
+	return reg.clear(ebpfFilter)
 }
 
 func (s *Server) SetFilterMode(id string, mode apiv1.PolicyMode) error {
@@ -882,9 +901,12 @@ func (s *Server) SetFilterMode(id string, mode apiv1.PolicyMode) error {
 	return nil
 }
 
-// AllowCIDR adds the CIDR to the attachment's allowlist. A ttl > 0 schedules
-// removal by the TTL janitor after it elapses; ttl <= 0 means permanent, and
-// re-adding an existing CIDR upserts its deadline (or clears it for ttl <= 0).
+// AllowCIDR adds the CIDR to the attachment's allowlist under the registry's
+// max-deadline / permanent-pin model (see ttlRegistry): a ttl > 0 schedules
+// removal by the TTL janitor, with a re-add only ever EXTENDING an existing
+// deadline to the later of the two (never shortening it); ttl <= 0 pins the
+// entry permanent, and a permanent entry is never demoted by a later TTL'd
+// re-add. Use RemoveAllowedCIDR to drop an entry early.
 func (s *Server) AllowCIDR(id string, cidr *net.IPNet, ttl time.Duration) error {
 	ebpfFilter, reg, err := s.filterAndRegistry(id)
 	if err != nil {

@@ -24,6 +24,8 @@ type fakeFilter struct {
 	clearCalls   int
 	stats        filter.Stats
 	setModeCalls int
+	allowCalls   int
+	allowErr     error // when set, AllowIP fails with this error
 }
 
 func (f *fakeFilter) SetMode(mode filter.PolicyMode) error {
@@ -37,9 +39,25 @@ func (f *fakeFilter) SetMode(mode filter.PolicyMode) error {
 func (f *fakeFilter) AllowIP(cidr *net.IPNet) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.allowCalls++
+	if f.allowErr != nil {
+		return f.allowErr
+	}
 	// Upsert, matching the real BPF map's set semantics on re-add.
 	f.allowed = appendUnique(f.allowed, cidr.String())
 	return nil
+}
+
+func (f *fakeFilter) setAllowErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.allowErr = err
+}
+
+func (f *fakeFilter) allowCallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.allowCalls
 }
 
 func (f *fakeFilter) DenyIP(cidr *net.IPNet) error {
@@ -105,7 +123,7 @@ func removeString(values []string, target string) []string {
 	return out
 }
 
-func newTestServerWithAttachment(t *testing.T) (*Server, *store.Store, string, *fakeFilter, *DNSServer) {
+func newTestServerWithAttachment(t testing.TB) (*Server, *store.Store, string, *fakeFilter, *DNSServer) {
 	t.Helper()
 
 	st, err := store.New(filepath.Join(t.TempDir(), "netfence.db"))
@@ -139,9 +157,11 @@ func newTestServerWithAttachment(t *testing.T) (*Server, *store.Store, string, *
 	require.NoError(t, st.SaveAttachment(attachment))
 
 	ff := &fakeFilter{}
-	dnsServer := NewDNSServer(id, attachment.DnsAddress, cfg.DNS.Upstream, zerolog.Nop(), ff, nil)
+	reg := newTTLRegistry()
+	sink := server.newDNSFilterSink(id, ff, reg)
+	dnsServer := NewDNSServer(id, attachment.DnsAddress, cfg.DNS.Upstream, zerolog.Nop(), sink, nil)
 	server.mu.Lock()
-	server.attachments[id] = &attachmentState{info: attachment, dns: dnsServer, filter: ff, ttls: newTTLRegistry()}
+	server.attachments[id] = &attachmentState{info: attachment, dns: dnsServer, filter: ff, ttls: reg}
 	server.targetIndex[attachment.Target] = id
 	server.portPool[12000] = true
 	server.mu.Unlock()

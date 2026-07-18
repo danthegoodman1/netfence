@@ -15,28 +15,39 @@ import (
 	apiv1 "github.com/danthegoodman1/netfence/v1"
 )
 
-type recordingIPAllower struct {
+// recordingSink is a fake DNSFilterSink capturing each forwarded CIDR and
+// the TTL the DNS server requested for it (pre-floor: the floor is applied
+// by the real server-side sink, not the DNS server).
+type recordingSink struct {
 	mu    sync.Mutex
 	cidrs []string
+	ttls  []time.Duration
 }
 
-func (r *recordingIPAllower) AllowIP(cidr *net.IPNet) error {
+func (r *recordingSink) AllowIPWithTTL(cidr *net.IPNet, ttl time.Duration) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.cidrs = append(r.cidrs, cidr.String())
+	r.ttls = append(r.ttls, ttl)
 	return nil
 }
 
-func (r *recordingIPAllower) calls() int {
+func (r *recordingSink) calls() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return len(r.cidrs)
 }
 
-func (r *recordingIPAllower) entries() []string {
+func (r *recordingSink) entries() []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return append([]string(nil), r.cidrs...)
+}
+
+func (r *recordingSink) requestedTTLs() []time.Duration {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]time.Duration(nil), r.ttls...)
 }
 
 type captureDNSWriter struct {
@@ -102,7 +113,7 @@ func startTestUpstream(t testing.TB) string {
 
 func TestDNSServerDomainPolicySemantics(t *testing.T) {
 	upstream := startTestUpstream(t)
-	filter := &recordingIPAllower{}
+	filter := &recordingSink{}
 	server := NewDNSServer("att-1", "127.0.0.1:0", upstream, zerolog.Nop(), filter, nil)
 	server.ReplaceRules(apiv1.DnsMode_DNS_MODE_ALLOWLIST,
 		[]*apiv1.DomainEntry{
@@ -173,7 +184,7 @@ func TestDNSServerProxyFailsClosed(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			filter := &recordingIPAllower{}
+			filter := &recordingSink{}
 			server := NewDNSServer("att-1", "127.0.0.1:0", "127.0.0.1:1", zerolog.Nop(), filter, tt.proxyFunc)
 			server.SetMode(apiv1.DnsMode_DNS_MODE_PROXY)
 
@@ -199,7 +210,7 @@ func TestDNSServerProxyExplicitDenyRefuses(t *testing.T) {
 }
 
 func TestDNSServerProxyResponseHonorsTTLQueryTypeAndFiltering(t *testing.T) {
-	filter := &recordingIPAllower{}
+	filter := &recordingSink{}
 	server := NewDNSServer("att-1", "127.0.0.1:0", "127.0.0.1:1", zerolog.Nop(), filter, func(string, string) (DnsProxyDecision, error) {
 		return DnsProxyDecision{
 			Allow:       true,
@@ -228,7 +239,7 @@ func TestDNSServerProxyResponseHonorsTTLQueryTypeAndFiltering(t *testing.T) {
 	assert.Equal(t, "2001:db8::1", aaaa.AAAA.String())
 	assert.Equal(t, []string{"198.51.100.10/32", "2001:db8::1/128"}, filter.entries())
 
-	noFilter := &recordingIPAllower{}
+	noFilter := &recordingSink{}
 	server = NewDNSServer("att-1", "127.0.0.1:0", "127.0.0.1:1", zerolog.Nop(), noFilter, func(string, string) (DnsProxyDecision, error) {
 		return DnsProxyDecision{Allow: true, AddToFilter: false, IPs: []string{"198.51.100.11"}}, nil
 	})
@@ -241,20 +252,24 @@ func TestDNSServerProxyResponseHonorsTTLQueryTypeAndFiltering(t *testing.T) {
 	assert.Zero(t, noFilter.calls())
 }
 
-func TestDNSServerDynamicFilterCacheExpiresByTTL(t *testing.T) {
-	filter := &recordingIPAllower{}
-	server := NewDNSServer("att-1", "127.0.0.1:0", "127.0.0.1:1", zerolog.Nop(), filter, nil)
+// TestDNSServerForwardsEveryResolutionToSink: with the old per-server ipCache
+// gone, the DNS server forwards every resolution (with the record TTL) to the
+// sink, which owns dedup, the TTL floor, and janitor-driven expiry (see the
+// registry-level tests in ttl_test.go). A zero record TTL is coerced to the
+// default before it reaches the sink.
+func TestDNSServerForwardsEveryResolutionToSink(t *testing.T) {
+	sink := &recordingSink{}
+	server := NewDNSServer("att-1", "127.0.0.1:0", "127.0.0.1:1", zerolog.Nop(), sink, nil)
 
 	ip := net.ParseIP("203.0.113.77")
 	server.addIPToFilter("example.com", ip, 32, 60)
-	server.addIPToFilter("example.com", ip, 32, 60)
-	assert.Equal(t, 1, filter.calls())
-
-	server.mu.Lock()
-	server.ipCache["203.0.113.77"] = time.Now().Add(-time.Second)
-	server.mu.Unlock()
-	server.addIPToFilter("example.com", ip, 32, 60)
-	assert.Equal(t, 2, filter.calls())
+	server.addIPToFilter("example.com", ip, 32, 0)
+	assert.Equal(t, 2, sink.calls())
+	assert.Equal(t, []string{"203.0.113.77/32", "203.0.113.77/32"}, sink.entries())
+	assert.Equal(t, []time.Duration{
+		60 * time.Second,
+		time.Duration(defaultDNSTTLSeconds) * time.Second,
+	}, sink.requestedTTLs())
 }
 
 func TestDNSServerStopClosesSocketAndAllowsRebind(t *testing.T) {

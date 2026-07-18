@@ -1,14 +1,17 @@
 package daemon
 
 import (
+	"errors"
 	"net"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/danthegoodman1/netfence/pkg/filter"
 )
 
-// ruleList identifies which filter list a TTL-tracked entry lives in.
+// ruleList identifies which filter list a tracked entry lives in.
 type ruleList int
 
 const (
@@ -25,24 +28,44 @@ func (l ruleList) String() string {
 
 // ttlKey identifies one tracked filter entry. cidr is the canonical (masked)
 // string form produced by (*net.IPNet).String(), so equal networks written
-// differently collapse to one key.
+// differently — including a control-plane CIDR and a DNS-resolved /32 for
+// the same address — collapse to one key.
 type ttlKey struct {
 	cidr string
 	list ruleList
 }
 
 type ttlEntry struct {
-	cidr      *net.IPNet
+	cidr *net.IPNet
+	// expiresAt is the entry's deadline. The zero time means permanent:
+	// the entry never expires (permanent pin).
 	expiresAt time.Time
+	// inFilter records whether the entry was successfully written to the
+	// eBPF filter, so repeated adds (e.g. every DNS query for a cached
+	// domain) skip the redundant map syscall. It stays false while the
+	// attachment has no filter yet (restore window, !linux stub) so the
+	// first add after the filter exists writes through.
+	inFilter bool
 }
 
-// ttlRegistry tracks expiry deadlines for one attachment's CIDR filter
-// entries and serializes that attachment's CIDR-rule mutations: every
-// add/remove/clear/expire routes through a method that holds r.mu across
-// BOTH the eBPF filter call and the bookkeeping update. That makes "a
-// concurrent re-add wins over an in-flight expiry" trivially true — the
-// janitor's expire pass and a control-plane (re-)add can never interleave
+// ttlRegistry tracks every CIDR entry the daemon has added to one
+// attachment's filter — control-plane rules and DNS-resolved IPs alike —
+// with an expiry deadline per (cidr, list), and serializes that attachment's
+// CIDR-rule mutations: every add/remove/clear/expire routes through a method
+// that holds r.mu across BOTH the eBPF filter call and the bookkeeping
+// update. That makes "a concurrent re-add wins over an in-flight expiry"
+// trivially true — the janitor's expire pass and an add can never interleave
 // between the kernel map write and the registry write.
+//
+// Lifetime model (max-deadline / permanent-pin): an add with ttl <= 0 pins
+// the entry permanent; an add with ttl > 0 sets deadline =
+// max(existing deadline, now+ttl), and a permanent entry stays permanent.
+// So an entry lives as long as the longest-lived source that wants it: a
+// permanent control-plane allow aliasing a DNS-resolved /32 is never removed
+// when the DNS TTL lapses, while a DNS-only /32 expires on schedule.
+// Explicit remove() and clear() are outright (operator/resync actions) and
+// drop the entry regardless of pins; a DNS-populated entry self-heals on the
+// next resolution.
 //
 // Locking: r.mu is a leaf lock. Callers snapshot the *ttlRegistry and
 // filter.Filter under Server.mu, release Server.mu, and only then lock r.mu;
@@ -52,29 +75,59 @@ type ttlEntry struct {
 // contention is confined to one attachment's rule mutations, never the
 // packet path (the datapath reads kernel maps directly).
 //
-// Phase 2B seam: entries are keyed by (cidr, list) with an absolute
-// deadline and carry no notion of where the rule came from. DNS-populated
-// /32s can be upserted through the same add() with a deadline derived from
-// the DNS TTL and swept by the same janitor.
+// Phase 2C seam: because every daemon-side add routes through here, the
+// registry doubles as the userspace record of intended filter contents,
+// which a diff-apply BulkUpdate can compare against.
 type ttlRegistry struct {
 	mu      sync.Mutex
 	entries map[ttlKey]ttlEntry
+
+	// mapFullDrops counts adds dropped because the filter's rule map was at
+	// capacity. Cumulative; surfaced via AttachmentStats.map_full_drops.
+	mapFullDrops atomic.Uint64
 }
 
 func newTTLRegistry() *ttlRegistry {
 	return &ttlRegistry{entries: make(map[ttlKey]ttlEntry)}
 }
 
-// add inserts the CIDR into the given filter list and records its expiry.
-// ttl <= 0 means permanent: the entry is added to the filter and any prior
-// deadline for the same (cidr, list) is dropped, so re-adding without a TTL
-// makes a previously-TTL'd entry permanent again. Re-adding with a TTL
-// replaces the previous deadline (upsert).
+// isMapFull reports whether a filter insert failed because the underlying
+// BPF map is at capacity. LPM tries return ENOSPC; hash-style maps E2BIG.
+func isMapFull(err error) bool {
+	return errors.Is(err, syscall.ENOSPC) || errors.Is(err, syscall.E2BIG)
+}
+
+// add inserts the CIDR into the given filter list and records its lifetime
+// under the max-deadline / permanent-pin model (see type comment):
+//   - ttl <= 0 pins the entry permanent (clears any deadline).
+//   - ttl > 0 extends the deadline to max(existing, now+ttl); it never
+//     shortens one and never unpins a permanent entry. Use remove() to drop
+//     an entry early.
+//
+// The kernel map write is skipped when the entry is already known to be in
+// the filter, so repeated DNS resolutions of a cached IP cost no syscall.
 func (r *ttlRegistry) add(f filter.Filter, cidr *net.IPNet, list ruleList, ttl time.Duration, now time.Time) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if f != nil {
+	key := ttlKey{cidr: cidr.String(), list: list}
+	existing, exists := r.entries[key]
+
+	entry := ttlEntry{cidr: cidr, inFilter: existing.inFilter}
+	if ttl > 0 {
+		entry.expiresAt = now.Add(ttl)
+		if exists {
+			if existing.expiresAt.IsZero() {
+				// Permanent pin wins: stays permanent.
+				entry.expiresAt = time.Time{}
+			} else if existing.expiresAt.After(entry.expiresAt) {
+				entry.expiresAt = existing.expiresAt
+			}
+		}
+	}
+	// ttl <= 0: entry.expiresAt stays zero — permanent pin.
+
+	if f != nil && !entry.inFilter {
 		var err error
 		if list == listAllow {
 			err = f.AllowIP(cidr)
@@ -82,27 +135,28 @@ func (r *ttlRegistry) add(f filter.Filter, cidr *net.IPNet, list ruleList, ttl t
 			err = f.DenyIP(cidr)
 		}
 		if err != nil {
+			if isMapFull(err) {
+				r.mapFullDrops.Add(1)
+			}
+			// Leave any existing entry untouched: its previous lifetime is
+			// still accurate, and the failed extension must not be recorded.
 			return err
 		}
+		entry.inFilter = true
 	}
 
-	key := ttlKey{cidr: cidr.String(), list: list}
-	if ttl <= 0 {
-		delete(r.entries, key)
-		return nil
-	}
-	r.entries[key] = ttlEntry{cidr: cidr, expiresAt: now.Add(ttl)}
+	r.entries[key] = entry
 	return nil
 }
 
 // remove deletes the CIDR from the given filter list and purges its deadline
 // so the janitor never "expires" an entry that was explicitly removed (and
 // possibly re-added as permanent) in the meantime. Mirroring expire()'s
-// fail-safe philosophy, the deadline is only dropped after the filter
+// fail-safe philosophy, the bookkeeping is only dropped after the filter
 // removal succeeds: if the rule is still in the kernel map, keeping the
-// bookkeeping lets the janitor retry the removal instead of leaving a TTL'd
-// entry unremovable (fail-open for allow entries). Filter removes are
-// idempotent, so a not-present key is a success, not an error.
+// entry lets the janitor retry the removal instead of leaving a TTL'd entry
+// unremovable (fail-open for allow entries). Filter removes are idempotent,
+// so a not-present key is a success, not an error.
 func (r *ttlRegistry) remove(f filter.Filter, cidr *net.IPNet, list ruleList) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -122,7 +176,7 @@ func (r *ttlRegistry) remove(f filter.Filter, cidr *net.IPNet, list ruleList) er
 	return nil
 }
 
-// clear wipes all filter rules and all tracked deadlines atomically with
+// clear wipes all filter rules and all tracked entries atomically with
 // respect to concurrent adds and janitor sweeps.
 func (r *ttlRegistry) clear(f filter.Filter) error {
 	r.mu.Lock()
@@ -135,10 +189,10 @@ func (r *ttlRegistry) clear(f filter.Filter) error {
 	return f.ClearRules()
 }
 
-// purge drops all tracked deadlines without touching the filter. Used when
-// an attachment is detached or its target removed: the filter is being
-// closed wholesale, and an in-flight janitor sweep holding a stale snapshot
-// must not keep retrying removals against the closed filter.
+// purge drops all tracked entries without touching the filter. Used when an
+// attachment is detached or its target removed: the filter is being closed
+// wholesale, and an in-flight janitor sweep holding a stale snapshot must
+// not keep retrying removals against the closed filter.
 func (r *ttlRegistry) purge() {
 	if r == nil {
 		return
@@ -148,11 +202,34 @@ func (r *ttlRegistry) purge() {
 	r.entries = make(map[ttlKey]ttlEntry)
 }
 
-// len reports the number of tracked (non-permanent) entries.
+// len reports the total number of tracked entries (permanent and TTL'd).
 func (r *ttlRegistry) len() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return len(r.entries)
+}
+
+// pendingLen reports the number of entries with a finite deadline, i.e.
+// those the janitor will eventually expire.
+func (r *ttlRegistry) pendingLen() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := 0
+	for _, entry := range r.entries {
+		if !entry.expiresAt.IsZero() {
+			n++
+		}
+	}
+	return n
+}
+
+// mapFullCount returns the cumulative number of adds dropped because the
+// filter's rule map was full.
+func (r *ttlRegistry) mapFullCount() uint64 {
+	if r == nil {
+		return 0
+	}
+	return r.mapFullDrops.Load()
 }
 
 // sweptEntry reports one expiry processed (or attempted) by expire.
@@ -162,9 +239,10 @@ type sweptEntry struct {
 	err  error
 }
 
-// expire removes every entry whose deadline has passed from both the filter
-// and the registry. On a filter removal error the entry is KEPT for retry on
-// the next sweep: failing to remove an expired allow entry is fail-open, so
+// expire removes every entry whose finite deadline has passed from both the
+// filter and the registry. Permanent (zero-deadline) entries are never
+// touched. On a filter removal error the entry is KEPT for retry on the
+// next sweep: failing to remove an expired allow entry is fail-open, so
 // silently dropping the bookkeeping is the wrong direction. (Detach purges
 // the registry, so a closed filter cannot cause an endless retry loop.)
 func (r *ttlRegistry) expire(f filter.Filter, now time.Time) []sweptEntry {
@@ -176,7 +254,7 @@ func (r *ttlRegistry) expire(f filter.Filter, now time.Time) []sweptEntry {
 
 	var swept []sweptEntry
 	for key, entry := range r.entries {
-		if entry.expiresAt.After(now) {
+		if entry.expiresAt.IsZero() || entry.expiresAt.After(now) {
 			continue
 		}
 		var err error

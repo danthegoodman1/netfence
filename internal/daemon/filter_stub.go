@@ -7,7 +7,7 @@ import (
 	apiv1 "github.com/danthegoodman1/netfence/v1"
 )
 
-func createFilter(_ string, _ apiv1.AttachmentType, _ apiv1.PolicyMode, _ apiv1.TcDirection) (filter.Filter, error) {
+func createFilter(_ string, _ apiv1.AttachmentType, _ apiv1.PolicyMode, _ apiv1.TcDirection, _ uint32) (filter.Filter, error) {
 	return nil, nil
 }
 
