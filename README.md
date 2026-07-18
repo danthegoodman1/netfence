@@ -48,6 +48,11 @@ A few major benefits to this solution that other options don't usually support:
 
 To my knowledge, no other solutions offers all of these features together.
 
+Known limitation: cgroup attachments filter at the socket layer (`connect`/`sendmsg`
+hooks), so a process with `CAP_NET_RAW` can craft raw packets that bypass them. Use
+a TC (interface) attachment, which filters at the device layer, for workloads that
+may hold `CAP_NET_RAW`.
+
 However, this does have a bit more overhead than something like [httpjail](https://github.com/coder/httpjail).
 
 ## Performance snapshot

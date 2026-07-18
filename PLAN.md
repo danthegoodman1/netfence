@@ -50,13 +50,13 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 1A: `sendmsg4`/`sendmsg6` hooks in cgroup filter | Missing: BPF programs, attach code, unconnected-UDP regression test. |
-| Incomplete | Work | 1B: `direction` field on `AttachRequest` (EGRESS default, INGRESS for host-side veth/tap peers) + docs | Decided: explicit field, default EGRESS (preserves current in-netns/uplink behavior), README documents correct side/direction pairings. Missing: implementation + veth-pair direction test. |
-| Incomplete | Work | 1C: `skb->protocol` parsing, VLAN handling, default-deny unknown ethertypes (ARP allowed) | Missing: BPF change + VLAN bypass test. |
-| Incomplete | Work | 1D: carve-out config map; disable v4 link-local always-allow by default; add `ff02::/16`+ARP for TC | Missing: implementation + metadata-service block test; README security-note update. |
-| Incomplete | Test | Veth-pair TC e2e incl. connection-severing assertion | Missing: test (no TC traffic test exists today). |
-| Incomplete | Gate | All four bypass tests pass in Docker gate; warm-path bench unchanged | Missing: tests + bench run. |
-| Incomplete | Doc | Raw-socket limitation + direction guidance in README | Missing: doc update. |
+| Complete | Work | 1A: `sendmsg4`/`sendmsg6` hooks in cgroup filter | Commit `e82d345`: shared `filter_dst4/6` helpers + sendmsg hooks over same maps; `TestCgroupUnconnectedUDP` (neg-verified against HEAD). |
+| Complete | Work | 1B: `direction` field on `AttachRequest` (EGRESS default, INGRESS for host-side veth/tap peers) + docs | Commit `6d8ca58`: `TcDirection` on AttachRequest/Subscribed/Attachment/AttachmentInfo, `NewTCFilter` ingress/egress, persisted via store column, `TestTCVethDirection` (first real TC traffic test, built-in negative verification). |
+| Complete | Work | 1C: `skb->protocol` parsing, VLAN handling, default-deny unknown ethertypes (ARP allowed) | Commit `47c751b`: `bpf_skb_load_bytes_relative(BPF_HDR_START_NET)` + bounded 802.1Q/QinQ walk, fail-closed in allowlist; `TestTCVethVlanAllowlist` (QinQ neg-verified); ARP allowance traffic-pinned via post-attach neigh flush (neg-verified). |
+| Complete | Work | 1D: carve-out flags; disable v4 link-local always-allow by default; add `ff02::/16` for TC | Commit `1bc85b7`: `volatile const carveout_flags` (zero per-packet cost), LinkLocalV4 OFF by default; `TestCgroupMetadataServiceBlockable` + `TestTCVethMetadataBlockable` (flag-flip proves const rewrite reaches program, neg-verified); README security note. |
+| Complete | Test | Veth-pair TC e2e incl. connection-severing assertion | Commits `6d8ca58`/`47c751b`: `tc_veth_test.go` netns+veth harness; severing proven on a UDP flow (per-packet, no conntrack — TCP data stops rather than RST, documented). |
+| Complete | Gate | All four bypass tests pass in Docker gate; warm-path bench unchanged | `make test-docker`/`-cgroup`/`-tc` green at each commit; `make bench-docker` warm connected path within noise (deltas -143/+104/+42 ns across runs, inside baseline spread). |
+| Complete | Doc | Raw-socket limitation + direction guidance in README | Direction table (`6d8ca58`), security note (`1bc85b7`), raw-socket/cgroup limitation note (this commit). |
 
 ## Phase 2: Rule lifecycle correctness (TTLs, bulk updates, capacity)
 
