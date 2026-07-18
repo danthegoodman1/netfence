@@ -351,6 +351,30 @@ grpc.NewServer(grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
 
 When the daemon receives `Subscribed`, it blocks waiting for `SubscribedAck` before returning success to the caller. This ensures the attachment has its initial configuration before traffic flows. Use the metadata to identify which VM/tenant/container this attachment belongs to and respond with the appropriate initial rules.
 
+### Reconnects and idempotency (required)
+
+`SyncRequest` is the authoritative reconciliation point: on every
+(re)connect it is the first event on the stream and lists the daemon's
+complete current attachment set. Reconcile your view against it — add
+attachments you didn't know about, drop ones absent from the list. On
+reconnect the daemon purges events that were queued against the previous
+connection (the sync supersedes them), so you will not see stale
+`Heartbeat`s, `Unsubscribed`s for attachments already absent from the sync,
+or `CommandResult`s from the dead connection replayed after it. Two edge
+cases remain by design, and your control plane MUST handle them
+idempotently:
+
+- A `Subscribed` whose `SubscribedAck` was still pending when the
+  connection dropped is re-sent on the new connection after the
+  `SyncRequest` (which may already list that same attachment), because the
+  daemon-side attach caller is still blocked waiting for the ack — you
+  acknowledge `Subscribed`, not `SyncRequest`. Treat a `Subscribed` for an
+  already-known attachment id as an update (and reply with a fresh
+  `SubscribedAck`), never as a duplicate.
+- An event generated concurrently with the (re)connect can race the sync
+  snapshot in either direction. Treat an `Unsubscribed` for an unknown or
+  already-removed attachment id as a no-op.
+
 ### Rule lifetimes (TTLs)
 
 - CIDR entries (`AllowCIDR`/`DenyCIDR` commands, and the CIDR lists in `SubscribedAck`/`BulkUpdate`) carry an optional TTL. TTL'd rules are removed by a daemon janitor once they expire (scan interval `ttl_janitor_interval`, default 1s); rules without a TTL are permanent.

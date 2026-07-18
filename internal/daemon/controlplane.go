@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -60,7 +61,21 @@ type ControlPlaneClient struct {
 	stream grpc.BidiStreamingClient[apiv1.DaemonEvent, apiv1.ControlCommand]
 	cancel context.CancelFunc
 
+	// sendCh is created once and PERSISTS across reconnects, so events
+	// queued against a dead connection are still sitting in it when the
+	// next connection comes up. Each connection's sendLoop drops those
+	// stale events instead of replaying them after the fresh SyncRequest —
+	// see sendEpoch and sendLoop.
 	sendCh chan outboundEvent
+
+	// sendEpoch is the current connection epoch. connect() increments it
+	// BEFORE snapshotting the attachment list for the SyncRequest, and
+	// enqueue() stamps every outbound event with the epoch current at
+	// enqueue time. An event carrying an older epoch was therefore produced
+	// from state that predates the Sync snapshot, so the SyncRequest already
+	// sent on the new stream supersedes it and sendLoop drops it (with the
+	// single exception of a Subscribed whose ack is still pending).
+	sendEpoch atomic.Uint64
 
 	// pendingAcks tracks subscriptions waiting for SubscribedAck responses.
 	// Key is attachment ID, value is the channel to send the result on.
@@ -72,6 +87,24 @@ type outboundEvent struct {
 	event             *apiv1.DaemonEvent
 	subscribedID      string
 	requirePendingAck bool
+	// epoch is the connection epoch current when the event was enqueued
+	// (see ControlPlaneClient.sendEpoch). sendLoop drops events from an
+	// older epoch: the fresh SyncRequest supersedes them.
+	epoch uint64
+}
+
+// enqueue stamps the event with the current connection epoch and queues it
+// without blocking. It returns false when the channel is full — callers
+// treat outbound events as best-effort and drop with a warning rather than
+// stalling.
+func (c *ControlPlaneClient) enqueue(out outboundEvent) bool {
+	out.epoch = c.sendEpoch.Load()
+	select {
+	case c.sendCh <- out:
+		return true
+	default:
+		return false
+	}
 }
 
 func NewControlPlaneClient(url string, server *Server, logger zerolog.Logger, metadata map[string]string, subscribeAckTimeout time.Duration, creds *ControlPlaneCreds) *ControlPlaneClient {
@@ -215,6 +248,14 @@ func (c *ControlPlaneClient) connect(ctx context.Context) (connectedAt time.Time
 	c.stream = stream
 	c.mu.Unlock()
 
+	// New connection epoch. Bumping BEFORE snapshotting the attachment list
+	// below guarantees that any event still queued with an older epoch was
+	// produced from state the snapshot already reflects, so the SyncRequest
+	// supersedes it and sendLoop can safely drop it. Events enqueued after
+	// this point may race the snapshot in either direction — the CP handles
+	// that via the idempotency contract documented in control.proto.
+	epoch := c.sendEpoch.Add(1)
+
 	syncReq := &apiv1.DaemonEvent{
 		Event: &apiv1.DaemonEvent_Sync{
 			Sync: &apiv1.SyncRequest{
@@ -237,7 +278,7 @@ func (c *ControlPlaneClient) connect(ctx context.Context) (connectedAt time.Time
 
 	errCh := make(chan error, 2)
 
-	go c.sendLoop(streamCtx, stream, errCh)
+	go c.sendLoop(streamCtx, stream, epoch, errCh)
 	go c.recvLoop(stream, errCh)
 	go c.heartbeatLoop(streamCtx)
 
@@ -254,7 +295,20 @@ func (c *ControlPlaneClient) connect(ctx context.Context) (connectedAt time.Time
 	return connectedAt
 }
 
-func (c *ControlPlaneClient) sendLoop(ctx context.Context, stream grpc.BidiStreamingClient[apiv1.DaemonEvent, apiv1.ControlCommand], errCh chan<- error) {
+// sendLoop drains sendCh onto one connection's stream. epoch is that
+// connection's epoch: events stamped with an older one were queued before
+// this connection's SyncRequest snapshot (i.e. during or before a previous
+// connection) and are dropped — the Sync already conveyed the authoritative
+// attachment state, so replaying stale Heartbeats, Unsubscribeds, or
+// CommandResults after it would only hand the CP superseded interleavings.
+// The one exception is a Subscribed whose ack is STILL pending: a caller
+// blocked in SubscribeAndWait across the reconnect needs the CP to see the
+// Subscribed on the new stream, because the CP replies SubscribedAck to
+// Subscribed, not to Sync. It is re-sent after the SyncRequest (which
+// connect() sends directly before starting this loop, so ordering holds by
+// construction) and the CP handles the possible re-delivery idempotently
+// (see control.proto).
+func (c *ControlPlaneClient) sendLoop(ctx context.Context, stream grpc.BidiStreamingClient[apiv1.DaemonEvent, apiv1.ControlCommand], epoch uint64, errCh chan<- error) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -262,6 +316,10 @@ func (c *ControlPlaneClient) sendLoop(ctx context.Context, stream grpc.BidiStrea
 		case outbound := <-c.sendCh:
 			if outbound.requirePendingAck && !c.hasPendingAck(outbound.subscribedID) {
 				c.logger.Debug().Str("id", outbound.subscribedID).Msg("dropping stale subscribed event")
+				continue
+			}
+			if outbound.epoch < epoch && !outbound.requirePendingAck {
+				c.logger.Debug().Msg("dropping stale queued event superseded by sync")
 				continue
 			}
 			if err := stream.Send(outbound.event); err != nil {
@@ -309,11 +367,7 @@ func (c *ControlPlaneClient) heartbeatLoop(ctx context.Context) {
 					},
 				},
 			}
-			select {
-			case c.sendCh <- event:
-			case <-ctx.Done():
-				return
-			default:
+			if !c.enqueue(event) {
 				c.logger.Warn().Msg("send channel full, dropping heartbeat")
 			}
 		}
@@ -458,11 +512,9 @@ func (c *ControlPlaneClient) sendCommandResult(commandID, attachmentID string, c
 	if cmdErr != nil {
 		result.Error = cmdErr.Error()
 	}
-	select {
-	case c.sendCh <- outboundEvent{event: &apiv1.DaemonEvent{
+	if !c.enqueue(outboundEvent{event: &apiv1.DaemonEvent{
 		Event: &apiv1.DaemonEvent_CommandResult{CommandResult: result},
-	}}:
-	default:
+	}}) {
 		c.logger.Warn().Str("command_id", commandID).Str("id", attachmentID).Msg("send channel full, dropping command result")
 	}
 }
@@ -474,14 +526,12 @@ func (c *ControlPlaneClient) sendCommandResult(commandID, attachmentID string, c
 // If subscribeAckTimeout is 0, this returns immediately without waiting.
 func (c *ControlPlaneClient) SubscribeAndWait(ctx context.Context, sub *apiv1.Subscribed) (*apiv1.SubscribedAck, error) {
 	if c.subscribeAckTimeout == 0 {
-		select {
-		case c.sendCh <- outboundEvent{event: &apiv1.DaemonEvent{
+		if !c.enqueue(outboundEvent{event: &apiv1.DaemonEvent{
 			Event: &apiv1.DaemonEvent_Subscribed{Subscribed: sub},
-		}}:
-			return nil, nil
-		default:
+		}}) {
 			return nil, fmt.Errorf("send channel full")
 		}
+		return nil, nil
 	}
 
 	resultCh := make(chan SubscribedAckResult, 1)
@@ -490,15 +540,13 @@ func (c *ControlPlaneClient) SubscribeAndWait(ctx context.Context, sub *apiv1.Su
 	c.pendingAcks[sub.Id] = resultCh
 	c.pendingAcksMu.Unlock()
 
-	select {
-	case c.sendCh <- outboundEvent{
+	if !c.enqueue(outboundEvent{
 		event: &apiv1.DaemonEvent{
 			Event: &apiv1.DaemonEvent_Subscribed{Subscribed: sub},
 		},
 		subscribedID:      sub.Id,
 		requirePendingAck: true,
-	}:
-	default:
+	}) {
 		c.pendingAcksMu.Lock()
 		delete(c.pendingAcks, sub.Id)
 		c.pendingAcksMu.Unlock()
@@ -520,11 +568,9 @@ func (c *ControlPlaneClient) SubscribeAndWait(ctx context.Context, sub *apiv1.Su
 }
 
 func (c *ControlPlaneClient) SendUnsubscribed(unsub *apiv1.Unsubscribed) {
-	select {
-	case c.sendCh <- outboundEvent{event: &apiv1.DaemonEvent{
+	if !c.enqueue(outboundEvent{event: &apiv1.DaemonEvent{
 		Event: &apiv1.DaemonEvent_Unsubscribed{Unsubscribed: unsub},
-	}}:
-	default:
+	}}) {
 		c.logger.Warn().Str("id", unsub.Id).Msg("send channel full, dropping unsubscribed event")
 	}
 }

@@ -217,6 +217,16 @@ func (*DaemonEvent_CommandResult) isDaemonEvent_Event() {}
 
 // SyncRequest is sent when the daemon connects or reconnects.
 // It lists all current attachments so the control plane can resync.
+//
+// SyncRequest is the authoritative reconciliation point on every
+// (re)connect: the control plane MUST treat the attachment list as the
+// daemon's complete current truth, reconciling its own view against it
+// (adding unknown attachments, dropping ones it believed existed but are
+// absent). The daemon purges events queued against a previous connection
+// when it reconnects, but a just-generated event can still race the sync
+// snapshot in either direction, so the control plane MUST apply the
+// idempotency rules documented on Subscribed and Unsubscribed to any event
+// arriving after a SyncRequest.
 type SyncRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Daemon instance identifier (stable across restarts)
@@ -391,6 +401,15 @@ func (x *Attachment) GetTcDirection() TcDirection {
 }
 
 // Subscribed notifies that a new filter attachment is now managed.
+//
+// Idempotency: the control plane MUST treat a Subscribed for an
+// already-known attachment id as an update to that attachment (and reply
+// with a fresh SubscribedAck), never as a duplicate registration. This
+// re-delivery is legitimate: a Subscribed whose SubscribedAck was still
+// pending when the connection dropped is re-sent on the next connection
+// AFTER the fresh SyncRequest (which may already list the same attachment),
+// because the daemon-side caller is still blocked waiting for the ack — the
+// control plane acknowledges Subscribed, not SyncRequest.
 type Subscribed struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Unique identifier for this attachment
@@ -502,6 +521,12 @@ func (x *Subscribed) GetTcDirection() TcDirection {
 }
 
 // Unsubscribed notifies that an attachment is no longer managed.
+//
+// Idempotency: the control plane MUST treat an Unsubscribed for an unknown
+// (or already-removed) attachment id as a no-op. A removal can also be
+// conveyed implicitly by the attachment being absent from the next
+// SyncRequest's list — the control plane must converge to the same state
+// either way.
 type Unsubscribed struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// The attachment that was removed
