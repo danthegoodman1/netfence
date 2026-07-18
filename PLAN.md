@@ -29,7 +29,7 @@ No traffic escapes an enforcing-mode attachment through a hook gap, a parsing ga
 
 Scope:
 - 1A — Cgroup UDP bypass: `bpf/filter_cgroup.c` only attaches `cgroup/connect4`/`connect6`, so unconnected UDP (`sendto`/`sendmsg` with an address, e.g. DNS exfil direct to an attacker's port 53) is never filtered. Add `cgroup/sendmsg4` + `cgroup/sendmsg6` programs sharing the same maps/verdict logic, attach them in `pkg/filter/filter_cgroup.go` (`NewCgroupFilter`). Connected-socket `send()` skips these kernel hooks, so the warm-path benchmark must be unchanged.
-- 1B — TC direction: `link.AttachTCXEgress` on a veth host-side peer or VM tap (`filter_tc.go:44-48`) sees host→workload traffic, not workload egress — on the documented topology (README: "veth", `fcr-*` taps) allowlist mode blocks return traffic by the workload's own daddr instead of filtering its egress. Add a direction option (TCX ingress for host-side peer attachment — daddr there is the true destination; keep egress for in-netns/uplink use), expose it on `AttachRequest`, document which side/direction pairs are correct.
+- 1B — TC direction: `link.AttachTCXEgress` on a veth host-side peer or VM tap (`filter_tc.go:44-48`) sees host→workload traffic, not workload egress — on the documented topology (README: "veth", `fcr-*` taps) allowlist mode blocks return traffic by the workload's own daddr instead of filtering its egress. Add an explicit `direction` field to `AttachRequest` (default EGRESS to preserve current in-netns/uplink behavior; INGRESS for host-side veth/tap peers, where daddr is the true destination) rather than silently flipping the attach point, and document which side/direction pairs are correct.
 - 1C — TC ethertype fail-open: in allowlist mode `filter_tc.c:217-246` parses a raw `ethhdr` and lets every non-IPv4/IPv6 ethertype through (`return TC_ACT_OK`), so VLAN-tagged (802.1Q) frames bypass the allowlist entirely, and L3 devices (tun/wireguard, where there is no ethhdr) misparse and fall through open. (Block-all is unaffected — it shoots at `:212` before the parse.) Use `skb->protocol`, handle VLAN, and default-deny unknown ethertypes in allowlist mode with an explicit ARP allowance.
 - 1D — Policy-controlled carve-outs: `is_link_local_v4` always-allows 169.254.0.0/16 in both programs — including 169.254.169.254, the cloud metadata service, a credential-theft target the sandboxing use case must be able to block. Move localhost/link-local/ND-multicast carve-outs into a small config map populated at filter creation (defaults: localhost on, v4 link-local OFF, IPv6 `ff02::/16` + ARP on for TC so NDP/gateway resolution survives allowlist mode; v4 broadcast/multicast decided here too).
 
@@ -51,7 +51,7 @@ Status ledger:
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
 | Incomplete | Work | 1A: `sendmsg4`/`sendmsg6` hooks in cgroup filter | Missing: BPF programs, attach code, unconnected-UDP regression test. |
-| Incomplete | Work | 1B: TC direction option + `AttachRequest` field + docs | Missing: implementation; decision on default (proposal: explicit field, ingress documented for host-side peers). |
+| Incomplete | Work | 1B: `direction` field on `AttachRequest` (EGRESS default, INGRESS for host-side veth/tap peers) + docs | Decided: explicit field, default EGRESS (preserves current in-netns/uplink behavior), README documents correct side/direction pairings. Missing: implementation + veth-pair direction test. |
 | Incomplete | Work | 1C: `skb->protocol` parsing, VLAN handling, default-deny unknown ethertypes (ARP allowed) | Missing: BPF change + VLAN bypass test. |
 | Incomplete | Work | 1D: carve-out config map; disable v4 link-local always-allow by default; add `ff02::/16`+ARP for TC | Missing: implementation + metadata-service block test; README security-note update. |
 | Incomplete | Test | Veth-pair TC e2e incl. connection-severing assertion | Missing: test (no TC traffic test exists today). |
@@ -116,7 +116,7 @@ Status ledger:
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
 | Incomplete | Work | 3A: bpffs pinning + restore-from-pins + `detach_on_stop` config | Missing: design note (pin layout, upgrade compat), implementation, kill-9 test. |
-| Incomplete | Decision | Default fail mode on daemon stop (proposal: keep-enforcing) | Missing: decision recorded in README + config default. |
+| Incomplete | Decision | Default fail mode on daemon stop | Decided: keep-enforcing (`detach_on_stop: false` default) — pinned BPF state holds policy across restarts/upgrades. Missing: recording in README + config default. |
 | Incomplete | Work | 3B: persisted daemon UUID | Missing: implementation + restart identity test. |
 | Incomplete | Work | 3C: `:memory:` pooling fix, fixed-width timestamps, scanner dedupe | Missing: implementation + concurrency/pagination tests. |
 | Incomplete | Work | 3D: netlink resubscribe + async onRemoved + shared fsnotify watcher | Missing: implementation + closed-channel test + >128-cgroup test. |
