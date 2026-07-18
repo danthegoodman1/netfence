@@ -77,6 +77,19 @@ func setupVethNetns(t *testing.T) func() {
 	return cleanupVethNetns
 }
 
+// flushNeighbors clears the neighbor (ARP) caches inside the workload netns
+// and on the given host-side devices. Called AFTER a filter is attached, it
+// forces the next connect to perform a real ARP exchange across the filter —
+// so if the filter ever drops ARP in allowlist mode, the allowed-connect
+// assertions fail deterministically instead of riding a warm cache.
+func flushNeighbors(t *testing.T, hostDevs ...string) {
+	t.Helper()
+	require.NoError(t, ipCmd("-n", vethNetns, "neigh", "flush", "all"))
+	for _, dev := range hostDevs {
+		require.NoError(t, ipCmd("neigh", "flush", "dev", dev))
+	}
+}
+
 // nsConnectTCP attempts a TCP connect from inside the workload netns.
 // Returns true if the connection succeeded, false if blocked/timed out.
 func nsConnectTCP(host, port string) bool {
@@ -114,6 +127,146 @@ func listenTCP(t *testing.T, addr string) (port string, cleanup func()) {
 	return port, func() { ln.Close() }
 }
 
+// VLAN topology layered on top of setupVethNetns for the ethertype tests:
+//
+//	netns (workload)                        root netns (host)
+//	nfveth1.100 10.200.0.2/24  ══ 802.1Q ══  nfveth0.100 10.200.0.1/24
+//	                                                     10.200.0.3/24 (allowed)
+//	                                                     10.200.0.5/24 (blocked)
+//	nfvq1 10.201.0.2/24  ═ 802.1Q-in-802.1Q ═  nfvq0    10.201.0.1/24
+//	  (link nfveth1.100, id 200)             (link nfveth0.100, id 200)
+//	                                                     10.201.0.3/24 (allowed)
+//	                                                     10.201.0.5/24 (blocked)
+//
+// Single-tagged frames reach the TC ingress hook with the tag already popped
+// to skb metadata (skb->protocol = inner proto). QinQ frames arrive with the
+// outer tag in metadata and the inner 802.1Q tag still IN THE PAYLOAD, so
+// skb->protocol == ETH_P_8021Q at the hook — the exact shape the pre-1C
+// program waved through as "non-IP".
+const (
+	vlanHostOuter = "nfveth0.100"
+	vlanNsOuter   = "nfveth1.100"
+	vlanHostQinq  = "nfvq0"
+	vlanNsQinq    = "nfvq1"
+
+	vlanNsIP        = "10.200.0.2"
+	vlanAllowedIP   = "10.200.0.3"
+	vlanBlockedIP   = "10.200.0.5"
+	qinqNsIP        = "10.201.0.2"
+	qinqAllowedIP   = "10.201.0.3"
+	qinqBlockedIP   = "10.201.0.5"
+	vlanHostGateway = "10.200.0.1"
+	qinqHostGateway = "10.201.0.1"
+)
+
+// setupVlanOnVeth stacks the 802.1Q and QinQ subinterfaces onto an existing
+// veth topology. The subdevices are torn down automatically with the veth
+// pair/netns, so no extra cleanup is needed.
+func setupVlanOnVeth(t *testing.T) {
+	t.Helper()
+
+	// Host side: outer 802.1Q (id 100) and nested 802.1Q (id 200) on top.
+	require.NoError(t, ipCmd("link", "add", "link", vethHostIf, "name", vlanHostOuter, "type", "vlan", "id", "100"))
+	for _, addr := range []string{vlanHostGateway, vlanAllowedIP, vlanBlockedIP} {
+		require.NoError(t, ipCmd("addr", "add", addr+"/24", "dev", vlanHostOuter))
+	}
+	require.NoError(t, ipCmd("link", "set", vlanHostOuter, "up"))
+
+	require.NoError(t, ipCmd("link", "add", "link", vlanHostOuter, "name", vlanHostQinq, "type", "vlan", "id", "200"))
+	for _, addr := range []string{qinqHostGateway, qinqAllowedIP, qinqBlockedIP} {
+		require.NoError(t, ipCmd("addr", "add", addr+"/24", "dev", vlanHostQinq))
+	}
+	require.NoError(t, ipCmd("link", "set", vlanHostQinq, "up"))
+
+	// Workload side mirrors the stack inside the netns.
+	require.NoError(t, ipCmd("-n", vethNetns, "link", "add", "link", vethNsIf, "name", vlanNsOuter, "type", "vlan", "id", "100"))
+	require.NoError(t, ipCmd("-n", vethNetns, "addr", "add", vlanNsIP+"/24", "dev", vlanNsOuter))
+	require.NoError(t, ipCmd("-n", vethNetns, "link", "set", vlanNsOuter, "up"))
+
+	require.NoError(t, ipCmd("-n", vethNetns, "link", "add", "link", vlanNsOuter, "name", vlanNsQinq, "type", "vlan", "id", "200"))
+	require.NoError(t, ipCmd("-n", vethNetns, "addr", "add", qinqNsIP+"/24", "dev", vlanNsQinq))
+	require.NoError(t, ipCmd("-n", vethNetns, "link", "set", vlanNsQinq, "up"))
+}
+
+// TestTCVethVlanAllowlist proves the 1C ethertype fix: VLAN-tagged traffic in
+// allowlist mode is filtered by the INNER destination address instead of
+// falling through open (pre-1C: any non-IPv4/IPv6 ethertype, including an
+// in-payload 802.1Q tag, returned TC_ACT_OK and bypassed the allowlist).
+// The neighbor caches are flushed after the filter attaches, so the
+// allowed-connect assertions force a real ARP exchange (single-tagged and
+// double-tagged) across the fail-closed filter — if ARP were dropped in
+// allowlist mode, those assertions would fail.
+func TestTCVethVlanAllowlist(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("test requires root")
+	}
+
+	cleanup := setupVethNetns(t)
+	defer cleanup()
+	setupVlanOnVeth(t)
+
+	vlanAllowedPort, closeVA := listenTCP(t, vlanAllowedIP)
+	defer closeVA()
+	vlanBlockedPort, closeVB := listenTCP(t, vlanBlockedIP)
+	defer closeVB()
+	qinqAllowedPort, closeQA := listenTCP(t, qinqAllowedIP)
+	defer closeQA()
+	qinqBlockedPort, closeQB := listenTCP(t, qinqBlockedIP)
+	defer closeQB()
+
+	// Sanity: with no filter attached, all four destinations are reachable
+	// through their VLAN paths from the workload netns.
+	require.True(t, nsConnectTCP(vlanAllowedIP, vlanAllowedPort), "vlan topology broken: allowed dest unreachable without filter")
+	require.True(t, nsConnectTCP(vlanBlockedIP, vlanBlockedPort), "vlan topology broken: blocked dest unreachable without filter")
+	require.True(t, nsConnectTCP(qinqAllowedIP, qinqAllowedPort), "qinq topology broken: allowed dest unreachable without filter")
+	require.True(t, nsConnectTCP(qinqBlockedIP, qinqBlockedPort), "qinq topology broken: blocked dest unreachable without filter")
+
+	// Filter attaches to the BASE host-side peer: every tagged frame from
+	// the workload crosses it.
+	f, err := filter.NewTCFilter(vethHostIf, filter.ModeAllowlist, filter.DirectionIngress)
+	require.NoError(t, err)
+	defer f.Close()
+
+	for _, allowed := range []string{vlanAllowedIP, qinqAllowedIP} {
+		cidr, err := filter.ParseCIDR(allowed + "/32")
+		require.NoError(t, err)
+		require.NoError(t, f.AllowIP(cidr))
+	}
+
+	// The pre-attach sanity connects warmed the neighbor caches; flush them
+	// so every assertion below must ARP through the attached filter.
+	flushNeighbors(t, vethHostIf, vlanHostOuter, vlanHostQinq)
+
+	t.Run("vlan_8021q/allowed_dest_succeeds", func(t *testing.T) {
+		assert.True(t, nsConnectTCP(vlanAllowedIP, vlanAllowedPort),
+			"expected connection over 802.1Q VLAN to allowlisted destination to SUCCEED")
+	})
+
+	t.Run("vlan_8021q/blocked_dest_blocked", func(t *testing.T) {
+		assert.False(t, nsConnectTCP(vlanBlockedIP, vlanBlockedPort),
+			"expected connection over 802.1Q VLAN to non-allowlisted destination to be BLOCKED")
+	})
+
+	// QinQ is the pre-1C bypass shape at an ingress attach: the kernel pops
+	// only the outer tag to metadata, leaving skb->protocol == ETH_P_8021Q
+	// with the inner tag in the payload.
+	t.Run("vlan_qinq/allowed_dest_succeeds", func(t *testing.T) {
+		assert.True(t, nsConnectTCP(qinqAllowedIP, qinqAllowedPort),
+			"expected connection over QinQ to allowlisted destination to SUCCEED (inner unwrap, not blanket drop)")
+	})
+
+	t.Run("vlan_qinq/blocked_dest_blocked", func(t *testing.T) {
+		assert.False(t, nsConnectTCP(qinqBlockedIP, qinqBlockedPort),
+			"expected connection over QinQ to non-allowlisted destination to be BLOCKED (pre-1C bypass)")
+	})
+
+	stats, err := f.GetStats()
+	require.NoError(t, err)
+	assert.Greater(t, stats.Allowed, uint64(0), "expected allowed count > 0")
+	assert.Greater(t, stats.Blocked, uint64(0), "expected blocked count > 0")
+	t.Logf("Stats: allowed=%d, blocked=%d", stats.Allowed, stats.Blocked)
+}
+
 // TestTCVethDirection is the first traffic-level TC test: it proves that on
 // the documented host-side veth topology, DirectionIngress filters the
 // workload's egress by true destination, and documents why DirectionEgress
@@ -145,6 +298,11 @@ func TestTCVethDirection(t *testing.T) {
 		require.NoError(t, err)
 		require.NoError(t, f.AllowIP(cidr))
 
+		// Flush neighbor caches (warmed by the pre-attach sanity connects)
+		// so the allowed connect must complete a real ARP exchange across
+		// the attached allowlist filter — pinning the ARP allowance.
+		flushNeighbors(t, vethHostIf)
+
 		assert.True(t, nsConnectTCP(vethAllowedIP, allowedPort),
 			"expected connection to allowlisted destination to SUCCEED")
 		assert.False(t, nsConnectTCP(vethBlockedIP, blockedPort),
@@ -173,6 +331,12 @@ func TestTCVethDirection(t *testing.T) {
 		destCidr, err := filter.ParseCIDR(vethAllowedIP + "/32")
 		require.NoError(t, err)
 		require.NoError(t, f.AllowIP(destCidr))
+
+		// Flush so the exchange must re-ARP through this egress filter too:
+		// the host's ARP REPLY egresses nfveth0 and relies on the ARP
+		// allowance in allowlist mode.
+		flushNeighbors(t, vethHostIf)
+
 		assert.False(t, nsConnectTCP(vethAllowedIP, allowedPort),
 			"EGRESS on a host-side veth peer should NOT be able to allow traffic by true destination")
 
@@ -216,6 +380,10 @@ func TestTCVethDirection(t *testing.T) {
 		cidr, err := filter.ParseCIDR(vethAllowedIP + "/32")
 		require.NoError(t, err)
 		require.NoError(t, f.AllowIP(cidr))
+
+		// Flush so the first datagram's delivery requires a fresh ARP
+		// exchange across the attached allowlist filter.
+		flushNeighbors(t, vethHostIf)
 
 		nsSendUDP(t, "flow-1", vethAllowedIP, udpPort)
 		select {

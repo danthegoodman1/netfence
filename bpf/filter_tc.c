@@ -197,6 +197,13 @@ static __always_inline int filter_ipv6(struct in6_addr *dst_addr, __u8 mode)
     return TC_ACT_OK;
 }
 
+// 802.1Q/802.1AD VLAN tag as it appears in the packet payload (after the
+// ethernet header, or after a preceding tag for QinQ).
+struct vlan_tag {
+    __be16 tci;
+    __be16 encapsulated_proto;
+};
+
 SEC("tc")
 int filter_egress(struct __sk_buff *skb)
 {
@@ -214,35 +221,92 @@ int filter_egress(struct __sk_buff *skb)
         return TC_ACT_SHOT;
     }
 
-    void *data = (void *)(long)skb->data;
-    void *data_end = (void *)(long)skb->data_end;
+    __u16 proto = bpf_ntohs(skb->protocol);
 
-    // Parse Ethernet header
-    struct ethhdr *eth = data;
-    if ((void *)(eth + 1) > data_end) {
-        return TC_ACT_OK; // Invalid packet, let it through
+    // Kernel-identified IP. skb->protocol covers frames whose VLAN tag the
+    // kernel already moved to skb metadata (single-tagged frames at ingress,
+    // hardware-offloaded tags at egress) — there it is the INNER protocol —
+    // as well as L3 devices (tun/wireguard) that have no ethernet header at
+    // all. Reading relative to the kernel-set network header is correct for
+    // every one of these without any offset math.
+    if (proto == ETH_P_IP) {
+        struct iphdr iph;
+        if (bpf_skb_load_bytes_relative(skb, 0, &iph, sizeof(iph), BPF_HDR_START_NET)) {
+            goto unidentified;
+        }
+        return filter_ipv4(iph.daddr, *mode);
+    }
+    if (proto == ETH_P_IPV6) {
+        struct ipv6hdr ip6h;
+        if (bpf_skb_load_bytes_relative(skb, 0, &ip6h, sizeof(ip6h), BPF_HDR_START_NET)) {
+            goto unidentified;
+        }
+        return filter_ipv6(&ip6h.daddr, *mode);
     }
 
-    __u16 eth_proto = bpf_ntohs(eth->h_proto);
+    // In-payload VLAN tag(s): QinQ frames after the kernel popped the outer
+    // tag to metadata, or egress paths without tag offload. Walk the tag
+    // chain from the MAC header and filter by the INNER destination address
+    // so tagged traffic gets the same policy as untagged traffic.
+    if (proto == ETH_P_8021Q || proto == ETH_P_8021AD) {
+        __be16 encap;
+        __u32 off = ETH_HLEN;
 
-    if (eth_proto == ETH_P_IP) {
-        // IPv4
-        struct iphdr *iph = (void *)(eth + 1);
-        if ((void *)(iph + 1) > data_end) {
-            return TC_ACT_OK;
+        if (bpf_skb_load_bytes_relative(skb, ETH_HLEN - sizeof(encap), &encap,
+                                        sizeof(encap), BPF_HDR_START_MAC)) {
+            goto unidentified;
         }
-        return filter_ipv4(iph->daddr, *mode);
-    } 
-    else if (eth_proto == ETH_P_IPV6) {
-        // IPv6
-        struct ipv6hdr *ip6h = (void *)(eth + 1);
-        if ((void *)(ip6h + 1) > data_end) {
-            return TC_ACT_OK;
+
+        __u16 inner = bpf_ntohs(encap);
+#pragma unroll
+        for (int i = 0; i < 2; i++) {
+            if (inner != ETH_P_8021Q && inner != ETH_P_8021AD) {
+                break;
+            }
+            struct vlan_tag vt;
+            if (bpf_skb_load_bytes_relative(skb, off, &vt, sizeof(vt), BPF_HDR_START_MAC)) {
+                goto unidentified;
+            }
+            inner = bpf_ntohs(vt.encapsulated_proto);
+            off += sizeof(vt);
         }
-        return filter_ipv6(&ip6h->daddr, *mode);
+
+        if (inner == ETH_P_IP) {
+            struct iphdr iph;
+            if (bpf_skb_load_bytes_relative(skb, off, &iph, sizeof(iph), BPF_HDR_START_MAC)) {
+                goto unidentified;
+            }
+            return filter_ipv4(iph.daddr, *mode);
+        }
+        if (inner == ETH_P_IPV6) {
+            struct ipv6hdr ip6h;
+            if (bpf_skb_load_bytes_relative(skb, off, &ip6h, sizeof(ip6h), BPF_HDR_START_MAC)) {
+                goto unidentified;
+            }
+            return filter_ipv6(&ip6h.daddr, *mode);
+        }
+        if (inner == ETH_P_ARP) {
+            return TC_ACT_OK; // see ARP note below
+        }
+        goto unidentified;
     }
 
-    // Non-IP traffic - allow
+    // ARP must stay allowed in allowlist mode: without it the workload
+    // cannot resolve its gateway/neighbor MACs and every allowlisted
+    // destination becomes unreachable. (Block-all already dropped above.)
+    if (proto == ETH_P_ARP) {
+        return TC_ACT_OK;
+    }
+
+unidentified:
+    // Allowlist mode fails CLOSED: any frame not positively identified as an
+    // IP packet (unknown ethertypes, deeper-than-QinQ tag stacks,
+    // unparseable headers) is dropped. Denylist/disabled keep the previous
+    // allow behavior for non-IP traffic — only listed IPs are blocked there.
+    if (*mode == 1) {
+        increment_stat(1);
+        return TC_ACT_SHOT;
+    }
     return TC_ACT_OK;
 }
 
