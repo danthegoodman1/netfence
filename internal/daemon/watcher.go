@@ -4,7 +4,7 @@ package daemon
 
 import (
 	"errors"
-	"os"
+	"fmt"
 	"path/filepath"
 	"sync"
 	"time"
@@ -13,6 +13,8 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
+
+	apiv1 "github.com/danthegoodman1/netfence/v1"
 )
 
 const (
@@ -43,13 +45,19 @@ const (
 	removalWorkerCount = 4
 )
 
+type interfaceWatch struct {
+	token   watchToken
+	ifindex uint64
+}
+
 type TargetWatcher struct {
 	logger    zerolog.Logger
-	onRemoved func(target string)
+	onRemoved func(watchToken)
 
-	mu         sync.RWMutex
-	interfaces map[string]struct{} // interface name -> watched
-	cgroups    map[string]struct{} // cgroup path -> watched
+	mu             sync.RWMutex
+	nextGeneration uint64
+	interfaces     map[string]interfaceWatch // interface name -> exact watched identity
+	cgroups        map[string]watchToken     // cgroup path -> exact watched generation
 	// dirRefs refcounts parent-directory watches on the single shared
 	// fsnotify watcher: parentDir -> set of watched cgroup paths under it.
 	// Multiple cgroups can share a parent, so the directory watch is only
@@ -62,7 +70,7 @@ type TargetWatcher struct {
 	// enqueued at most once per watch (dedupe) and the queue length is
 	// bounded by the number of watched targets.
 	pendingMu sync.Mutex
-	pending   []string
+	pending   []watchToken
 	pendingCh chan struct{} // wakeup signal, capacity 1
 
 	done     chan struct{}
@@ -72,16 +80,18 @@ type TargetWatcher struct {
 	// Test seams: default to the real netlink calls (set in
 	// NewTargetWatcher), overridden in tests to drive the resubscribe and
 	// reconcile paths deterministically.
-	subscribeLinks func(ch chan<- netlink.LinkUpdate, done <-chan struct{}) error
-	listLinks      func() ([]netlink.Link, error)
+	subscribeLinks    func(ch chan<- netlink.LinkUpdate, done <-chan struct{}) error
+	listLinks         func() ([]netlink.Link, error)
+	interfaceIdentity func(name string) (uint64, error)
+	cgroupIdentity    func(path string) (uint64, error)
 }
 
-func NewTargetWatcher(logger zerolog.Logger, onRemoved func(target string)) *TargetWatcher {
+func NewTargetWatcher(logger zerolog.Logger, onRemoved func(watchToken)) *TargetWatcher {
 	w := &TargetWatcher{
 		logger:     logger.With().Str("component", "watcher").Logger(),
 		onRemoved:  onRemoved,
-		interfaces: make(map[string]struct{}),
-		cgroups:    make(map[string]struct{}),
+		interfaces: make(map[string]interfaceWatch),
+		cgroups:    make(map[string]watchToken),
 		dirRefs:    make(map[string]map[string]struct{}),
 		pendingCh:  make(chan struct{}, 1),
 		done:       make(chan struct{}),
@@ -95,7 +105,18 @@ func NewTargetWatcher(logger zerolog.Logger, onRemoved func(target string)) *Tar
 		})
 	}
 	w.listLinks = netlink.LinkList
+	w.interfaceIdentity = currentInterfaceIdentity
+	w.cgroupIdentity = currentCgroupIdentity
 	return w
+}
+
+func (w *TargetWatcher) setTargetIdentityResolver(resolve func(apiv1.AttachmentType, string) (uint64, error)) {
+	w.interfaceIdentity = func(name string) (uint64, error) {
+		return resolve(apiv1.AttachmentType_ATTACHMENT_TYPE_TC, name)
+	}
+	w.cgroupIdentity = func(path string) (uint64, error) {
+		return resolve(apiv1.AttachmentType_ATTACHMENT_TYPE_CGROUP, path)
+	}
 }
 
 func (w *TargetWatcher) Start() error {
@@ -122,32 +143,55 @@ func (w *TargetWatcher) Stop() {
 	w.wg.Wait()
 }
 
-func (w *TargetWatcher) WatchInterface(name string) {
+func (w *TargetWatcher) WatchInterface(name string, ifindex uint64) (watchToken, error) {
 	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.interfaces[name] = struct{}{}
-	w.logger.Debug().Str("interface", name).Msg("watching interface")
-}
-
-func (w *TargetWatcher) UnwatchInterface(name string) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	delete(w.interfaces, name)
-	w.logger.Debug().Str("interface", name).Msg("unwatching interface")
-}
-
-func (w *TargetWatcher) WatchCgroup(path string) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	if _, ok := w.cgroups[path]; ok {
-		return nil
+	if w.stoppedLocked() {
+		w.mu.Unlock()
+		return watchToken{}, errors.New("target watcher is stopped")
 	}
-	if _, err := os.Stat(path); err != nil {
-		return err
+	token := w.newTokenLocked(name, watchKindInterface, ifindex)
+	w.interfaces[name] = interfaceWatch{token: token, ifindex: ifindex}
+	w.mu.Unlock()
+
+	w.logger.Debug().Str("interface", name).Msg("watching interface")
+
+	// Close the lookup -> registration gap too. A DELLINK may have raced
+	// before the registration became visible; in that case remove this exact
+	// generation. A same-name replacement is also removal of the identity the
+	// filter was attached to.
+	currentIfindex, err := w.interfaceIdentity(name)
+	if err != nil {
+		w.dispatchInterfaceRemoved(token, "registration-recheck")
+		return token, fmt.Errorf("rechecking interface identity after watch registration: %w", err)
+	}
+	if currentIfindex != ifindex {
+		w.dispatchInterfaceRemoved(token, "registration-recheck")
+		return token, fmt.Errorf("interface identity changed during watch registration: was %d, now %d", ifindex, currentIfindex)
+	}
+	return token, nil
+}
+
+func (w *TargetWatcher) UnwatchInterface(token watchToken) {
+	w.mu.Lock()
+	current, ok := w.interfaces[token.target]
+	if ok && current.token == token {
+		delete(w.interfaces, token.target)
+	}
+	w.mu.Unlock()
+	if ok && current.token == token {
+		w.logger.Debug().Str("interface", token.target).Msg("unwatching interface")
+	}
+}
+
+func (w *TargetWatcher) WatchCgroup(path string, identity uint64) (watchToken, error) {
+	w.mu.Lock()
+	if w.stoppedLocked() {
+		w.mu.Unlock()
+		return watchToken{}, errors.New("target watcher is stopped")
 	}
 	if err := w.ensureCgroupWatcherLocked(); err != nil {
-		return err
+		w.mu.Unlock()
+		return watchToken{}, err
 	}
 
 	// Watch the parent directory so we can detect when the cgroup is
@@ -156,24 +200,57 @@ func (w *TargetWatcher) WatchCgroup(path string) error {
 	refs, ok := w.dirRefs[parentDir]
 	if !ok {
 		if err := w.cgWatcher.Add(parentDir); err != nil {
-			return err
+			w.mu.Unlock()
+			return watchToken{}, err
 		}
 		refs = make(map[string]struct{})
 		w.dirRefs[parentDir] = refs
 	}
+	token := w.newTokenLocked(path, watchKindCgroup, identity)
 	refs[path] = struct{}{}
-	w.cgroups[path] = struct{}{}
+	w.cgroups[path] = token
+	w.mu.Unlock()
 
 	w.logger.Debug().Str("cgroup", path).Msg("watching cgroup")
-	return nil
+
+	// The pre-attachment identity validation and fsnotify Add cannot be
+	// atomic. Recheck only after both the directory watch and the exact
+	// in-memory generation are active; absence or same-path replacement in
+	// that window dispatches this generation. The token comparison makes the
+	// result harmless after a later rewatch.
+	currentIdentity, err := w.cgroupIdentity(path)
+	if err != nil {
+		w.dispatchCgroupRemoved(token)
+		return token, fmt.Errorf("rechecking cgroup identity after watch registration: %w", err)
+	}
+	if currentIdentity != identity {
+		w.dispatchCgroupRemoved(token)
+		return token, fmt.Errorf("cgroup identity changed during watch registration: was %d, now %d", identity, currentIdentity)
+	}
+	return token, nil
 }
 
-func (w *TargetWatcher) UnwatchCgroup(path string) {
+func (w *TargetWatcher) UnwatchCgroup(token watchToken) {
 	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.removeCgroupLocked(path) {
-		w.logger.Debug().Str("cgroup", path).Msg("unwatching cgroup")
+	removed := w.removeCgroupLocked(token)
+	w.mu.Unlock()
+	if removed {
+		w.logger.Debug().Str("cgroup", token.target).Msg("unwatching cgroup")
 	}
+}
+
+func (w *TargetWatcher) stoppedLocked() bool {
+	select {
+	case <-w.done:
+		return true
+	default:
+		return false
+	}
+}
+
+func (w *TargetWatcher) newTokenLocked(target string, kind watchKind, identity uint64) watchToken {
+	w.nextGeneration++
+	return watchToken{generation: w.nextGeneration, target: target, kind: kind, identity: identity}
 }
 
 // ensureCgroupWatcherLocked lazily creates the single shared fsnotify watcher
@@ -203,15 +280,16 @@ func (w *TargetWatcher) ensureCgroupWatcherLocked() error {
 // the last watched cgroup under that parent is gone (so unwatching one cgroup
 // never breaks a sibling sharing the parent). Returns false if path was not
 // watched. Caller must hold w.mu.
-func (w *TargetWatcher) removeCgroupLocked(path string) bool {
-	if _, ok := w.cgroups[path]; !ok {
+func (w *TargetWatcher) removeCgroupLocked(token watchToken) bool {
+	current, ok := w.cgroups[token.target]
+	if !ok || current != token {
 		return false
 	}
-	delete(w.cgroups, path)
+	delete(w.cgroups, token.target)
 
-	parentDir := filepath.Dir(path)
+	parentDir := filepath.Dir(token.target)
 	if refs, ok := w.dirRefs[parentDir]; ok {
-		delete(refs, path)
+		delete(refs, token.target)
 		if len(refs) > 0 {
 			return true
 		}
@@ -300,7 +378,13 @@ func (w *TargetWatcher) consumeLinkUpdates(updates <-chan netlink.LinkUpdate) bo
 			if update.Header.Type != unix.RTM_DELLINK || update.Link == nil {
 				continue
 			}
-			w.dispatchInterfaceRemoved(update.Attrs().Name, "netlink")
+			attrs := update.Attrs()
+			w.mu.RLock()
+			watched, ok := w.interfaces[attrs.Name]
+			w.mu.RUnlock()
+			if ok && watched.ifindex == uint64(attrs.Index) {
+				w.dispatchInterfaceRemoved(watched.token, "netlink")
+			}
 		}
 	}
 }
@@ -310,9 +394,9 @@ func (w *TargetWatcher) consumeLinkUpdates(updates <-chan netlink.LinkUpdate) bo
 // subscription gap are not silently lost.
 func (w *TargetWatcher) reconcileInterfaces() {
 	w.mu.RLock()
-	watched := make([]string, 0, len(w.interfaces))
-	for name := range w.interfaces {
-		watched = append(watched, name)
+	watched := make([]interfaceWatch, 0, len(w.interfaces))
+	for _, registration := range w.interfaces {
+		watched = append(watched, registration)
 	}
 	w.mu.RUnlock()
 	if len(watched) == 0 {
@@ -324,13 +408,14 @@ func (w *TargetWatcher) reconcileInterfaces() {
 		w.logger.Error().Err(err).Msg("failed to list links while reconciling watched interfaces")
 		return
 	}
-	present := make(map[string]struct{}, len(links))
+	present := make(map[string]uint64, len(links))
 	for _, link := range links {
-		present[link.Attrs().Name] = struct{}{}
+		attrs := link.Attrs()
+		present[attrs.Name] = uint64(attrs.Index)
 	}
-	for _, name := range watched {
-		if _, ok := present[name]; !ok {
-			w.dispatchInterfaceRemoved(name, "reconcile")
+	for _, registration := range watched {
+		if ifindex, ok := present[registration.token.target]; !ok || ifindex != registration.ifindex {
+			w.dispatchInterfaceRemoved(registration.token, "reconcile")
 		}
 	}
 }
@@ -353,14 +438,18 @@ func (w *TargetWatcher) watchCgroups(watcher *fsnotify.Watcher) {
 			// against the watched cgroup set.
 			path := event.Name
 			w.mu.RLock()
-			_, watched := w.cgroups[path]
+			token, watched := w.cgroups[path]
 			w.mu.RUnlock()
 			if !watched {
 				continue
 			}
-			// Verify it's actually gone (not just renamed)
-			if _, err := os.Stat(path); os.IsNotExist(err) {
-				w.dispatchCgroupRemoved(path)
+			// A remove followed by a same-path recreation can be coalesced or
+			// consumed after the replacement already exists. Compare the kernel
+			// object identity, not mere path existence, so the watch for the old
+			// cgroup is still removed.
+			currentIdentity, err := w.cgroupIdentity(path)
+			if err != nil || currentIdentity != token.identity {
+				w.dispatchCgroupRemoved(token)
 			}
 		case err, ok := <-watcher.Errors:
 			if !ok {
@@ -375,32 +464,36 @@ func (w *TargetWatcher) watchCgroups(watcher *fsnotify.Watcher) {
 // The name is deleted from the watched set here, at dispatch time, so repeated
 // events for the same target are dropped (dedupe). onRemoved itself never runs
 // on a watcher event loop.
-func (w *TargetWatcher) dispatchInterfaceRemoved(name, source string) {
+func (w *TargetWatcher) dispatchInterfaceRemoved(token watchToken, source string) {
 	w.mu.Lock()
-	_, watched := w.interfaces[name]
-	delete(w.interfaces, name)
+	current, watched := w.interfaces[token.target]
+	if watched && current.token == token {
+		delete(w.interfaces, token.target)
+	} else {
+		watched = false
+	}
 	w.mu.Unlock()
 	if !watched {
 		return
 	}
-	w.logger.Info().Str("interface", name).Str("source", source).Msg("interface removed")
-	w.enqueueRemoval(name)
+	w.logger.Info().Str("interface", token.target).Str("source", source).Msg("interface removed")
+	w.enqueueRemoval(token)
 }
 
-func (w *TargetWatcher) dispatchCgroupRemoved(path string) {
+func (w *TargetWatcher) dispatchCgroupRemoved(token watchToken) {
 	w.mu.Lock()
-	removed := w.removeCgroupLocked(path)
+	removed := w.removeCgroupLocked(token)
 	w.mu.Unlock()
 	if !removed {
 		return
 	}
-	w.logger.Info().Str("cgroup", path).Msg("cgroup removed")
-	w.enqueueRemoval(path)
+	w.logger.Info().Str("cgroup", token.target).Msg("cgroup removed")
+	w.enqueueRemoval(token)
 }
 
-func (w *TargetWatcher) enqueueRemoval(target string) {
+func (w *TargetWatcher) enqueueRemoval(token watchToken) {
 	w.pendingMu.Lock()
-	w.pending = append(w.pending, target)
+	w.pending = append(w.pending, token)
 	w.pendingMu.Unlock()
 	select {
 	case w.pendingCh <- struct{}{}:
@@ -432,7 +525,7 @@ func (w *TargetWatcher) drainPending() {
 			w.pendingMu.Unlock()
 			return
 		}
-		target := w.pending[0]
+		token := w.pending[0]
 		w.pending = w.pending[1:]
 		remaining := len(w.pending) > 0
 		w.pendingMu.Unlock()
@@ -447,7 +540,7 @@ func (w *TargetWatcher) drainPending() {
 		// Invoked with no watcher locks held: onRemoved
 		// (Server.handleTargetRemoved) takes s.mu and calls back into
 		// Unwatch*, which takes w.mu.
-		w.onRemoved(target)
+		w.onRemoved(token)
 	}
 }
 

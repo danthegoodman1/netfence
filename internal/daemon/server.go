@@ -79,12 +79,21 @@ type Server struct {
 	// (production: targetPresent; a seam so unit tests can restore
 	// attachments whose fake targets never existed).
 	targetExists func(attachType apiv1.AttachmentType, target string) bool
+	// targetIdentity resolves the kernel object an attachment name/path
+	// currently denotes (ifindex or cgroup id). Attach validates this identity
+	// across filter construction and watcher registration so a same-name/path
+	// replacement can never bind the filter and watcher to different objects.
+	targetIdentity func(attachType apiv1.AttachmentType, target string) (uint64, error)
 }
 
 type attachmentState struct {
 	info   *store.Attachment
 	dns    *DNSServer
 	filter filter.Filter
+	// watch identifies the exact watcher registration owned by this
+	// attachment. A delayed callback for an older same-target generation is
+	// ignored unless this token still matches.
+	watch watchToken
 	// ttls tracks expiry deadlines for this attachment's TTL'd CIDR entries
 	// and serializes its CIDR-rule mutations. See ttlRegistry.
 	ttls *ttlRegistry
@@ -137,6 +146,7 @@ func NewServer(cfg *config.Config, st *store.Store, logger zerolog.Logger, versi
 		loadPinnedFilter:   loadPinnedFilter,
 		ensurePinRoot:      ensureBPFPinRoot,
 		targetExists:       targetPresent,
+		targetIdentity:     currentTargetIdentity,
 	}
 
 	s.watcher = NewTargetWatcher(logger, s.handleTargetRemoved)
@@ -169,6 +179,14 @@ func (s *Server) SetControlPlaneClient(cp *ControlPlaneClient) {
 	s.cpClient.Store(cp)
 }
 
+// setTargetIdentityResolver is a test seam that keeps Server's lifecycle
+// validation and TargetWatcher's post-registration validation on the same
+// deterministic identity source.
+func (s *Server) setTargetIdentityResolver(resolve func(apiv1.AttachmentType, string) (uint64, error)) {
+	s.targetIdentity = resolve
+	s.watcher.setTargetIdentityResolver(resolve)
+}
+
 func (s *Server) Start() error {
 	if s.pinRoot != "" {
 		if err := s.ensurePinRoot(s.pinRoot); err != nil {
@@ -182,6 +200,15 @@ func (s *Server) Start() error {
 		attachType := parseAttachmentType(state.info.Type)
 		mode := parsePolicyMode(state.info.Mode)
 		direction := parseTcDirection(state.info.Direction)
+		expectedIdentity, err := s.targetIdentity(attachType, state.info.Target)
+		if err != nil {
+			s.logger.Warn().Err(err).
+				Str("id", id).
+				Str("target", state.info.Target).
+				Msg("failed to resolve target identity on restore")
+			toRemove = append(toRemove, id)
+			continue
+		}
 
 		ebpfFilter, adopted, err := s.restoreFilter(id, state.info.Target, attachType, mode, direction)
 		if err != nil {
@@ -223,28 +250,36 @@ func (s *Server) Start() error {
 			continue
 		}
 
-		switch attachType {
-		case apiv1.AttachmentType_ATTACHMENT_TYPE_TC:
-			s.watcher.WatchInterface(state.info.Target)
-		case apiv1.AttachmentType_ATTACHMENT_TYPE_CGROUP:
-			if err := s.watcher.WatchCgroup(state.info.Target); err != nil {
-				s.logger.Warn().Err(err).
-					Str("id", id).
-					Str("target", state.info.Target).
-					Msg("failed to watch cgroup on restore")
-				if err := dnsServer.Stop(); err != nil {
-					s.logger.Warn().Err(err).Str("id", id).Msg("error stopping DNS server after restore watch failure")
-				}
-				if ebpfFilter != nil {
-					// Dropped for good: Detach so pinned state goes too.
-					if err := ebpfFilter.Detach(); err != nil {
-						s.logger.Warn().Err(err).Str("id", id).Msg("error detaching filter after restore watch failure")
-					}
-				}
-				toRemove = append(toRemove, id)
-				continue
+		var (
+			token    watchToken
+			watchErr = s.validateTargetIdentity(attachType, state.info.Target, expectedIdentity)
+		)
+		if watchErr == nil {
+			switch attachType {
+			case apiv1.AttachmentType_ATTACHMENT_TYPE_TC:
+				token, watchErr = s.watcher.WatchInterface(state.info.Target, expectedIdentity)
+			case apiv1.AttachmentType_ATTACHMENT_TYPE_CGROUP:
+				token, watchErr = s.watcher.WatchCgroup(state.info.Target, expectedIdentity)
 			}
 		}
+		if watchErr != nil {
+			s.logger.Warn().Err(watchErr).
+				Str("id", id).
+				Str("target", state.info.Target).
+				Msg("failed to watch target on restore")
+			if err := dnsServer.Stop(); err != nil {
+				s.logger.Warn().Err(err).Str("id", id).Msg("error stopping DNS server after restore watch failure")
+			}
+			if ebpfFilter != nil {
+				// Dropped for good: Detach so pinned state goes too.
+				if err := ebpfFilter.Detach(); err != nil {
+					s.logger.Warn().Err(err).Str("id", id).Msg("error detaching filter after restore watch failure")
+				}
+			}
+			toRemove = append(toRemove, id)
+			continue
+		}
+		state.watch = token
 		state.filter = ebpfFilter
 		state.dns = dnsServer
 
@@ -445,6 +480,17 @@ func targetPresent(attachType apiv1.AttachmentType, target string) bool {
 	}
 }
 
+func (s *Server) validateTargetIdentity(attachType apiv1.AttachmentType, target string, expected uint64) error {
+	current, err := s.targetIdentity(attachType, target)
+	if err != nil {
+		return fmt.Errorf("resolving current target identity: %w", err)
+	}
+	if current != expected {
+		return fmt.Errorf("target identity changed during attachment setup: was %d, now %d", expected, current)
+	}
+	return nil
+}
+
 func (s *Server) Stop() {
 	// Stop the janitor before closing filters so a sweep never races with
 	// wholesale filter teardown.
@@ -543,16 +589,20 @@ func (s *Server) sweepExpiredTTLs(now time.Time) {
 	}
 }
 
-func (s *Server) handleTargetRemoved(target string) {
+func (s *Server) handleTargetRemoved(token watchToken) {
 	s.mu.Lock()
+	target := token.target
 	id, ok := s.targetIndex[target]
 	if !ok {
 		s.mu.Unlock()
 		return
 	}
-
 	state, ok := s.attachments[id]
 	if !ok {
+		s.mu.Unlock()
+		return
+	}
+	if state.watch != token {
 		s.mu.Unlock()
 		return
 	}
@@ -564,9 +614,9 @@ func (s *Server) handleTargetRemoved(target string) {
 
 	switch parseAttachmentType(state.info.Type) {
 	case apiv1.AttachmentType_ATTACHMENT_TYPE_TC:
-		s.watcher.UnwatchInterface(target)
+		s.watcher.UnwatchInterface(token)
 	case apiv1.AttachmentType_ATTACHMENT_TYPE_CGROUP:
-		s.watcher.UnwatchCgroup(target)
+		s.watcher.UnwatchCgroup(token)
 	}
 
 	delete(s.attachments, id)
@@ -703,9 +753,9 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (*apiv1.A
 			s.releasePort(port)
 			switch attachType {
 			case apiv1.AttachmentType_ATTACHMENT_TYPE_TC:
-				s.watcher.UnwatchInterface(target)
+				s.watcher.UnwatchInterface(registered.watch)
 			case apiv1.AttachmentType_ATTACHMENT_TYPE_CGROUP:
-				s.watcher.UnwatchCgroup(target)
+				s.watcher.UnwatchCgroup(registered.watch)
 			}
 			s.mu.Unlock()
 
@@ -761,9 +811,17 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (*apiv1.A
 		s.mu.Unlock()
 	}()
 
+	expectedIdentity, err := s.targetIdentity(attachType, target)
+	if err != nil {
+		return nil, fmt.Errorf("resolving target identity before filter attachment: %w", err)
+	}
+
 	ebpfFilter, err = s.newFilter(s.pinDirFor(id), target, attachType, mode, direction, s.maxRuleEntries)
 	if err != nil {
 		return nil, fmt.Errorf("creating eBPF filter: %w", err)
+	}
+	if err := s.validateTargetIdentity(attachType, target, expectedIdentity); err != nil {
+		return nil, err
 	}
 
 	var proxyFunc DnsProxyFunc
@@ -797,16 +855,25 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (*apiv1.A
 	// deferred cleanup can never observe a publicly-registered attachment with
 	// registered still nil.
 	registered = state
-	s.mu.Unlock()
-
-	switch attachType {
-	case apiv1.AttachmentType_ATTACHMENT_TYPE_TC:
-		s.watcher.WatchInterface(target)
-	case apiv1.AttachmentType_ATTACHMENT_TYPE_CGROUP:
-		if err := s.watcher.WatchCgroup(target); err != nil {
-			s.logger.Error().Err(err).Str("target", target).Msg("failed to watch cgroup")
-			return nil, fmt.Errorf("watching cgroup: %w", err)
+	var (
+		token    watchToken
+		watchErr = s.validateTargetIdentity(attachType, target, expectedIdentity)
+	)
+	if watchErr == nil {
+		switch attachType {
+		case apiv1.AttachmentType_ATTACHMENT_TYPE_TC:
+			token, watchErr = s.watcher.WatchInterface(target, expectedIdentity)
+		case apiv1.AttachmentType_ATTACHMENT_TYPE_CGROUP:
+			token, watchErr = s.watcher.WatchCgroup(target, expectedIdentity)
 		}
+	}
+	if watchErr == nil {
+		state.watch = token
+	}
+	s.mu.Unlock()
+	if watchErr != nil {
+		s.logger.Error().Err(watchErr).Str("target", target).Msg("failed to watch target")
+		return nil, fmt.Errorf("watching target: %w", watchErr)
 	}
 
 	logEvent := s.logger.Info().
@@ -875,9 +942,9 @@ func (s *Server) Detach(ctx context.Context, req *apiv1.DetachRequest) (*emptypb
 
 	switch parseAttachmentType(state.info.Type) {
 	case apiv1.AttachmentType_ATTACHMENT_TYPE_TC:
-		s.watcher.UnwatchInterface(state.info.Target)
+		s.watcher.UnwatchInterface(state.watch)
 	case apiv1.AttachmentType_ATTACHMENT_TYPE_CGROUP:
-		s.watcher.UnwatchCgroup(state.info.Target)
+		s.watcher.UnwatchCgroup(state.watch)
 	}
 
 	delete(s.attachments, req.Id)

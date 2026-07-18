@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -54,6 +55,7 @@ func newAttachTestEnv(t *testing.T, port int) *attachTestEnv {
 	}
 	server, err := NewServer(cfg, st, zerolog.Nop(), "test")
 	require.NoError(t, err)
+	server.setTargetIdentityResolver(func(apiv1.AttachmentType, string) (uint64, error) { return 1, nil })
 
 	env := &attachTestEnv{server: server, st: st, dbPath: dbPath, port: port}
 	server.newFilter = func(_, _ string, _ apiv1.AttachmentType, _ apiv1.PolicyMode, _ apiv1.TcDirection, _ uint32) (filter.Filter, error) {
@@ -248,6 +250,37 @@ func TestAttachHappyPathNoControlPlane(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 1, filters[0].closeCallCount())
 	env.assertNoResidue(t)
+}
+
+// TestAttachRejectsInterfaceIdentityChangeBeforeWatchRegistration proves the
+// filter and watcher cannot silently bind different same-name interfaces. The
+// fake filter attaches while the name denotes identity 401, then simulates a
+// delete+recreate before WatchInterface; Attach must roll the filter back and
+// publish no attachment or watch for identity 402.
+func TestAttachRejectsInterfaceIdentityChangeBeforeWatchRegistration(t *testing.T) {
+	env := newAttachTestEnv(t, 12111)
+	var identity atomic.Uint64
+	identity.Store(401)
+	env.server.setTargetIdentityResolver(func(apiv1.AttachmentType, string) (uint64, error) {
+		return identity.Load(), nil
+	})
+
+	newFilter := env.server.newFilter
+	env.server.newFilter = func(pinDir, target string, attachType apiv1.AttachmentType, mode apiv1.PolicyMode, direction apiv1.TcDirection, maxRuleEntries uint32) (filter.Filter, error) {
+		f, err := newFilter(pinDir, target, attachType, mode, direction, maxRuleEntries)
+		identity.Store(402) // same name now denotes a different interface
+		return f, err
+	}
+
+	resp, err := env.server.Attach(context.Background(), attachInterfaceReq("identity-race-if0"))
+	require.Error(t, err)
+	require.Nil(t, resp)
+	require.Contains(t, err.Error(), "target identity changed")
+	env.assertNoResidue(t)
+
+	filters := env.createdFilters()
+	require.Len(t, filters, 1)
+	require.Equal(t, 1, filters[0].detachCallCount(), "filter attached to the old identity must be rolled back")
 }
 
 // TestAttachHappyPathWithControlPlaneAck pins the success path through the

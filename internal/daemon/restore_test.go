@@ -69,6 +69,7 @@ func newRestoreEnv(t *testing.T, port int, storeMode apiv1.PolicyMode) *restoreE
 	}
 	server, err := NewServer(cfg, st, zerolog.Nop(), "test")
 	require.NoError(t, err)
+	server.setTargetIdentityResolver(func(apiv1.AttachmentType, string) (uint64, error) { return 1, nil })
 
 	env := &restoreEnv{server: server, st: st, id: id, pinRoot: pinRoot}
 
