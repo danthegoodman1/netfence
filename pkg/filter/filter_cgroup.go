@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"sync"
 
 	"github.com/cilium/ebpf"
@@ -19,6 +20,7 @@ type CgroupFilter struct {
 	mu           sync.Mutex
 	objs         *cgroupObjects
 	cgroupPath   string
+	pinDir       string
 	cgroupLink4  link.Link
 	cgroupLink6  link.Link
 	sendmsgLink4 link.Link
@@ -121,21 +123,145 @@ func NewCgroupFilterWithOptions(cgroupPath string, mode PolicyMode, carveouts Ca
 		return nil, fmt.Errorf("attaching IPv6 sendmsg filter to cgroup: %w", err)
 	}
 
-	return &CgroupFilter{
+	f := &CgroupFilter{
 		objs:         objs,
 		cgroupPath:   cgroupPath,
+		pinDir:       opts.PinDir,
 		cgroupLink4:  link4,
 		cgroupLink6:  link6,
 		sendmsgLink4: sendmsg4,
 		sendmsgLink6: sendmsg6,
-	}, nil
+	}
+
+	// Pin links + maps last, once everything is attached: a crash before this
+	// point leaves nothing pinned (state dies with the process, as before),
+	// while a successful pin means the full set is adoptable after a restart.
+	if opts.PinDir != "" {
+		if err := pinAll(opts.PinDir, f.pinnables()); err != nil {
+			_ = os.RemoveAll(opts.PinDir)
+			_ = f.Close()
+			return nil, fmt.Errorf("pinning cgroup filter state: %w", err)
+		}
+	}
+
+	return f, nil
 }
 
-// Close releases the BPF resources
+// LoadPinnedCgroupFilter re-adopts a cgroup filter previously pinned under
+// pinDir (a filter created with Options.PinDir): it loads the pinned rule/
+// mode/stat maps and cgroup links into a working CgroupFilter WITHOUT
+// re-attaching anything — the pinned links kept the programs attached (and
+// enforcing) the whole time, and the pinned maps kept the rules. The program
+// handles themselves are not needed post-attach and are not reloaded.
+//
+// On error the partially-loaded handles are closed and the pins are left in
+// place for the caller to inspect or remove.
+func LoadPinnedCgroupFilter(cgroupPath, pinDir string) (_ *CgroupFilter, retErr error) {
+	f := &CgroupFilter{
+		objs:       &cgroupObjects{},
+		cgroupPath: cgroupPath,
+		pinDir:     pinDir,
+	}
+	defer func() {
+		if retErr != nil {
+			_ = f.closeHandles()
+		}
+	}()
+
+	if err := loadPinnedMaps(pinDir, map[string]**ebpf.Map{
+		pinAllowedIPv4: &f.objs.AllowedIpv4,
+		pinAllowedIPv6: &f.objs.AllowedIpv6,
+		pinDeniedIPv4:  &f.objs.DeniedIpv4,
+		pinDeniedIPv6:  &f.objs.DeniedIpv6,
+		pinPolicyMode:  &f.objs.PolicyMode,
+		pinStats:       &f.objs.Stats,
+	}); err != nil {
+		return nil, err
+	}
+
+	// The links must be validated against the cgroup CURRENTLY at the path:
+	// a bpf_link binds to the cgroup object, so a destroy+recreate at the
+	// same path (routine container restart) leaves these pins loadable but
+	// defunct — adopting them would report enforcement while the recreated
+	// cgroup runs unfiltered (see validateCgroupLinkTarget).
+	cgroupID, err := currentCgroupID(cgroupPath)
+	if err != nil {
+		return nil, err
+	}
+	for name, dst := range map[string]*link.Link{
+		pinLinkConnect4: &f.cgroupLink4,
+		pinLinkConnect6: &f.cgroupLink6,
+		pinLinkSendmsg4: &f.sendmsgLink4,
+		pinLinkSendmsg6: &f.sendmsgLink6,
+	} {
+		l, err := link.LoadPinnedLink(filepath.Join(pinDir, name), nil)
+		if err != nil {
+			return nil, fmt.Errorf("loading pinned link %s: %w", name, err)
+		}
+		*dst = l
+		if err := validateCgroupLinkTarget(l, name, cgroupID); err != nil {
+			return nil, err
+		}
+	}
+
+	return f, nil
+}
+
+// pinnables returns every object that must be pinned for the filter to
+// survive the process, keyed by pin file name.
+func (f *CgroupFilter) pinnables() map[string]pinner {
+	return map[string]pinner{
+		pinAllowedIPv4:  f.objs.AllowedIpv4,
+		pinAllowedIPv6:  f.objs.AllowedIpv6,
+		pinDeniedIPv4:   f.objs.DeniedIpv4,
+		pinDeniedIPv6:   f.objs.DeniedIpv6,
+		pinPolicyMode:   f.objs.PolicyMode,
+		pinStats:        f.objs.Stats,
+		pinLinkConnect4: f.cgroupLink4,
+		pinLinkConnect6: f.cgroupLink6,
+		pinLinkSendmsg4: f.sendmsgLink4,
+		pinLinkSendmsg6: f.sendmsgLink6,
+	}
+}
+
+// Close releases the userspace BPF file descriptors. If the filter is pinned
+// the bpffs pins keep the links attached and the maps populated — the kernel
+// keeps enforcing (keep-enforcing daemon-stop path). If unpinned, this drops
+// the last references and the kernel detaches.
 func (f *CgroupFilter) Close() error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	return f.closeHandles()
+}
 
+// Detach permanently removes the filter: it unpins all links and maps
+// (removing the pin directory) and closes every handle, dropping the last
+// kernel references so enforcement stops. For an unpinned filter this is
+// equivalent to Close.
+func (f *CgroupFilter) Detach() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	var errs []error
+	// Removing the bpffs entries IS the unpin: once the pin files are gone,
+	// our fds hold the only references and closeHandles drops them.
+	if f.pinDir != "" {
+		if err := os.RemoveAll(f.pinDir); err != nil {
+			errs = append(errs, fmt.Errorf("removing pin dir %s: %w", f.pinDir, err))
+		}
+	}
+	if err := f.closeHandles(); err != nil {
+		errs = append(errs, err)
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("errors during detach: %v", errs)
+	}
+	return nil
+}
+
+// closeHandles closes all fds. Callers hold f.mu (or have exclusive access
+// during construction).
+func (f *CgroupFilter) closeHandles() error {
 	var errs []error
 
 	if f.cgroupLink4 != nil {
@@ -298,4 +424,21 @@ func (f *CgroupFilter) GetStats() (Stats, error) {
 // CgroupPath returns the cgroup path this filter is attached to
 func (f *CgroupFilter) CgroupPath() string {
 	return f.cgroupPath
+}
+
+// Rules lists every CIDR currently present in the allow and deny maps. Used
+// to re-adopt rule bookkeeping from pinned maps after a daemon restart.
+func (f *CgroupFilter) Rules() (allowed, denied []*net.IPNet, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	allowed, err = dumpRuleMaps(f.objs.AllowedIpv4, f.objs.AllowedIpv6)
+	if err != nil {
+		return nil, nil, fmt.Errorf("dumping allowed rules: %w", err)
+	}
+	denied, err = dumpRuleMaps(f.objs.DeniedIpv4, f.objs.DeniedIpv6)
+	if err != nil {
+		return nil, nil, fmt.Errorf("dumping denied rules: %w", err)
+	}
+	return allowed, denied, nil
 }

@@ -26,6 +26,7 @@ type fakeFilter struct {
 	setModeCalls int
 	allowCalls   int
 	closeCalls   int
+	detachCalls  int
 	allowErr     error // when set, AllowIP fails with this error
 	// removedAllowed/removedDenied record every Remove call (even for CIDRs
 	// not present, mirroring the real filter's idempotent removes), so tests
@@ -129,11 +130,56 @@ func (f *fakeFilter) GetStats() (filter.Stats, error) {
 	return f.stats, nil
 }
 
+func (f *fakeFilter) GetMode() (filter.PolicyMode, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.mode, nil
+}
+
 func (f *fakeFilter) Close() error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.closeCalls++
 	return nil
+}
+
+// Detach mirrors the real filters: it is Close plus pin removal. It bumps
+// closeCalls too so the exactly-once-teardown assertions (closeCallCount)
+// keep guarding double-frees regardless of which teardown path ran.
+func (f *fakeFilter) Detach() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.detachCalls++
+	f.closeCalls++
+	return nil
+}
+
+// detachCallCount reports how many times Detach ran.
+func (f *fakeFilter) detachCallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.detachCalls
+}
+
+// Rules mirrors the real filters' rule listing (used by restore reseeding).
+func (f *fakeFilter) Rules() (allowed, denied []*net.IPNet, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, s := range f.allowed {
+		_, cidr, perr := net.ParseCIDR(s)
+		if perr != nil {
+			return nil, nil, perr
+		}
+		allowed = append(allowed, cidr)
+	}
+	for _, s := range f.denied {
+		_, cidr, perr := net.ParseCIDR(s)
+		if perr != nil {
+			return nil, nil, perr
+		}
+		denied = append(denied, cidr)
+	}
+	return allowed, denied, nil
 }
 
 // closeCallCount reports how many times Close ran, so tests can prove

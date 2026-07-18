@@ -9,7 +9,7 @@ import (
 	apiv1 "github.com/danthegoodman1/netfence/v1"
 )
 
-func createFilter(target string, attachType apiv1.AttachmentType, mode apiv1.PolicyMode, direction apiv1.TcDirection, maxRuleEntries uint32) (filter.Filter, error) {
+func createFilter(pinDir, target string, attachType apiv1.AttachmentType, mode apiv1.PolicyMode, direction apiv1.TcDirection, maxRuleEntries uint32) (filter.Filter, error) {
 	filterMode := apiModeToFilterMode(mode)
 
 	// Default carve-out posture (localhost + IPv6 ND allowed, IPv4
@@ -18,7 +18,7 @@ func createFilter(target string, attachType apiv1.AttachmentType, mode apiv1.Pol
 	// follow-up; allowlisting 169.254.169.254/32 is the override for
 	// workloads that need the metadata service.
 	carveouts := filter.DefaultCarveouts()
-	opts := filter.Options{MaxRuleEntries: maxRuleEntries}
+	opts := filter.Options{MaxRuleEntries: maxRuleEntries, PinDir: pinDir}
 
 	switch attachType {
 	case apiv1.AttachmentType_ATTACHMENT_TYPE_CGROUP:
@@ -26,6 +26,19 @@ func createFilter(target string, attachType apiv1.AttachmentType, mode apiv1.Pol
 		return filter.NewCgroupFilterWithOptions(target, filterMode, carveouts, opts)
 	case apiv1.AttachmentType_ATTACHMENT_TYPE_TC:
 		return filter.NewTCFilterWithOptions(target, filterMode, apiDirectionToFilterDirection(direction), carveouts, opts)
+	default:
+		return nil, fmt.Errorf("unsupported attachment type: %s", attachType)
+	}
+}
+
+// loadPinnedFilter re-adopts an attachment's BPF state from its bpffs pin
+// directory without re-attaching anything (see LoadPinned*Filter).
+func loadPinnedFilter(pinDir, target string, attachType apiv1.AttachmentType, direction apiv1.TcDirection) (filter.Filter, error) {
+	switch attachType {
+	case apiv1.AttachmentType_ATTACHMENT_TYPE_CGROUP:
+		return filter.LoadPinnedCgroupFilter(target, pinDir)
+	case apiv1.AttachmentType_ATTACHMENT_TYPE_TC:
+		return filter.LoadPinnedTCFilter(target, apiDirectionToFilterDirection(direction), pinDir)
 	default:
 		return nil, fmt.Errorf("unsupported attachment type: %s", attachType)
 	}

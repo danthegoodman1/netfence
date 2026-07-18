@@ -56,7 +56,7 @@ func newAttachTestEnv(t *testing.T, port int) *attachTestEnv {
 	require.NoError(t, err)
 
 	env := &attachTestEnv{server: server, st: st, dbPath: dbPath, port: port}
-	server.newFilter = func(_ string, _ apiv1.AttachmentType, _ apiv1.PolicyMode, _ apiv1.TcDirection, _ uint32) (filter.Filter, error) {
+	server.newFilter = func(_, _ string, _ apiv1.AttachmentType, _ apiv1.PolicyMode, _ apiv1.TcDirection, _ uint32) (filter.Filter, error) {
 		env.mu.Lock()
 		defer env.mu.Unlock()
 		if env.filterErr != nil {

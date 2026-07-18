@@ -109,6 +109,15 @@ type Options struct {
 	// bytes and per-packet lookup cost are unchanged (LPM trie lookups are
 	// bounded by key length, not capacity).
 	MaxRuleEntries uint32
+
+	// PinDir, when non-empty, pins the filter's links and maps to this
+	// directory (which must live on a bpffs mount). Pinned state is held by
+	// the kernel independent of the creating process: enforcement survives
+	// Close() and process death, and LoadPinnedCgroupFilter /
+	// LoadPinnedTCFilter re-adopt it without re-attaching. Any stale
+	// directory at this path is removed before pinning. Empty disables
+	// pinning (state dies with the process, the pre-pinning behavior).
+	PinDir string
 }
 
 // Stats holds the filter statistics

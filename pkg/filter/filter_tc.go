@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"sync"
 
 	"github.com/cilium/ebpf"
@@ -46,6 +48,7 @@ type TCFilter struct {
 	objs      *tcObjects
 	ifaceName string
 	direction TCDirection
+	pinDir    string
 	tcLink    link.Link
 }
 
@@ -110,19 +113,135 @@ func NewTCFilterWithOptions(ifaceName string, mode PolicyMode, direction TCDirec
 		return nil, fmt.Errorf("attaching TC filter to interface %s (%s): %w", ifaceName, direction, err)
 	}
 
-	return &TCFilter{
+	f := &TCFilter{
 		objs:      objs,
 		ifaceName: ifaceName,
 		direction: direction,
+		pinDir:    opts.PinDir,
 		tcLink:    tcLink,
-	}, nil
+	}
+
+	// Pin link + maps last, once everything is attached: a crash before this
+	// point leaves nothing pinned (state dies with the process, as before),
+	// while a successful pin means the full set is adoptable after a restart.
+	if opts.PinDir != "" {
+		if err := pinAll(opts.PinDir, f.pinnables()); err != nil {
+			_ = os.RemoveAll(opts.PinDir)
+			_ = f.Close()
+			return nil, fmt.Errorf("pinning TC filter state: %w", err)
+		}
+	}
+
+	return f, nil
 }
 
-// Close releases the BPF resources
+// LoadPinnedTCFilter re-adopts a TC filter previously pinned under pinDir (a
+// filter created with Options.PinDir): it loads the pinned rule/mode/stat
+// maps and TCX link into a working TCFilter WITHOUT re-attaching anything —
+// the pinned link kept the program attached (and enforcing) the whole time,
+// and the pinned maps kept the rules. The program handle itself is not
+// needed post-attach and is not reloaded.
+//
+// On error the partially-loaded handles are closed and the pins are left in
+// place for the caller to inspect or remove.
+func LoadPinnedTCFilter(ifaceName string, direction TCDirection, pinDir string) (_ *TCFilter, retErr error) {
+	f := &TCFilter{
+		objs:      &tcObjects{},
+		ifaceName: ifaceName,
+		direction: direction,
+		pinDir:    pinDir,
+	}
+	defer func() {
+		if retErr != nil {
+			_ = f.closeHandles()
+		}
+	}()
+
+	if err := loadPinnedMaps(pinDir, map[string]**ebpf.Map{
+		pinAllowedIPv4: &f.objs.AllowedIpv4,
+		pinAllowedIPv6: &f.objs.AllowedIpv6,
+		pinDeniedIPv4:  &f.objs.DeniedIpv4,
+		pinDeniedIPv6:  &f.objs.DeniedIpv6,
+		pinPolicyMode:  &f.objs.PolicyMode,
+		pinStats:       &f.objs.Stats,
+	}); err != nil {
+		return nil, err
+	}
+
+	l, err := link.LoadPinnedLink(filepath.Join(pinDir, pinLinkTCX), nil)
+	if err != nil {
+		return nil, fmt.Errorf("loading pinned link %s: %w", pinLinkTCX, err)
+	}
+	f.tcLink = l
+
+	// The link must be validated against the interface CURRENTLY under the
+	// name: a TCX link binds to an ifindex, so a destroy+recreate under the
+	// same name leaves this pin loadable but defunct — adopting it would
+	// report enforcement while the recreated interface runs unfiltered (see
+	// validateTCXLinkTarget).
+	iface, err := net.InterfaceByName(ifaceName)
+	if err != nil {
+		return nil, fmt.Errorf("getting interface %s: %w", ifaceName, err)
+	}
+	if err := validateTCXLinkTarget(l, pinLinkTCX, iface.Index); err != nil {
+		return nil, err
+	}
+
+	return f, nil
+}
+
+// pinnables returns every object that must be pinned for the filter to
+// survive the process, keyed by pin file name.
+func (f *TCFilter) pinnables() map[string]pinner {
+	return map[string]pinner{
+		pinAllowedIPv4: f.objs.AllowedIpv4,
+		pinAllowedIPv6: f.objs.AllowedIpv6,
+		pinDeniedIPv4:  f.objs.DeniedIpv4,
+		pinDeniedIPv6:  f.objs.DeniedIpv6,
+		pinPolicyMode:  f.objs.PolicyMode,
+		pinStats:       f.objs.Stats,
+		pinLinkTCX:     f.tcLink,
+	}
+}
+
+// Close releases the userspace BPF file descriptors. If the filter is pinned
+// the bpffs pins keep the link attached and the maps populated — the kernel
+// keeps enforcing (keep-enforcing daemon-stop path). If unpinned, this drops
+// the last references and the kernel detaches.
 func (f *TCFilter) Close() error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	return f.closeHandles()
+}
 
+// Detach permanently removes the filter: it unpins the link and maps
+// (removing the pin directory) and closes every handle, dropping the last
+// kernel references so enforcement stops. For an unpinned filter this is
+// equivalent to Close.
+func (f *TCFilter) Detach() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	var errs []error
+	// Removing the bpffs entries IS the unpin: once the pin files are gone,
+	// our fds hold the only references and closeHandles drops them.
+	if f.pinDir != "" {
+		if err := os.RemoveAll(f.pinDir); err != nil {
+			errs = append(errs, fmt.Errorf("removing pin dir %s: %w", f.pinDir, err))
+		}
+	}
+	if err := f.closeHandles(); err != nil {
+		errs = append(errs, err)
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("errors during detach: %v", errs)
+	}
+	return nil
+}
+
+// closeHandles closes all fds. Callers hold f.mu (or have exclusive access
+// during construction).
+func (f *TCFilter) closeHandles() error {
 	var errs []error
 
 	if f.tcLink != nil {
@@ -272,4 +391,21 @@ func (f *TCFilter) InterfaceName() string {
 // Direction returns the direction this filter is attached in
 func (f *TCFilter) Direction() TCDirection {
 	return f.direction
+}
+
+// Rules lists every CIDR currently present in the allow and deny maps. Used
+// to re-adopt rule bookkeeping from pinned maps after a daemon restart.
+func (f *TCFilter) Rules() (allowed, denied []*net.IPNet, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	allowed, err = dumpRuleMaps(f.objs.AllowedIpv4, f.objs.AllowedIpv6)
+	if err != nil {
+		return nil, nil, fmt.Errorf("dumping allowed rules: %w", err)
+	}
+	denied, err = dumpRuleMaps(f.objs.DeniedIpv4, f.objs.DeniedIpv6)
+	if err != nil {
+		return nil, nil, fmt.Errorf("dumping denied rules: %w", err)
+	}
+	return allowed, denied, nil
 }

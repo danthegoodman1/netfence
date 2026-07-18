@@ -153,6 +153,15 @@ func (cp *testControlPlane) StreamCount() int {
 	return len(cp.streams)
 }
 
+// HasStream reports whether a command stream is registered for the
+// attachment (via Subscribed or a post-restart Sync).
+func (cp *testControlPlane) HasStream(id string) bool {
+	cp.mu.RLock()
+	defer cp.mu.RUnlock()
+	_, ok := cp.streams[id]
+	return ok
+}
+
 func (cp *testControlPlane) Unsubscribed(id string) *apiv1.Unsubscribed {
 	cp.mu.RLock()
 	defer cp.mu.RUnlock()
@@ -202,6 +211,14 @@ func (cp *testControlPlane) Connect(stream grpc.BidiStreamingServer[apiv1.Daemon
 
 		switch e := event.Event.(type) {
 		case *apiv1.DaemonEvent_Sync:
+			// Register the stream for every synced attachment so tests can
+			// SendCommand to attachments restored by a daemon restart (which
+			// re-announce via Sync, not Subscribed).
+			cp.mu.Lock()
+			for _, att := range e.Sync.Attachments {
+				cp.streams[att.Id] = stream
+			}
+			cp.mu.Unlock()
 			if err := stream.Send(&apiv1.ControlCommand{
 				Command: &apiv1.ControlCommand_SyncAck{SyncAck: &apiv1.SyncAck{}},
 			}); err != nil {

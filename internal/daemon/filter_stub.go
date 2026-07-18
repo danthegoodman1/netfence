@@ -3,12 +3,18 @@
 package daemon
 
 import (
+	"fmt"
+
 	"github.com/danthegoodman1/netfence/pkg/filter"
 	apiv1 "github.com/danthegoodman1/netfence/v1"
 )
 
-func createFilter(_ string, _ apiv1.AttachmentType, _ apiv1.PolicyMode, _ apiv1.TcDirection, _ uint32) (filter.Filter, error) {
+func createFilter(_, _ string, _ apiv1.AttachmentType, _ apiv1.PolicyMode, _ apiv1.TcDirection, _ uint32) (filter.Filter, error) {
 	return nil, nil
+}
+
+func loadPinnedFilter(_, _ string, _ apiv1.AttachmentType, _ apiv1.TcDirection) (filter.Filter, error) {
+	return nil, fmt.Errorf("pinned BPF filters are only supported on linux")
 }
 
 func apiModeToFilterMode(mode apiv1.PolicyMode) filter.PolicyMode {

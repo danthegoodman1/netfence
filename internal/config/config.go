@@ -43,6 +43,21 @@ type FilterConfig struct {
 	// Zero (or unset) keeps the compiled-in default of 4096. This is
 	// load-time map sizing only; it has no per-packet cost.
 	MaxRuleEntries int `mapstructure:"max_rule_entries"`
+	// BPFPinDir is the bpffs directory the daemon pins each attachment's BPF
+	// links and maps under (one subdirectory per attachment ID). Pinned state
+	// is held by the kernel independent of the daemon process: enforcement
+	// (and the rule set) survives daemon crashes, stops, and upgrades, and is
+	// re-adopted on the next start. Default /sys/fs/bpf/netfence. An explicit
+	// empty string disables pinning (BPF state dies with the process — every
+	// daemon stop becomes fail-open).
+	BPFPinDir string `mapstructure:"bpf_pin_dir"`
+	// DetachOnStop controls what a daemon stop (SIGTERM/SIGINT) does with
+	// attached filters. Default false: filters stay attached via their bpffs
+	// pins and the kernel KEEPS ENFORCING the last-known policy while the
+	// daemon is down (fail-closed; the next start re-adopts them). Set true
+	// to detach filters and remove their pins on stop, leaving traffic
+	// unfiltered while the daemon is down (fail-open).
+	DetachOnStop bool `mapstructure:"detach_on_stop"`
 }
 
 type ControlPlaneConfig struct {
@@ -64,6 +79,8 @@ func Load(configPath string) (*Config, error) {
 	v.SetDefault("socket", "/var/run/netfence.sock")
 	v.SetDefault("dns.min_filter_ttl", 60*time.Second)
 	v.SetDefault("filter.max_rule_entries", 4096)
+	v.SetDefault("filter.bpf_pin_dir", "/sys/fs/bpf/netfence")
+	v.SetDefault("filter.detach_on_stop", false)
 	v.SetDefault("control_plane.subscribe_ack_timeout", 5*time.Second)
 	v.SetDefault("ttl_janitor_interval", time.Second)
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -54,11 +55,30 @@ type Server struct {
 	// (see config filter.max_rule_entries; 0 = compiled-in default).
 	maxRuleEntries uint32
 
+	// pinRoot is the bpffs directory attachment BPF state is pinned under
+	// (config filter.bpf_pin_dir; "" disables pinning). detachOnStop selects
+	// Stop's teardown path: false (default) keeps the pins so the kernel
+	// keeps enforcing while the daemon is down; true detaches and unpins.
+	pinRoot      string
+	detachOnStop bool
+
 	// newFilter constructs the eBPF filter for an attachment. It is a struct
 	// field (always createFilter in production, set once in NewServer and
 	// never reassigned) purely so unit tests can inject fake filters and
-	// forced construction failures.
-	newFilter func(target string, attachType apiv1.AttachmentType, mode apiv1.PolicyMode, direction apiv1.TcDirection, maxRuleEntries uint32) (filter.Filter, error)
+	// forced construction failures. pinDir is the attachment's bpffs pin
+	// directory ("" disables pinning).
+	newFilter func(pinDir, target string, attachType apiv1.AttachmentType, mode apiv1.PolicyMode, direction apiv1.TcDirection, maxRuleEntries uint32) (filter.Filter, error)
+	// loadPinnedFilter re-adopts an attachment's BPF state from its pin
+	// directory during restore, without re-attaching (production:
+	// loadPinnedFilter; a seam for the same reason as newFilter).
+	loadPinnedFilter func(pinDir, target string, attachType apiv1.AttachmentType, direction apiv1.TcDirection) (filter.Filter, error)
+	// ensurePinRoot prepares pinRoot on bpffs (production: ensureBPFPinRoot;
+	// a seam so unit tests can use plain temp directories).
+	ensurePinRoot func(pinRoot string) error
+	// targetExists reports whether an attachment target is still present
+	// (production: targetPresent; a seam so unit tests can restore
+	// attachments whose fake targets never existed).
+	targetExists func(attachType apiv1.AttachmentType, target string) bool
 }
 
 type attachmentState struct {
@@ -111,7 +131,12 @@ func NewServer(cfg *config.Config, st *store.Store, logger zerolog.Logger, versi
 		janitorStop:        make(chan struct{}),
 		dnsMinFilterTTL:    dnsMinFilterTTL,
 		maxRuleEntries:     maxRuleEntries,
+		pinRoot:            cfg.Filter.BPFPinDir,
+		detachOnStop:       cfg.Filter.DetachOnStop,
 		newFilter:          createFilter,
+		loadPinnedFilter:   loadPinnedFilter,
+		ensurePinRoot:      ensureBPFPinRoot,
+		targetExists:       targetPresent,
 	}
 
 	s.watcher = NewTargetWatcher(logger, s.handleTargetRemoved)
@@ -145,6 +170,12 @@ func (s *Server) SetControlPlaneClient(cp *ControlPlaneClient) {
 }
 
 func (s *Server) Start() error {
+	if s.pinRoot != "" {
+		if err := s.ensurePinRoot(s.pinRoot); err != nil {
+			return fmt.Errorf("preparing BPF pin root: %w", err)
+		}
+	}
+
 	s.mu.Lock()
 	var toRemove []string
 	for id, state := range s.attachments {
@@ -152,14 +183,22 @@ func (s *Server) Start() error {
 		mode := parsePolicyMode(state.info.Mode)
 		direction := parseTcDirection(state.info.Direction)
 
-		ebpfFilter, err := s.newFilter(state.info.Target, attachType, mode, direction, s.maxRuleEntries)
+		ebpfFilter, adopted, err := s.restoreFilter(id, state.info.Target, attachType, mode, direction)
 		if err != nil {
+			var abort *restoreAbortError
+			if errors.As(err, &abort) {
+				s.mu.Unlock()
+				return fmt.Errorf("restoring attachment %s: %w", id, abort.err)
+			}
 			s.logger.Warn().Err(err).
 				Str("id", id).
 				Str("target", state.info.Target).
 				Msg("failed to restore filter, target may be gone")
 			toRemove = append(toRemove, id)
 			continue
+		}
+		if adopted {
+			s.seedAdoptedState(id, state, ebpfFilter)
 		}
 
 		var proxyFunc DnsProxyFunc
@@ -174,7 +213,11 @@ func (s *Server) Start() error {
 				Str("target", state.info.Target).
 				Msg("failed to start DNS server on restore")
 			if ebpfFilter != nil {
-				ebpfFilter.Close()
+				// The attachment is being dropped for good: Detach (not
+				// Close) so its pinned state is destroyed too.
+				if err := ebpfFilter.Detach(); err != nil {
+					s.logger.Warn().Err(err).Str("id", id).Msg("error detaching filter after restore DNS failure")
+				}
 			}
 			toRemove = append(toRemove, id)
 			continue
@@ -193,8 +236,9 @@ func (s *Server) Start() error {
 					s.logger.Warn().Err(err).Str("id", id).Msg("error stopping DNS server after restore watch failure")
 				}
 				if ebpfFilter != nil {
-					if err := ebpfFilter.Close(); err != nil {
-						s.logger.Warn().Err(err).Str("id", id).Msg("error closing filter after restore watch failure")
+					// Dropped for good: Detach so pinned state goes too.
+					if err := ebpfFilter.Detach(); err != nil {
+						s.logger.Warn().Err(err).Str("id", id).Msg("error detaching filter after restore watch failure")
 					}
 				}
 				toRemove = append(toRemove, id)
@@ -208,6 +252,7 @@ func (s *Server) Start() error {
 			Str("id", id).
 			Str("target", state.info.Target).
 			Str("type", attachType.String()).
+			Bool("readopted_from_pins", adopted).
 			Msg("restored attachment")
 	}
 
@@ -225,6 +270,31 @@ func (s *Server) Start() error {
 			s.logger.Error().Err(err).Str("id", id).Msg("failed to delete stale attachment from store")
 		}
 	}
+
+	// Reconcile orphaned pin dirs: bpffs state with no surviving store row
+	// (e.g. a crash between pinning and the store save, or a row dropped just
+	// above) is unowned — remove it so no stale enforcement or kernel
+	// objects leak.
+	if s.pinRoot != "" {
+		if entries, err := os.ReadDir(s.pinRoot); err != nil {
+			s.logger.Warn().Err(err).Msg("failed to scan BPF pin root for orphans")
+		} else {
+			for _, entry := range entries {
+				if !entry.IsDir() {
+					continue
+				}
+				if _, ok := s.attachments[entry.Name()]; ok {
+					continue
+				}
+				orphan := filepath.Join(s.pinRoot, entry.Name())
+				if err := os.RemoveAll(orphan); err != nil {
+					s.logger.Warn().Err(err).Str("pin_dir", orphan).Msg("failed to remove orphaned BPF pin dir")
+				} else {
+					s.logger.Info().Str("pin_dir", orphan).Msg("removed orphaned BPF pin dir (no matching attachment)")
+				}
+			}
+		}
+	}
 	s.mu.Unlock()
 
 	if err := s.watcher.Start(); err != nil {
@@ -235,6 +305,144 @@ func (s *Server) Start() error {
 	go s.runTTLJanitor()
 
 	return nil
+}
+
+// pinDirFor returns the bpffs pin directory for an attachment, or "" when
+// pinning is disabled.
+func (s *Server) pinDirFor(id string) string {
+	if s.pinRoot == "" {
+		return ""
+	}
+	return filepath.Join(s.pinRoot, id)
+}
+
+// restoreAbortError marks a restoreFilter failure that must abort daemon
+// startup (e.g. the pin state's existence cannot be determined) instead of
+// being treated as a gone target and cleaning the attachment up.
+type restoreAbortError struct{ err error }
+
+func (e *restoreAbortError) Error() string { return e.err.Error() }
+func (e *restoreAbortError) Unwrap() error { return e.err }
+
+// restoreFilter obtains the eBPF filter for a persisted attachment during
+// Start. The keep-enforcing path re-adopts the attachment's pinned BPF state
+// (rules intact, links never re-attached — so no transient allow/block
+// window and no duplicate attachment; the kernel was enforcing the whole
+// time the daemon was down). Absent or unusable pins fall back to recreating
+// an empty filter in the persisted mode — the pre-pinning behavior, e.g.
+// after a detach_on_stop run or on data from a pre-pinning daemon — and the
+// caller's log line records which path was taken. adopted reports whether
+// the pinned path was used.
+func (s *Server) restoreFilter(id, target string, attachType apiv1.AttachmentType, mode apiv1.PolicyMode, direction apiv1.TcDirection) (_ filter.Filter, adopted bool, _ error) {
+	pinDir := s.pinDirFor(id)
+	if pinDir != "" {
+		_, statErr := os.Stat(pinDir)
+		if statErr != nil && !os.IsNotExist(statErr) {
+			// Cannot tell whether pinned (live, kernel-enforcing) state
+			// exists. Falling through to recreate-empty would silently
+			// discard it on a transient EACCES/EIO, so abort startup and
+			// surface the error instead of guessing.
+			return nil, false, &restoreAbortError{err: fmt.Errorf("checking pin dir %s: %w", pinDir, statErr)}
+		}
+		if statErr == nil {
+			if !s.targetExists(attachType, target) {
+				// The target vanished while the daemon was down, so the
+				// pinned links are defunct. Drop the pins and let the
+				// recreate path below fail against the missing target, which
+				// routes the attachment into the caller's cleanup.
+				s.logger.Warn().Str("id", id).Str("target", target).
+					Msg("target gone while daemon was down; discarding pinned BPF state")
+				if rmErr := os.RemoveAll(pinDir); rmErr != nil {
+					s.logger.Warn().Err(rmErr).Str("id", id).Str("pin_dir", pinDir).Msg("failed to remove stale pin dir")
+				}
+			} else {
+				restored, lerr := s.loadPinnedFilter(pinDir, target, attachType, direction)
+				if lerr == nil {
+					return restored, true, nil
+				}
+				s.logger.Warn().Err(lerr).Str("id", id).Str("pin_dir", pinDir).
+					Msg("failed to re-adopt pinned BPF state; discarding pins and recreating empty filter")
+				if rmErr := os.RemoveAll(pinDir); rmErr != nil {
+					s.logger.Warn().Err(rmErr).Str("id", id).Str("pin_dir", pinDir).Msg("failed to remove unusable pin dir")
+				}
+			}
+		} else {
+			s.logger.Info().Str("id", id).Str("pin_dir", pinDir).
+				Msg("no pinned BPF state for attachment (detach_on_stop run or pre-pinning data); recreating empty filter")
+		}
+	}
+
+	f, err := s.newFilter(pinDir, target, attachType, mode, direction, s.maxRuleEntries)
+	if err != nil {
+		return nil, false, err
+	}
+	return f, false, nil
+}
+
+// seedAdoptedState re-syncs daemon bookkeeping with kernel state adopted
+// from pins: the store row's mode is corrected to the live (pinned) mode if
+// they diverged (the pinned map IS what is enforcing; it is never rewritten
+// on restore, so there is no transient mode window), and every adopted rule
+// is seeded into the TTL registry as a permanent control-plane entry so a
+// later BulkUpdate diff-reconcile sees — and can remove — it. TTL deadlines
+// are not persisted, so TTL'd rules come back permanent until the next
+// control-plane sync corrects them; that fails toward last-known policy.
+// Called with s.mu held during Start (no concurrent rule traffic yet).
+func (s *Server) seedAdoptedState(id string, state *attachmentState, f filter.Filter) {
+	if liveMode, err := f.GetMode(); err != nil {
+		s.logger.Warn().Err(err).Str("id", id).Msg("failed to read mode from re-adopted filter")
+	} else if apiMode := filterModeToAPIMode(liveMode); apiMode.String() != state.info.Mode {
+		s.logger.Info().Str("id", id).
+			Str("store_mode", state.info.Mode).
+			Str("live_mode", apiMode.String()).
+			Msg("store mode lagged pinned mode; trusting kernel state")
+		state.info.Mode = apiMode.String()
+		if err := s.store.SaveAttachment(cloneAttachment(state.info)); err != nil {
+			s.logger.Warn().Err(err).Str("id", id).Msg("failed to persist re-adopted mode")
+		}
+	}
+
+	lister, ok := f.(interface {
+		Rules() (allowed, denied []*net.IPNet, err error)
+	})
+	if !ok {
+		return
+	}
+	allowed, denied, err := lister.Rules()
+	if err != nil {
+		s.logger.Warn().Err(err).Str("id", id).
+			Msg("failed to list re-adopted rules; later bulk updates may not remove stale entries")
+		return
+	}
+	now := s.now()
+	for _, cidr := range allowed {
+		if err := state.ttls.addCP(f, cidr, listAllow, 0, now); err != nil {
+			s.logger.Warn().Err(err).Str("id", id).Str("cidr", cidr.String()).Msg("failed to seed re-adopted allow rule")
+		}
+	}
+	for _, cidr := range denied {
+		if err := state.ttls.addCP(f, cidr, listDeny, 0, now); err != nil {
+			s.logger.Warn().Err(err).Str("id", id).Str("cidr", cidr.String()).Msg("failed to seed re-adopted deny rule")
+		}
+	}
+	s.logger.Info().Str("id", id).
+		Int("allow_rules", len(allowed)).
+		Int("deny_rules", len(denied)).
+		Msg("re-adopted pinned rules (permanent until next control-plane sync; TTL deadlines are not persisted)")
+}
+
+// targetPresent reports whether an attachment target still exists.
+func targetPresent(attachType apiv1.AttachmentType, target string) bool {
+	switch attachType {
+	case apiv1.AttachmentType_ATTACHMENT_TYPE_CGROUP:
+		_, err := os.Stat(target)
+		return err == nil
+	case apiv1.AttachmentType_ATTACHMENT_TYPE_TC:
+		_, err := net.InterfaceByName(target)
+		return err == nil
+	default:
+		return false
+	}
 }
 
 func (s *Server) Stop() {
@@ -252,12 +460,26 @@ func (s *Server) Stop() {
 	}
 	s.mu.Unlock()
 
+	if s.detachOnStop {
+		s.logger.Info().Int("attachments", len(attachments)).
+			Msg("stopping with detach_on_stop: detaching filters and removing pinned BPF state (traffic will be unfiltered)")
+	} else if len(attachments) > 0 && s.pinRoot != "" {
+		s.logger.Info().Int("attachments", len(attachments)).
+			Msg("stopping; pinned BPF state keeps enforcing the last-known policy while the daemon is down")
+	}
+
 	for _, state := range attachments {
 		if state.dns != nil {
 			state.dns.Stop()
 		}
 		if state.filter != nil {
-			state.filter.Close()
+			if s.detachOnStop {
+				if err := state.filter.Detach(); err != nil {
+					s.logger.Warn().Err(err).Msg("error detaching filter on stop")
+				}
+			} else {
+				state.filter.Close()
+			}
 		}
 	}
 }
@@ -362,8 +584,10 @@ func (s *Server) handleTargetRemoved(target string) {
 	}
 
 	if state.filter != nil {
-		if err := state.filter.Close(); err != nil {
-			s.logger.Warn().Err(err).Str("id", id).Msg("error closing eBPF filter")
+		// Genuine removal: Detach (not Close) so the pinned BPF state is
+		// destroyed along with the kernel attachment.
+		if err := state.filter.Detach(); err != nil {
+			s.logger.Warn().Err(err).Str("id", id).Msg("error detaching eBPF filter")
 		}
 	}
 
@@ -492,8 +716,10 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (*apiv1.A
 			if err := dnsServer.Stop(); err != nil {
 				s.logger.Warn().Err(err).Str("id", id).Msg("error stopping DNS server during attach rollback")
 			}
-			if err := ebpfFilter.Close(); err != nil {
-				s.logger.Warn().Err(err).Str("id", id).Msg("error closing eBPF filter during attach rollback")
+			// The rollback destroys the half-built attachment for good, so
+			// Detach: the pins this Attach created must not outlive it.
+			if err := ebpfFilter.Detach(); err != nil {
+				s.logger.Warn().Err(err).Str("id", id).Msg("error detaching eBPF filter during attach rollback")
 			}
 			if err := s.store.DeleteAttachment(id); err != nil {
 				s.logger.Error().Err(err).Str("id", id).Msg("error deleting attachment from store during attach rollback")
@@ -519,8 +745,10 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (*apiv1.A
 			}
 		}
 		if ebpfFilter != nil {
-			if err := ebpfFilter.Close(); err != nil {
-				s.logger.Warn().Err(err).Str("id", id).Msg("error closing eBPF filter during attach rollback")
+			// Destroying the staged filter for good: Detach so its pins (if
+			// any were created) go with it.
+			if err := ebpfFilter.Detach(); err != nil {
+				s.logger.Warn().Err(err).Str("id", id).Msg("error detaching eBPF filter during attach rollback")
 			}
 		}
 		if rowSaved {
@@ -533,7 +761,7 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (*apiv1.A
 		s.mu.Unlock()
 	}()
 
-	ebpfFilter, err = s.newFilter(target, attachType, mode, direction, s.maxRuleEntries)
+	ebpfFilter, err = s.newFilter(s.pinDirFor(id), target, attachType, mode, direction, s.maxRuleEntries)
 	if err != nil {
 		return nil, fmt.Errorf("creating eBPF filter: %w", err)
 	}
@@ -667,8 +895,10 @@ func (s *Server) Detach(ctx context.Context, req *apiv1.DetachRequest) (*emptypb
 	}
 
 	if state.filter != nil {
-		if err := state.filter.Close(); err != nil {
-			s.logger.Warn().Err(err).Str("id", req.Id).Msg("error closing eBPF filter")
+		// Explicit detach destroys the attachment for good: unpin + close so
+		// no bpffs state or kernel links survive.
+		if err := state.filter.Detach(); err != nil {
+			s.logger.Warn().Err(err).Str("id", req.Id).Msg("error detaching eBPF filter")
 		}
 	}
 
@@ -1146,6 +1376,20 @@ func parseAttachmentType(s string) apiv1.AttachmentType {
 		return apiv1.AttachmentType(v)
 	}
 	return apiv1.AttachmentType_ATTACHMENT_TYPE_UNSPECIFIED
+}
+
+// filterModeToAPIMode is the inverse of apiModeToFilterMode.
+func filterModeToAPIMode(mode filter.PolicyMode) apiv1.PolicyMode {
+	switch mode {
+	case filter.ModeAllowlist:
+		return apiv1.PolicyMode_POLICY_MODE_ALLOWLIST
+	case filter.ModeBlockAll:
+		return apiv1.PolicyMode_POLICY_MODE_BLOCK_ALL
+	case filter.ModeDenylist:
+		return apiv1.PolicyMode_POLICY_MODE_DENYLIST
+	default:
+		return apiv1.PolicyMode_POLICY_MODE_DISABLED
+	}
 }
 
 func parsePolicyMode(s string) apiv1.PolicyMode {

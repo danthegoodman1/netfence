@@ -55,8 +55,20 @@ import "net"
 
 // Filter is the common interface implemented by both CgroupFilter and TCFilter.
 // It provides methods for managing IP allowlists/denylists and controlling the filter mode.
+//
+// Teardown has two distinct paths:
+//
+//   - Close releases the userspace file descriptors only. For a filter
+//     created with Options.PinDir set, the bpffs pins keep the links attached
+//     and the rule maps populated, so the kernel KEEPS ENFORCING after Close
+//     (and after the process exits). This is the daemon-stop / keep-enforcing
+//     path; a later LoadPinned*Filter re-adopts the state.
+//   - Detach removes the bpffs pin directory and closes everything, dropping
+//     the last kernel references: enforcement stops and no state survives.
+//     For an unpinned filter Detach is equivalent to Close.
 type Filter interface {
 	SetMode(PolicyMode) error
+	GetMode() (PolicyMode, error)
 	AllowIP(cidr *net.IPNet) error
 	DenyIP(cidr *net.IPNet) error
 	RemoveAllowedIP(cidr *net.IPNet) error
@@ -64,4 +76,5 @@ type Filter interface {
 	ClearRules() error
 	GetStats() (Stats, error)
 	Close() error
+	Detach() error
 }

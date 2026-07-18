@@ -134,6 +134,46 @@ netfenced start --config /etc/netfence/config.yaml
 netfenced status
 ```
 
+### Daemon restarts, crashes, and upgrades (pinned BPF state)
+
+The daemon pins every attachment's BPF links and rule maps to bpffs
+(`filter.bpf_pin_dir`, default `/sys/fs/bpf/netfence`, one directory per
+attachment ID). Because pinned state is held by the kernel — not the daemon
+process — **enforcement continues while the daemon is down**: a crash
+(`kill -9`), a graceful stop, or an upgrade leaves the last-known policy
+(mode + all rules) enforcing, and the next daemon start re-adopts the pinned
+state as-is. Restore never re-attaches or rewrites the live maps, so there is
+no window where an allowlisted workload is blocked or a blocked destination
+is allowed, and no duplicate attachment.
+
+Stop behavior is explicit config (`filter.detach_on_stop`):
+
+```yaml
+filter:
+  # false (default): stopping the daemon KEEPS ENFORCING — filters stay
+  # attached via their bpffs pins and are re-adopted on the next start
+  # (fail-closed across restarts/upgrades).
+  # true: stopping the daemon detaches filters and removes their pins —
+  # traffic is unfiltered while the daemon is down (explicit fail-open).
+  detach_on_stop: false
+  # bpffs directory for pinned state. Must be on a bpffs mount; the daemon
+  # mounts bpffs at /sys/fs/bpf if needed (privileged). An explicit "" turns
+  # pinning off entirely (BPF state then dies with the process).
+  bpf_pin_dir: /sys/fs/bpf/netfence
+```
+
+An explicit `Detach` (RPC/CLI) or a removed target always destroys the
+pinned state along with the attachment.
+
+Notes on re-adopted state:
+- Rule TTL deadlines are not persisted: rules re-adopted after a restart are
+  treated as permanent until the next control-plane sync (a `BulkUpdate`
+  reconciles them exactly, removing anything no longer declared). This fails
+  toward the last-known policy, never toward open.
+- The per-attachment DNS server is a userspace component and stops with the
+  daemon; while the daemon is down, already-resolved (still unexpired) IPs
+  keep working but new names cannot be resolved through it.
+
 ## Per attachment
 
 Your orchestration system calls the daemon's local API.
