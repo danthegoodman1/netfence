@@ -457,6 +457,12 @@ func (c *ControlPlaneClient) applySubscribedAck(id string, ack *apiv1.Subscribed
 	}
 }
 
+// applyBulkUpdate reconciles the attachment to the declared state with
+// add/remove deltas instead of the old wipe-then-rebuild: a rule present in
+// both the old and new state is never removed from the kernel map, so a
+// control-plane resync opens no transient allow/block window, and
+// DNS-populated filter IPs survive (they age out via their own DNS TTLs,
+// Phase 2B). Any parse error aborts BEFORE any mutation.
 func (c *ControlPlaneClient) applyBulkUpdate(id string, update *apiv1.BulkUpdate) {
 	if update == nil {
 		return
@@ -465,27 +471,17 @@ func (c *ControlPlaneClient) applyBulkUpdate(id string, update *apiv1.BulkUpdate
 	if !ok {
 		return
 	}
-	if err := c.server.ClearRules(id); err != nil {
-		c.logger.Error().Err(err).Str("id", id).Msg("failed to clear rules in bulk update")
-		return
-	}
-	if err := c.server.SetFilterMode(id, update.Mode); err != nil {
-		c.logger.Error().Err(err).Str("id", id).Msg("failed to set filter mode in bulk update")
-		return
+
+	// ReconcileCIDRs owns the mode write too, sandwiching it between the
+	// two list reconciles (new mode's list first) so no mode pair opens a
+	// transient allow/block window — see its doc comment.
+	if err := c.server.ReconcileCIDRs(id, update.Mode, allowCIDRs, denyCIDRs); err != nil {
+		c.logger.Error().Err(err).Str("id", id).Msg("failed to reconcile CIDRs in bulk update")
 	}
 
-	for _, entry := range allowCIDRs {
-		if err := c.server.AllowCIDR(id, entry.cidr, entry.ttl); err != nil {
-			c.logger.Error().Err(err).Str("id", id).Str("cidr", entry.cidr.String()).Msg("failed to allow CIDR in bulk update")
-		}
-	}
-
-	for _, entry := range denyCIDRs {
-		if err := c.server.DenyCIDR(id, entry.cidr, entry.ttl); err != nil {
-			c.logger.Error().Err(err).Str("id", id).Str("cidr", entry.cidr.String()).Msg("failed to deny CIDR in bulk update")
-		}
-	}
-
+	// Domain rules are replaced wholesale as before; DNS-populated filter
+	// IPs are deliberately NOT wiped (clients still hold them in resolver
+	// caches) — the janitor expires them by their DNS TTLs.
 	if update.Dns == nil {
 		if err := c.server.ReplaceDNSRules(id, apiv1.DnsMode_DNS_MODE_DISABLED, nil, nil); err != nil {
 			c.logger.Error().Err(err).Str("id", id).Msg("failed to clear DNS rules in bulk update")

@@ -50,7 +50,7 @@ func (s *dnsFilterSink) AllowIPWithTTL(cidr *net.IPNet, ttl time.Duration) error
 	if floor := s.server.dnsMinFilterTTL; ttl < floor {
 		ttl = floor
 	}
-	err := s.reg.add(s.filter, cidr, listAllow, ttl, s.server.now())
+	err := s.reg.addDNS(s.filter, cidr, listAllow, ttl, s.server.now())
 	if err == nil {
 		return nil
 	}

@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -912,7 +913,7 @@ func (s *Server) AllowCIDR(id string, cidr *net.IPNet, ttl time.Duration) error 
 	if err != nil {
 		return err
 	}
-	return reg.add(ebpfFilter, cidr, listAllow, ttl, s.now())
+	return reg.addCP(ebpfFilter, cidr, listAllow, ttl, s.now())
 }
 
 // DenyCIDR adds the CIDR to the attachment's denylist. TTL semantics match
@@ -922,7 +923,7 @@ func (s *Server) DenyCIDR(id string, cidr *net.IPNet, ttl time.Duration) error {
 	if err != nil {
 		return err
 	}
-	return reg.add(ebpfFilter, cidr, listDeny, ttl, s.now())
+	return reg.addCP(ebpfFilter, cidr, listDeny, ttl, s.now())
 }
 
 func (s *Server) RemoveAllowedCIDR(id string, cidr *net.IPNet) error {
@@ -939,6 +940,49 @@ func (s *Server) RemoveDeniedCIDR(id string, cidr *net.IPNet) error {
 		return err
 	}
 	return reg.remove(ebpfFilter, cidr, listDeny)
+}
+
+// ReconcileCIDRs applies a bulk update — target mode plus declared CIDR
+// sets — as add/remove deltas against the registry's live CP entries (see
+// ttlRegistry.reconcileCP), in an order that is window-free for EVERY mode
+// pair. The BPF program consults exactly one rule map per mode (allowlist
+// -> allowed_*, denylist -> denied_*, block-all/disabled -> none), so:
+//
+//  1. The list the NEW mode consults is reconciled first — adds AND
+//     removes. During a mode flip that list is inert under the OLD mode, so
+//     correcting it opens no window; on a same-mode resync this is the live
+//     list, and survivor dedup means a rule present before and after is
+//     never touched.
+//  2. The mode is flipped only once the map it will read is fully correct.
+//     (Without this order, e.g. allowlist->denylist would consult a
+//     still-empty deny map and fail OPEN until the deny rules landed.)
+//  3. The other list is reconciled last — inert under the NEW mode, so its
+//     churn (e.g. stale allow entries that would otherwise sit live at a
+//     later flip back) is harmless.
+//
+// DNS-populated entries absent from the declared set stay in the filter
+// until their own DNS TTL lapses. Per-CIDR failures (e.g. map-full) are
+// aggregated, not aborting the rest of the reconcile.
+func (s *Server) ReconcileCIDRs(id string, mode apiv1.PolicyMode, allow, deny []parsedCIDR) error {
+	ebpfFilter, reg, err := s.filterAndRegistry(id)
+	if err != nil {
+		return err
+	}
+
+	// Which list does the new mode consult? Denylist reads denied_*;
+	// allowlist reads allowed_*; block-all/disabled read neither, so the
+	// order is arbitrary — allow-first, deterministically.
+	first, second := listAllow, listDeny
+	firstSet, secondSet := allow, deny
+	if mode == apiv1.PolicyMode_POLICY_MODE_DENYLIST {
+		first, second = listDeny, listAllow
+		firstSet, secondSet = deny, allow
+	}
+
+	firstErr := reg.reconcileCP(ebpfFilter, first, firstSet, s.now())
+	modeErr := s.SetFilterMode(id, mode)
+	secondErr := reg.reconcileCP(ebpfFilter, second, secondSet, s.now())
+	return errors.Join(firstErr, modeErr, secondErr)
 }
 
 // filterAndRegistry snapshots an attachment's filter and TTL registry under

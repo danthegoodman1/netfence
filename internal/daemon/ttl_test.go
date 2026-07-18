@@ -3,6 +3,7 @@ package daemon
 import (
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -200,9 +201,9 @@ func TestRemoveCidrPurgesRegistry(t *testing.T) {
 	assert.Empty(t, denied)
 }
 
-// TestBulkUpdatePurgesAndTracksTTLs: a bulk update's ClearRules purges stale
-// deadlines (rules rebuilt as permanent stay), and TTL'd entries in the bulk
-// payload are tracked and expire.
+// TestBulkUpdatePurgesAndTracksTTLs: a bulk update that re-declares a
+// previously TTL'd CIDR as permanent pins it (the stale deadline cannot
+// fire), while TTL'd entries in the bulk payload are tracked and expire.
 func TestBulkUpdatePurgesAndTracksTTLs(t *testing.T) {
 	server, _, id, ff, _ := newTestServerWithAttachment(t)
 	clk := newFakeClock()
@@ -563,4 +564,268 @@ func TestMapFullCountedSurfacedAndRecovers(t *testing.T) {
 	drops := server.attachments[id].ttls.mapFullCount()
 	server.mu.RUnlock()
 	assert.Equal(t, uint64(3), drops)
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2C: BulkUpdate reconciliation without transient windows.
+// ---------------------------------------------------------------------------
+
+// TestBulkUpdateNoWindowForSurvivingRules is the unit-level no-window proof:
+// across two consecutive bulk updates, a CIDR present in both the old and
+// new declared sets is NEVER passed to the filter's Remove — only genuinely
+// stale rules are removed, new ones added, and the mode changes in place
+// with zero ClearRules calls.
+func TestBulkUpdateNoWindowForSurvivingRules(t *testing.T) {
+	server, _, id, ff, _ := newTestServerWithAttachment(t)
+	c := NewControlPlaneClient("", server, zerolog.Nop(), nil, 0)
+
+	// Initial state via individual commands.
+	c.handleCommand(allowCidrCmd(id, "10.0.0.0/8", 0))
+	c.handleCommand(denyCidrCmd(id, "192.0.2.0/24", 0))
+
+	// Bulk 1: keeps both, adds a TTL'd allow, switches mode.
+	c.applyBulkUpdate(id, &apiv1.BulkUpdate{
+		Mode: apiv1.PolicyMode_POLICY_MODE_ALLOWLIST,
+		AllowCidrs: []*apiv1.CIDREntry{
+			{Cidr: "10.0.0.0/8"},
+			{Cidr: "198.51.100.0/24", Ttl: durationpb.New(5 * time.Second)},
+		},
+		DenyCidrs: []*apiv1.CIDREntry{{Cidr: "192.0.2.0/24"}},
+	})
+
+	mode, allowed, denied, clearCalls := ff.snapshot()
+	assert.Equal(t, filter.ModeAllowlist, mode)
+	assert.Zero(t, clearCalls)
+	assert.ElementsMatch(t, []string{"10.0.0.0/8", "198.51.100.0/24"}, allowed)
+	assert.Equal(t, []string{"192.0.2.0/24"}, denied)
+	removedAllowed, removedDenied := ff.removeCalls()
+	assert.Empty(t, removedAllowed, "no allow rule may be removed when all survive")
+	assert.Empty(t, removedDenied, "no deny rule may be removed when all survive")
+
+	// Bulk 2: drops the TTL'd allow and the deny, keeps 10.0.0.0/8.
+	c.applyBulkUpdate(id, &apiv1.BulkUpdate{
+		Mode:       apiv1.PolicyMode_POLICY_MODE_ALLOWLIST,
+		AllowCidrs: []*apiv1.CIDREntry{{Cidr: "10.0.0.0/8"}},
+	})
+
+	_, allowed, denied, clearCalls = ff.snapshot()
+	assert.Zero(t, clearCalls)
+	assert.Equal(t, []string{"10.0.0.0/8"}, allowed)
+	assert.Empty(t, denied)
+	removedAllowed, removedDenied = ff.removeCalls()
+	assert.Equal(t, []string{"198.51.100.0/24"}, removedAllowed, "only the dropped allow may be removed")
+	assert.Equal(t, []string{"192.0.2.0/24"}, removedDenied)
+	assert.NotContains(t, removedAllowed, "10.0.0.0/8", "surviving rule must never see a Remove")
+
+	// The survivor is permanent: no janitor sweep may ever take it.
+	clk := newFakeClock()
+	server.now = clk.Now
+	clk.Advance(1000 * time.Hour)
+	server.sweepExpiredTTLs(clk.Now())
+	_, allowed, _, _ = ff.snapshot()
+	assert.Equal(t, []string{"10.0.0.0/8"}, allowed)
+}
+
+// TestBulkUpdatePreservesDNSPopulatedIPs: a DNS-populated /32 absent from
+// the bulk's declared CP set is NOT removed by the resync — it stays in the
+// filter and only ages out later when its own DNS TTL lapses.
+func TestBulkUpdatePreservesDNSPopulatedIPs(t *testing.T) {
+	server, _, id, ff, dnsServer := newTestServerWithAttachment(t)
+	clk := newFakeClock()
+	server.now = clk.Now
+	c := NewControlPlaneClient("", server, zerolog.Nop(), nil, 0)
+
+	dnsServer.addIPToFilter("cached.example.com", net.ParseIP("203.0.113.5"), 32, 30) // floored to 60s
+
+	c.applyBulkUpdate(id, &apiv1.BulkUpdate{
+		Mode:       apiv1.PolicyMode_POLICY_MODE_ALLOWLIST,
+		AllowCidrs: []*apiv1.CIDREntry{{Cidr: "198.51.100.0/24"}},
+	})
+
+	_, allowed, _, _ := ff.snapshot()
+	assert.ElementsMatch(t, []string{"203.0.113.5/32", "198.51.100.0/24"}, allowed,
+		"DNS-populated IP must survive the bulk update")
+	removedAllowed, _ := ff.removeCalls()
+	assert.Empty(t, removedAllowed)
+
+	// It ages out by its own DNS TTL, not the resync.
+	clk.Advance(60 * time.Second)
+	server.sweepExpiredTTLs(clk.Now())
+	_, allowed, _, _ = ff.snapshot()
+	assert.Equal(t, []string{"198.51.100.0/24"}, allowed)
+}
+
+// TestBulkUpdateClearsCPSourceButDNSKeepsEntry: when a CIDR held by BOTH a
+// TTL'd CP rule and a DNS resolution is dropped from the bulk's declared
+// set, only the CP source is cleared — the DNS source keeps the entry in
+// the filter, and it then expires at the DNS deadline, NOT the (longer) CP
+// deadline the bulk revoked.
+func TestBulkUpdateClearsCPSourceButDNSKeepsEntry(t *testing.T) {
+	server, _, id, ff, dnsServer := newTestServerWithAttachment(t)
+	clk := newFakeClock()
+	server.now = clk.Now
+	c := NewControlPlaneClient("", server, zerolog.Nop(), nil, 0)
+
+	c.handleCommand(allowCidrCmd(id, "203.0.113.6/32", 10*time.Minute))
+	dnsServer.addIPToFilter("both.example.com", net.ParseIP("203.0.113.6"), 32, 30) // DNS deadline: 60s floor
+
+	// Bulk drops the CP rule for it.
+	c.applyBulkUpdate(id, &apiv1.BulkUpdate{
+		Mode:       apiv1.PolicyMode_POLICY_MODE_ALLOWLIST,
+		AllowCidrs: []*apiv1.CIDREntry{{Cidr: "198.51.100.0/24"}},
+	})
+
+	_, allowed, _, _ := ff.snapshot()
+	assert.Contains(t, allowed, "203.0.113.6/32", "live DNS source must keep the entry through the bulk")
+	removedAllowed, _ := ff.removeCalls()
+	assert.Empty(t, removedAllowed)
+
+	// The revoked CP deadline (10min) must NOT keep it alive: it expires at
+	// the DNS deadline (60s).
+	clk.Advance(60 * time.Second)
+	server.sweepExpiredTTLs(clk.Now())
+	_, allowed, _, _ = ff.snapshot()
+	assert.Equal(t, []string{"198.51.100.0/24"}, allowed,
+		"entry must expire at the DNS deadline once the bulk cleared the CP source")
+	// Only the bulk's permanent entry remains, and it is pinned: nothing
+	// is pending expiry.
+	assert.Zero(t, registryLen(t, server, id))
+}
+
+// TestBulkUpdateConcurrentWithDNSAdds hammers bulk reconciles against
+// concurrent DNS sink adds and janitor sweeps so the race detector can vet
+// the reconcile locking, and asserts the invariant that a CIDR declared in
+// every bulk is present at the end.
+func TestBulkUpdateConcurrentWithDNSAdds(t *testing.T) {
+	server, _, id, ff, dnsServer := newTestServerWithAttachment(t)
+	clk := newFakeClock()
+	server.now = clk.Now
+	c := NewControlPlaneClient("", server, zerolog.Nop(), nil, 0)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 100; i++ {
+			dnsServer.addIPToFilter("churn.example.com", net.ParseIP("203.0.113.7"), 32, 30)
+			clk.Advance(30 * time.Second)
+			server.sweepExpiredTTLs(clk.Now())
+		}
+	}()
+
+	for i := 0; i < 100; i++ {
+		c.applyBulkUpdate(id, &apiv1.BulkUpdate{
+			Mode: apiv1.PolicyMode_POLICY_MODE_ALLOWLIST,
+			AllowCidrs: []*apiv1.CIDREntry{
+				{Cidr: "10.0.0.0/8"},
+				{Cidr: "198.51.100.0/24", Ttl: durationpb.New(time.Hour)},
+			},
+		})
+	}
+	<-done
+
+	// The permanent survivor must be present and must never have been
+	// removed by any interleaving.
+	_, allowed, _, _ := ff.snapshot()
+	assert.Contains(t, allowed, "10.0.0.0/8")
+	removedAllowed, _ := ff.removeCalls()
+	assert.NotContains(t, removedAllowed, "10.0.0.0/8")
+}
+
+// indexOfEvent returns the index of the first occurrence of event in events,
+// failing the test if absent.
+func indexOfEvent(t *testing.T, events []string, event string) int {
+	t.Helper()
+	for i, ev := range events {
+		if ev == event {
+			return i
+		}
+	}
+	t.Fatalf("event %q not found in %v", event, events)
+	return -1
+}
+
+// TestBulkUpdateModeFlipOrdering proves the window-free ORDERING of a bulk
+// apply via the fakeFilter's sequenced call log: the list the NEW mode
+// consults is fully reconciled (adds AND removes) BEFORE the SetMode lands,
+// and the other list only after. Without that order an allowlist->denylist
+// flip consults a still-stale deny map and fails OPEN until the deny rules
+// land (and denylist->allowlist fails open via stale inert allow entries).
+func TestBulkUpdateModeFlipOrdering(t *testing.T) {
+	server, _, id, ff, _ := newTestServerWithAttachment(t)
+	c := NewControlPlaneClient("", server, zerolog.Nop(), nil, 0)
+
+	// Establish allowlist state; the deny rule is inert under allowlist.
+	c.applyBulkUpdate(id, &apiv1.BulkUpdate{
+		Mode:       apiv1.PolicyMode_POLICY_MODE_ALLOWLIST,
+		AllowCidrs: []*apiv1.CIDREntry{{Cidr: "10.0.0.0/8"}, {Cidr: "172.16.0.0/12"}},
+		DenyCidrs:  []*apiv1.CIDREntry{{Cidr: "192.0.2.0/24"}},
+	})
+
+	t.Run("allowlist_to_denylist", func(t *testing.T) {
+		before := len(ff.eventLog())
+		c.applyBulkUpdate(id, &apiv1.BulkUpdate{
+			Mode:       apiv1.PolicyMode_POLICY_MODE_DENYLIST,
+			AllowCidrs: []*apiv1.CIDREntry{{Cidr: "10.0.0.0/8"}},      // drops 172.16.0.0/12
+			DenyCidrs:  []*apiv1.CIDREntry{{Cidr: "198.51.100.0/24"}}, // adds this, drops 192.0.2.0/24
+		})
+		events := ff.eventLog()[before:]
+		modeIdx := indexOfEvent(t, events, "set-mode "+filter.ModeDenylist.String())
+		for i, ev := range events {
+			switch {
+			case strings.HasPrefix(ev, "deny ") || strings.HasPrefix(ev, "remove-deny "):
+				assert.Less(t, i, modeIdx, "deny-list op %q must precede the flip to denylist (log: %v)", ev, events)
+			case strings.HasPrefix(ev, "allow ") || strings.HasPrefix(ev, "remove-allow "):
+				assert.Greater(t, i, modeIdx, "allow-list op %q must follow the flip to denylist (log: %v)", ev, events)
+			}
+		}
+		// The deny map was corrected in full, and the surviving allow rule
+		// was never removed.
+		assert.Contains(t, events, "deny 198.51.100.0/24")
+		assert.Contains(t, events, "remove-deny 192.0.2.0/24")
+		assert.Contains(t, events, "remove-allow 172.16.0.0/12")
+		assert.NotContains(t, events, "remove-allow 10.0.0.0/8")
+	})
+
+	t.Run("denylist_to_allowlist", func(t *testing.T) {
+		before := len(ff.eventLog())
+		c.applyBulkUpdate(id, &apiv1.BulkUpdate{
+			Mode:       apiv1.PolicyMode_POLICY_MODE_ALLOWLIST,
+			AllowCidrs: []*apiv1.CIDREntry{{Cidr: "10.0.0.0/8"}, {Cidr: "203.0.113.0/24"}},
+			// deny set emptied: drops 198.51.100.0/24
+		})
+		events := ff.eventLog()[before:]
+		modeIdx := indexOfEvent(t, events, "set-mode "+filter.ModeAllowlist.String())
+		for i, ev := range events {
+			switch {
+			case strings.HasPrefix(ev, "allow ") || strings.HasPrefix(ev, "remove-allow "):
+				assert.Less(t, i, modeIdx, "allow-list op %q must precede the flip to allowlist (log: %v)", ev, events)
+			case strings.HasPrefix(ev, "deny ") || strings.HasPrefix(ev, "remove-deny "):
+				assert.Greater(t, i, modeIdx, "deny-list op %q must follow the flip to allowlist (log: %v)", ev, events)
+			}
+		}
+		assert.Contains(t, events, "allow 203.0.113.0/24")
+		assert.Contains(t, events, "remove-deny 198.51.100.0/24")
+		assert.NotContains(t, events, "remove-allow 10.0.0.0/8")
+	})
+
+	t.Run("same_mode_resync", func(t *testing.T) {
+		before := len(ff.eventLog())
+		c.applyBulkUpdate(id, &apiv1.BulkUpdate{
+			Mode:       apiv1.PolicyMode_POLICY_MODE_ALLOWLIST,
+			AllowCidrs: []*apiv1.CIDREntry{{Cidr: "10.0.0.0/8"}, {Cidr: "198.51.100.0/24"}}, // drops 203.0.113.0/24
+		})
+		events := ff.eventLog()[before:]
+		modeIdx := indexOfEvent(t, events, "set-mode "+filter.ModeAllowlist.String())
+		for i, ev := range events {
+			if strings.HasPrefix(ev, "allow ") || strings.HasPrefix(ev, "remove-allow ") {
+				assert.Less(t, i, modeIdx, "live-list op %q must precede the (no-op) mode write (log: %v)", ev, events)
+			}
+		}
+		// Survivor never removed; the live list is reconciled with survivor
+		// dedup so there is no window on the same-mode path either.
+		assert.Contains(t, events, "allow 198.51.100.0/24")
+		assert.Contains(t, events, "remove-allow 203.0.113.0/24")
+		assert.NotContains(t, events, "remove-allow 10.0.0.0/8")
+		assert.NotContains(t, events, "clear")
+	})
 }

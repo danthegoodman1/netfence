@@ -60,18 +60,22 @@ func TestApplyBulkUpdateReplacesExistingState(t *testing.T) {
 
 	mode, allowed, denied, clearCalls := ff.snapshot()
 	assert.Equal(t, filter.ModeDenylist, mode)
-	assert.Equal(t, 1, clearCalls)
-	assert.Equal(t, []string{"198.51.100.0/24"}, allowed)
+	assert.Zero(t, clearCalls, "bulk update must reconcile deltas, never wipe the filter")
+	// The stale CP rule is removed, the new one added — and the
+	// DNS-populated IP SURVIVES the resync (it ages out via its own DNS
+	// TTL; clients still hold it in resolver caches).
+	assert.ElementsMatch(t, []string{"198.51.100.0/24", "203.0.113.200/32"}, allowed)
 	assert.Equal(t, []string{"2001:db8::/32"}, denied)
+	removedAllowed, removedDenied := ff.removeCalls()
+	assert.Equal(t, []string{"10.0.0.0/8"}, removedAllowed)
+	assert.Equal(t, []string{"192.0.2.0/24"}, removedDenied)
 
-	// The DNS-populated IP was wiped with the rest of the filter state (the
-	// allowed list above is exactly the bulk payload) and its TTL tracking
-	// went with it: nothing is pending expiry after a bulk of permanent
-	// entries, so the janitor cannot later remove a rebuilt rule.
+	// Exactly one entry is pending expiry afterwards: the surviving
+	// DNS-populated IP. The bulk's permanent entries are pinned.
 	server.mu.RLock()
 	reg := server.attachments[id].ttls
 	server.mu.RUnlock()
-	assert.Zero(t, reg.pendingLen())
+	assert.Equal(t, 1, reg.pendingLen())
 
 	dnsServer.mu.RLock()
 	defer dnsServer.mu.RUnlock()

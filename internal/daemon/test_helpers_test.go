@@ -26,6 +26,17 @@ type fakeFilter struct {
 	setModeCalls int
 	allowCalls   int
 	allowErr     error // when set, AllowIP fails with this error
+	// removedAllowed/removedDenied record every Remove call (even for CIDRs
+	// not present, mirroring the real filter's idempotent removes), so tests
+	// can prove a surviving rule was NEVER removed during a transition.
+	removedAllowed []string
+	removedDenied  []string
+	// events is a single sequenced log of every mutating filter call, in
+	// call order ("allow <cidr>", "deny <cidr>", "remove-allow <cidr>",
+	// "remove-deny <cidr>", "set-mode <mode>", "clear"), so tests can prove
+	// ORDERING invariants — e.g. that a mode flip's target list is fully
+	// reconciled before the SetMode lands.
+	events []string
 }
 
 func (f *fakeFilter) SetMode(mode filter.PolicyMode) error {
@@ -33,6 +44,7 @@ func (f *fakeFilter) SetMode(mode filter.PolicyMode) error {
 	defer f.mu.Unlock()
 	f.mode = mode
 	f.setModeCalls++
+	f.events = append(f.events, "set-mode "+mode.String())
 	return nil
 }
 
@@ -40,6 +52,7 @@ func (f *fakeFilter) AllowIP(cidr *net.IPNet) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.allowCalls++
+	f.events = append(f.events, "allow "+cidr.String())
 	if f.allowErr != nil {
 		return f.allowErr
 	}
@@ -63,6 +76,7 @@ func (f *fakeFilter) allowCallCount() int {
 func (f *fakeFilter) DenyIP(cidr *net.IPNet) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.events = append(f.events, "deny "+cidr.String())
 	f.denied = appendUnique(f.denied, cidr.String())
 	return nil
 }
@@ -70,6 +84,8 @@ func (f *fakeFilter) DenyIP(cidr *net.IPNet) error {
 func (f *fakeFilter) RemoveAllowedIP(cidr *net.IPNet) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.events = append(f.events, "remove-allow "+cidr.String())
+	f.removedAllowed = append(f.removedAllowed, cidr.String())
 	f.allowed = removeString(f.allowed, cidr.String())
 	return nil
 }
@@ -77,13 +93,29 @@ func (f *fakeFilter) RemoveAllowedIP(cidr *net.IPNet) error {
 func (f *fakeFilter) RemoveDeniedIP(cidr *net.IPNet) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.events = append(f.events, "remove-deny "+cidr.String())
+	f.removedDenied = append(f.removedDenied, cidr.String())
 	f.denied = removeString(f.denied, cidr.String())
 	return nil
+}
+
+func (f *fakeFilter) removeCalls() (removedAllowed, removedDenied []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.removedAllowed...), append([]string(nil), f.removedDenied...)
+}
+
+// eventLog returns the sequenced mutating-call log (see the events field).
+func (f *fakeFilter) eventLog() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.events...)
 }
 
 func (f *fakeFilter) ClearRules() error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.events = append(f.events, "clear")
 	f.allowed = nil
 	f.denied = nil
 	f.clearCalls++
