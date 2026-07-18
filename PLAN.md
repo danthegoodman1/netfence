@@ -83,11 +83,11 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 2A: TTL registry + janitor; honor `CIDREntry.ttl` everywhere it arrives | Missing: implementation + expiry test (feature currently advertised but ignored). |
-| Incomplete | Work | 2B: DNS-entry expiry, ipCache eviction, map-full stat, configurable max_entries | Missing: implementation; capacity test. |
-| Incomplete | Work | 2C: diff-apply BulkUpdate preserving unexpired DNS entries | Missing: implementation + no-window loop test. |
-| Incomplete | Work | 2D: command ack/error event in proto + daemon + README CP contract | Missing: proto change + plumbing. |
-| Incomplete | Gate | Expiry, no-window, and capacity tests green in Docker gate | Missing: all three tests. |
+| Complete | Work | 2A: TTL registry + janitor; honor `CIDREntry.ttl` everywhere it arrives | Commit `2bf56a6`: per-attachment ttlRegistry + daemon-wide janitor; TTL wired at all four entry points; leaf-lock makes re-add/expiry atomic; fake-clock unit tests + -race concurrency test. |
+| Complete | Work | 2B: DNS-entry expiry, ipCache eviction, map-full stat, configurable max_entries | Commit `22e81aa`: DNSFilterSink routes DNS IPs through the registry; ipCache deleted (inFilter dedup); max-deadline/permanent-pin aliasing; `AttachmentStats.map_full_drops`; `filter.max_rule_entries`; real-ENOSPC + traffic-expiry Docker tests. |
+| Complete | Work | 2C: diff-apply BulkUpdate preserving unexpired DNS entries | Commit `165e89b`: two-source (CP/DNS) registry; reconcile with deltas (survivors never removed); window-free mode ordering (reconcile new-mode list → SetMode → other list, closing the allowlist→denylist fail-open); 80-bulk traffic test + ordered-call-log test, both neg-verified. |
+| Complete | Work | 2D: command ack/error event in proto + daemon + README CP contract | Commit `c7d59d8`: opt-in `ControlCommand.command_id` + `CommandResult` DaemonEvent; handleCommand reports true outcomes (partial-bulk = failure); best-effort non-blocking; unit + e2e tests. |
+| Complete | Gate | Expiry, no-window, and capacity tests green in Docker gate | `TestDaemonCIDRTTLExpiryTraffic`, `TestBulkUpdateNoTransientWindowTraffic`, `TestDaemonMapFullSurfacedAndRecovers` all green under `make test-docker` + `make check-docker` (-race). |
 
 ## Phase 3: Daemon lifecycle, state, and watcher resilience
 
@@ -183,6 +183,7 @@ Status ledger:
 | Incomplete | Work | 5C: honor `DnsConfig.upstream_servers` | Missing: plumbing (currently ignored proto field). |
 | Incomplete | Work | 5D: HTTPS/SVCB hint policy | Missing: decision + implementation. |
 | Incomplete | Work | 5E: split error vs blocked counters | Missing: implementation. |
+| Incomplete | Work | 5F: evict a domain's resolved IPs promptly when it is de-allowed (ReplaceDNSRules / domain removal) | Deferred from Phase 2 (2B reviewer F4): today a removed domain's IPs age out by TTL rather than being evicted — strictly better than pre-2B (never expired), but prompt eviction needs a domain→IPs reverse index. Missing: reverse index + eviction + test. |
 | Incomplete | Gate | Bootstrap/TCP/upstream tests green in Docker gate | Missing: tests. |
 
 ## Phase 6: Local API and CLI completeness
