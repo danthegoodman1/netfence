@@ -39,6 +39,9 @@ message DaemonEvent {
     Unsubscribed unsubscribed = 3;
     // Periodic heartbeat with optional stats
     Heartbeat heartbeat = 4;
+    // Outcome of a ControlCommand that carried a command_id (see
+    // ControlCommand.command_id / CommandResult).
+    CommandResult command_result = 5;
   }
 }
 
@@ -164,6 +167,33 @@ message ControlCommand {
     // Acknowledge subscription with initial config (sent after receiving Subscribed)
     SubscribedAck subscribed_ack = 12;
   }
+
+  // Optional control-plane-chosen correlation id for this command. When
+  // non-empty, the daemon reports the command's outcome with a
+  // CommandResult DaemonEvent echoing this value; when empty (the
+  // default), no result is emitted — fully backward-compatible opt-in.
+  // SubscribedAck is excluded (it is itself the ack of a daemon event and
+  // is answered by the Subscribed handshake), as is SyncAck.
+  string command_id = 13;
+}
+
+// CommandResult reports the outcome of a ControlCommand that carried a
+// non-empty command_id. success is true only when the command fully
+// applied (parse + filter + bookkeeping); a partially-applied command
+// (e.g. one CIDR of a BulkUpdate failing) reports success=false with the
+// aggregated error. Results are best-effort: a saturated event channel
+// drops them (with a daemon-side warning) rather than blocking command
+// processing, so the control plane must treat a missing result as
+// unknown, not failed.
+message CommandResult {
+  // Echo of ControlCommand.command_id
+  string command_id = 1;
+  // The attachment the command targeted (echo of ControlCommand.id)
+  string id = 2;
+  // Whether the command fully applied
+  bool success = 3;
+  // Error detail when success is false
+  string error = 4;
 }
 
 // SyncAck acknowledges that the control plane has processed the SyncRequest.

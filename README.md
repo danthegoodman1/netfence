@@ -204,6 +204,7 @@ Implement `ControlPlane.Connect` RPC - a bidirectional stream:
 - `Subscribed` when new attachments are added
 - `Unsubscribed` when attachments are removed
 - `Heartbeat` with stats
+- `CommandResult{command_id, id, success, error}` — outcome of any command you sent with a non-empty `command_id` (opt-in correlation nonce on `ControlCommand`; commands without one produce no result). `success` is true only if the command fully applied — a partially-applied `BulkUpdate` reports failure with the aggregated error. Results are best-effort: treat a missing result as unknown, not failed.
 
 **Send to daemon:**
 - `SyncAck` after receiving SyncRequest

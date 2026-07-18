@@ -2,6 +2,8 @@ package daemon
 
 import (
 	"context"
+	"fmt"
+	"syscall"
 	"testing"
 	"time"
 
@@ -178,4 +180,146 @@ func TestMakeProxyFuncRequiresConnectedState(t *testing.T) {
 	assert.True(t, decision.Allow)
 	assert.Equal(t, uint32(30), decision.TTLSeconds)
 	assert.Equal(t, 1, fakeClient.queries)
+}
+
+// drainCommandResults empties sendCh and returns any CommandResult events.
+func drainCommandResults(t *testing.T, c *ControlPlaneClient) []*apiv1.CommandResult {
+	t.Helper()
+	var results []*apiv1.CommandResult
+	for {
+		select {
+		case out := <-c.sendCh:
+			if r, ok := out.event.Event.(*apiv1.DaemonEvent_CommandResult); ok {
+				results = append(results, r.CommandResult)
+			}
+		default:
+			return results
+		}
+	}
+}
+
+// TestHandleCommandEmitsCommandResults covers 2D: commands carrying a
+// command_id get a CommandResult echoing it (success only when the command
+// fully applied); commands without one produce no result at all.
+func TestHandleCommandEmitsCommandResults(t *testing.T) {
+	server, _, id, ff, _ := newTestServerWithAttachment(t)
+	c := NewControlPlaneClient("", server, zerolog.Nop(), nil, 0)
+
+	t.Run("valid_command_reports_success", func(t *testing.T) {
+		c.handleCommand(&apiv1.ControlCommand{
+			Id:        id,
+			CommandId: "cmd-ok",
+			Command:   &apiv1.ControlCommand_AllowCidr{AllowCidr: &apiv1.CIDREntry{Cidr: "10.0.0.0/8"}},
+		})
+		results := drainCommandResults(t, c)
+		require.Len(t, results, 1)
+		assert.Equal(t, "cmd-ok", results[0].CommandId)
+		assert.Equal(t, id, results[0].Id)
+		assert.True(t, results[0].Success)
+		assert.Empty(t, results[0].Error)
+	})
+
+	t.Run("bad_cidr_reports_failure", func(t *testing.T) {
+		c.handleCommand(&apiv1.ControlCommand{
+			Id:        id,
+			CommandId: "cmd-bad-cidr",
+			Command:   &apiv1.ControlCommand_AllowCidr{AllowCidr: &apiv1.CIDREntry{Cidr: "not-a-cidr"}},
+		})
+		results := drainCommandResults(t, c)
+		require.Len(t, results, 1)
+		assert.Equal(t, "cmd-bad-cidr", results[0].CommandId)
+		assert.Equal(t, id, results[0].Id)
+		assert.False(t, results[0].Success)
+		assert.Contains(t, results[0].Error, "parsing CIDR")
+	})
+
+	t.Run("no_command_id_no_result", func(t *testing.T) {
+		c.handleCommand(&apiv1.ControlCommand{
+			Id:      id,
+			Command: &apiv1.ControlCommand_AllowCidr{AllowCidr: &apiv1.CIDREntry{Cidr: "10.1.0.0/16"}},
+		})
+		// Failing command without a command_id must be silent too.
+		c.handleCommand(&apiv1.ControlCommand{
+			Id:      id,
+			Command: &apiv1.ControlCommand_AllowCidr{AllowCidr: &apiv1.CIDREntry{Cidr: "also-not-a-cidr"}},
+		})
+		assert.Empty(t, drainCommandResults(t, c))
+	})
+
+	t.Run("bulk_update_parse_failure_reports_failure", func(t *testing.T) {
+		c.handleCommand(&apiv1.ControlCommand{
+			Id:        id,
+			CommandId: "cmd-bulk-bad",
+			Command: &apiv1.ControlCommand_BulkUpdate{BulkUpdate: &apiv1.BulkUpdate{
+				Mode:       apiv1.PolicyMode_POLICY_MODE_ALLOWLIST,
+				AllowCidrs: []*apiv1.CIDREntry{{Cidr: "198.51.100.0/24"}, {Cidr: "bogus"}},
+			}},
+		})
+		results := drainCommandResults(t, c)
+		require.Len(t, results, 1)
+		assert.False(t, results[0].Success)
+		assert.Contains(t, results[0].Error, "parsing allow CIDR")
+	})
+
+	t.Run("bulk_update_success", func(t *testing.T) {
+		c.handleCommand(&apiv1.ControlCommand{
+			Id:        id,
+			CommandId: "cmd-bulk-ok",
+			Command: &apiv1.ControlCommand_BulkUpdate{BulkUpdate: &apiv1.BulkUpdate{
+				Mode:       apiv1.PolicyMode_POLICY_MODE_ALLOWLIST,
+				AllowCidrs: []*apiv1.CIDREntry{{Cidr: "198.51.100.0/24"}},
+			}},
+		})
+		results := drainCommandResults(t, c)
+		require.Len(t, results, 1)
+		assert.Equal(t, "cmd-bulk-ok", results[0].CommandId)
+		assert.True(t, results[0].Success)
+	})
+
+	t.Run("partially_applied_bulk_reports_failure", func(t *testing.T) {
+		// A filter-level failure mid-bulk (map full) must yield failure even
+		// though the rest of the update applied.
+		ff.setAllowErr(fmt.Errorf("updating allowed_ipv4: %w", syscall.ENOSPC))
+		c.handleCommand(&apiv1.ControlCommand{
+			Id:        id,
+			CommandId: "cmd-bulk-partial",
+			Command: &apiv1.ControlCommand_BulkUpdate{BulkUpdate: &apiv1.BulkUpdate{
+				Mode:       apiv1.PolicyMode_POLICY_MODE_ALLOWLIST,
+				AllowCidrs: []*apiv1.CIDREntry{{Cidr: "203.0.113.0/24"}},
+			}},
+		})
+		ff.setAllowErr(nil)
+		results := drainCommandResults(t, c)
+		require.Len(t, results, 1)
+		assert.False(t, results[0].Success)
+		assert.Contains(t, results[0].Error, "reconciling CIDRs")
+	})
+
+	t.Run("unknown_attachment_reports_failure", func(t *testing.T) {
+		c.handleCommand(&apiv1.ControlCommand{
+			Id:        "no-such-attachment",
+			CommandId: "cmd-missing",
+			Command:   &apiv1.ControlCommand_SetMode{SetMode: &apiv1.SetMode{Mode: apiv1.PolicyMode_POLICY_MODE_ALLOWLIST}},
+		})
+		results := drainCommandResults(t, c)
+		require.Len(t, results, 1)
+		assert.Equal(t, "cmd-missing", results[0].CommandId)
+		assert.Equal(t, "no-such-attachment", results[0].Id)
+		assert.False(t, results[0].Success)
+		assert.Contains(t, results[0].Error, "attachment not found")
+	})
+
+	t.Run("acks_never_produce_results", func(t *testing.T) {
+		c.handleCommand(&apiv1.ControlCommand{
+			Id:        id,
+			CommandId: "cmd-sync-ack",
+			Command:   &apiv1.ControlCommand_SyncAck{SyncAck: &apiv1.SyncAck{}},
+		})
+		c.handleCommand(&apiv1.ControlCommand{
+			Id:        id,
+			CommandId: "cmd-subscribed-ack",
+			Command:   &apiv1.ControlCommand_SubscribedAck{SubscribedAck: &apiv1.SubscribedAck{Mode: apiv1.PolicyMode_POLICY_MODE_DISABLED}},
+		})
+		assert.Empty(t, drainCommandResults(t, c))
+	})
 }

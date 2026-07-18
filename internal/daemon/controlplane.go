@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -233,79 +234,100 @@ func (c *ControlPlaneClient) heartbeatLoop(ctx context.Context) {
 	}
 }
 
+// handleCommand applies one control-plane command. Every applying case
+// yields an outcome (nil = fully applied); when the command carried a
+// non-empty command_id, that outcome is reported back as a CommandResult
+// event so the control plane can converge on truth instead of assuming
+// success. SyncAck and SubscribedAck are pure acks of daemon events and
+// never produce results (SubscribedAck already has its own handshake via
+// SubscribeAndWait).
 func (c *ControlPlaneClient) handleCommand(cmd *apiv1.ControlCommand) {
+	var err error
+	reportResult := true
+
 	switch v := cmd.Command.(type) {
 	case *apiv1.ControlCommand_SyncAck:
 		c.logger.Debug().Msg("received sync ack")
+		reportResult = false
 
 	case *apiv1.ControlCommand_SetMode:
 		c.logger.Debug().Str("id", cmd.Id).Str("mode", v.SetMode.Mode.String()).Msg("received set mode")
-		if err := c.server.SetFilterMode(cmd.Id, v.SetMode.Mode); err != nil {
+		if err = c.server.SetFilterMode(cmd.Id, v.SetMode.Mode); err != nil {
 			c.logger.Error().Err(err).Str("id", cmd.Id).Msg("failed to set filter mode")
+			err = fmt.Errorf("setting filter mode: %w", err)
 		}
 
 	case *apiv1.ControlCommand_AllowCidr:
 		c.logger.Debug().Str("id", cmd.Id).Str("cidr", v.AllowCidr.Cidr).Msg("received allow cidr")
-		cidr, err := filter.ParseCIDR(v.AllowCidr.Cidr)
-		if err != nil {
-			c.logger.Error().Err(err).Str("id", cmd.Id).Str("cidr", v.AllowCidr.Cidr).Msg("failed to parse CIDR")
-			return
-		}
-		if err := c.server.AllowCIDR(cmd.Id, cidr, v.AllowCidr.GetTtl().AsDuration()); err != nil {
+		cidr, parseErr := filter.ParseCIDR(v.AllowCidr.Cidr)
+		if parseErr != nil {
+			c.logger.Error().Err(parseErr).Str("id", cmd.Id).Str("cidr", v.AllowCidr.Cidr).Msg("failed to parse CIDR")
+			err = fmt.Errorf("parsing CIDR %q: %w", v.AllowCidr.Cidr, parseErr)
+		} else if err = c.server.AllowCIDR(cmd.Id, cidr, v.AllowCidr.GetTtl().AsDuration()); err != nil {
 			c.logger.Error().Err(err).Str("id", cmd.Id).Msg("failed to allow CIDR")
+			err = fmt.Errorf("allowing CIDR %q: %w", v.AllowCidr.Cidr, err)
 		}
 
 	case *apiv1.ControlCommand_DenyCidr:
 		c.logger.Debug().Str("id", cmd.Id).Str("cidr", v.DenyCidr.Cidr).Msg("received deny cidr")
-		cidr, err := filter.ParseCIDR(v.DenyCidr.Cidr)
-		if err != nil {
-			c.logger.Error().Err(err).Str("id", cmd.Id).Str("cidr", v.DenyCidr.Cidr).Msg("failed to parse CIDR")
-			return
-		}
-		if err := c.server.DenyCIDR(cmd.Id, cidr, v.DenyCidr.GetTtl().AsDuration()); err != nil {
+		cidr, parseErr := filter.ParseCIDR(v.DenyCidr.Cidr)
+		if parseErr != nil {
+			c.logger.Error().Err(parseErr).Str("id", cmd.Id).Str("cidr", v.DenyCidr.Cidr).Msg("failed to parse CIDR")
+			err = fmt.Errorf("parsing CIDR %q: %w", v.DenyCidr.Cidr, parseErr)
+		} else if err = c.server.DenyCIDR(cmd.Id, cidr, v.DenyCidr.GetTtl().AsDuration()); err != nil {
 			c.logger.Error().Err(err).Str("id", cmd.Id).Msg("failed to deny CIDR")
+			err = fmt.Errorf("denying CIDR %q: %w", v.DenyCidr.Cidr, err)
 		}
 
 	case *apiv1.ControlCommand_RemoveCidr:
 		c.logger.Debug().Str("id", cmd.Id).Str("cidr", v.RemoveCidr).Msg("received remove cidr")
-		cidr, err := filter.ParseCIDR(v.RemoveCidr)
-		if err != nil {
-			c.logger.Error().Err(err).Str("id", cmd.Id).Str("cidr", v.RemoveCidr).Msg("failed to parse CIDR")
-			return
+		cidr, parseErr := filter.ParseCIDR(v.RemoveCidr)
+		if parseErr != nil {
+			c.logger.Error().Err(parseErr).Str("id", cmd.Id).Str("cidr", v.RemoveCidr).Msg("failed to parse CIDR")
+			err = fmt.Errorf("parsing CIDR %q: %w", v.RemoveCidr, parseErr)
+			break
 		}
-		if err := c.server.RemoveAllowedCIDR(cmd.Id, cidr); err != nil {
-			c.logger.Warn().Err(err).Str("id", cmd.Id).Msg("failed to remove CIDR from allowlist")
+		var allowErr, denyErr error
+		if allowErr = c.server.RemoveAllowedCIDR(cmd.Id, cidr); allowErr != nil {
+			c.logger.Warn().Err(allowErr).Str("id", cmd.Id).Msg("failed to remove CIDR from allowlist")
+			allowErr = fmt.Errorf("removing from allowlist: %w", allowErr)
 		}
-		if err := c.server.RemoveDeniedCIDR(cmd.Id, cidr); err != nil {
-			c.logger.Warn().Err(err).Str("id", cmd.Id).Msg("failed to remove CIDR from denylist")
+		if denyErr = c.server.RemoveDeniedCIDR(cmd.Id, cidr); denyErr != nil {
+			c.logger.Warn().Err(denyErr).Str("id", cmd.Id).Msg("failed to remove CIDR from denylist")
+			denyErr = fmt.Errorf("removing from denylist: %w", denyErr)
 		}
+		err = errors.Join(allowErr, denyErr)
 
 	case *apiv1.ControlCommand_BulkUpdate:
 		c.logger.Debug().Str("id", cmd.Id).Msg("received bulk update")
-		c.applyBulkUpdate(cmd.Id, v.BulkUpdate)
+		err = c.applyBulkUpdate(cmd.Id, v.BulkUpdate)
 
 	case *apiv1.ControlCommand_SetDnsMode:
 		c.logger.Debug().Str("id", cmd.Id).Str("mode", v.SetDnsMode.Mode.String()).Msg("received set dns mode")
-		if err := c.server.SetDnsMode(cmd.Id, v.SetDnsMode.Mode); err != nil {
+		if err = c.server.SetDnsMode(cmd.Id, v.SetDnsMode.Mode); err != nil {
 			c.logger.Error().Err(err).Str("id", cmd.Id).Msg("failed to set dns mode")
+			err = fmt.Errorf("setting DNS mode: %w", err)
 		}
 
 	case *apiv1.ControlCommand_AllowDomain:
 		c.logger.Debug().Str("id", cmd.Id).Str("domain", v.AllowDomain.Domain).Msg("received allow domain")
-		if err := c.server.AllowDomain(cmd.Id, v.AllowDomain.Domain, v.AllowDomain.IncludeSubdomains); err != nil {
+		if err = c.server.AllowDomain(cmd.Id, v.AllowDomain.Domain, v.AllowDomain.IncludeSubdomains); err != nil {
 			c.logger.Error().Err(err).Str("id", cmd.Id).Msg("failed to allow domain")
+			err = fmt.Errorf("allowing domain %q: %w", v.AllowDomain.Domain, err)
 		}
 
 	case *apiv1.ControlCommand_DenyDomain:
 		c.logger.Debug().Str("id", cmd.Id).Str("domain", v.DenyDomain.Domain).Msg("received deny domain")
-		if err := c.server.DenyDomain(cmd.Id, v.DenyDomain.Domain, v.DenyDomain.IncludeSubdomains); err != nil {
+		if err = c.server.DenyDomain(cmd.Id, v.DenyDomain.Domain, v.DenyDomain.IncludeSubdomains); err != nil {
 			c.logger.Error().Err(err).Str("id", cmd.Id).Msg("failed to deny domain")
+			err = fmt.Errorf("denying domain %q: %w", v.DenyDomain.Domain, err)
 		}
 
 	case *apiv1.ControlCommand_RemoveDomain:
 		c.logger.Debug().Str("id", cmd.Id).Str("domain", v.RemoveDomain).Msg("received remove domain")
-		if err := c.server.RemoveDomain(cmd.Id, v.RemoveDomain); err != nil {
+		if err = c.server.RemoveDomain(cmd.Id, v.RemoveDomain); err != nil {
 			c.logger.Error().Err(err).Str("id", cmd.Id).Msg("failed to remove domain")
+			err = fmt.Errorf("removing domain %q: %w", v.RemoveDomain, err)
 		}
 
 	case *apiv1.ControlCommand_SubscribedAck:
@@ -320,9 +342,42 @@ func (c *ControlPlaneClient) handleCommand(cmd *apiv1.ControlCommand) {
 			delete(c.pendingAcks, cmd.Id)
 		}
 		c.pendingAcksMu.Unlock()
+		reportResult = false
 
 	default:
 		c.logger.Warn().Str("id", cmd.Id).Msg("received unknown command")
+		err = fmt.Errorf("unknown command type")
+	}
+
+	if reportResult {
+		c.sendCommandResult(cmd.CommandId, cmd.Id, err)
+	}
+}
+
+// sendCommandResult reports a command outcome back to the control plane,
+// echoing its correlation id. Commands without a command_id (the default)
+// produce no result — opt-in, backward compatible. The send is
+// non-blocking: a saturated event channel drops the result with a warning
+// rather than stalling the receive loop (results are best-effort by
+// contract; the CP treats a missing result as unknown).
+func (c *ControlPlaneClient) sendCommandResult(commandID, attachmentID string, cmdErr error) {
+	if commandID == "" {
+		return
+	}
+	result := &apiv1.CommandResult{
+		CommandId: commandID,
+		Id:        attachmentID,
+		Success:   cmdErr == nil,
+	}
+	if cmdErr != nil {
+		result.Error = cmdErr.Error()
+	}
+	select {
+	case c.sendCh <- outboundEvent{event: &apiv1.DaemonEvent{
+		Event: &apiv1.DaemonEvent_CommandResult{CommandResult: result},
+	}}:
+	default:
+		c.logger.Warn().Str("command_id", commandID).Str("id", attachmentID).Msg("send channel full, dropping command result")
 	}
 }
 
@@ -462,35 +517,42 @@ func (c *ControlPlaneClient) applySubscribedAck(id string, ack *apiv1.Subscribed
 // both the old and new state is never removed from the kernel map, so a
 // control-plane resync opens no transient allow/block window, and
 // DNS-populated filter IPs survive (they age out via their own DNS TTLs,
-// Phase 2B). Any parse error aborts BEFORE any mutation.
-func (c *ControlPlaneClient) applyBulkUpdate(id string, update *apiv1.BulkUpdate) {
+// Phase 2B). Any parse error aborts BEFORE any mutation. The returned
+// error aggregates every failed step — a partially-applied bulk update is
+// a failure, never reported as success.
+func (c *ControlPlaneClient) applyBulkUpdate(id string, update *apiv1.BulkUpdate) error {
 	if update == nil {
-		return
+		return nil
 	}
-	allowCIDRs, denyCIDRs, ok := c.parseBulkCIDRs(id, update)
-	if !ok {
-		return
+	allowCIDRs, denyCIDRs, parseErr := c.parseBulkCIDRs(id, update)
+	if parseErr != nil {
+		return parseErr
 	}
 
 	// ReconcileCIDRs owns the mode write too, sandwiching it between the
 	// two list reconciles (new mode's list first) so no mode pair opens a
 	// transient allow/block window — see its doc comment.
-	if err := c.server.ReconcileCIDRs(id, update.Mode, allowCIDRs, denyCIDRs); err != nil {
-		c.logger.Error().Err(err).Str("id", id).Msg("failed to reconcile CIDRs in bulk update")
+	reconcileErr := c.server.ReconcileCIDRs(id, update.Mode, allowCIDRs, denyCIDRs)
+	if reconcileErr != nil {
+		c.logger.Error().Err(reconcileErr).Str("id", id).Msg("failed to reconcile CIDRs in bulk update")
+		reconcileErr = fmt.Errorf("reconciling CIDRs: %w", reconcileErr)
 	}
 
 	// Domain rules are replaced wholesale as before; DNS-populated filter
 	// IPs are deliberately NOT wiped (clients still hold them in resolver
 	// caches) — the janitor expires them by their DNS TTLs.
+	var dnsErr error
 	if update.Dns == nil {
-		if err := c.server.ReplaceDNSRules(id, apiv1.DnsMode_DNS_MODE_DISABLED, nil, nil); err != nil {
-			c.logger.Error().Err(err).Str("id", id).Msg("failed to clear DNS rules in bulk update")
+		if dnsErr = c.server.ReplaceDNSRules(id, apiv1.DnsMode_DNS_MODE_DISABLED, nil, nil); dnsErr != nil {
+			c.logger.Error().Err(dnsErr).Str("id", id).Msg("failed to clear DNS rules in bulk update")
+			dnsErr = fmt.Errorf("clearing DNS rules: %w", dnsErr)
 		}
-		return
+	} else if dnsErr = c.server.ReplaceDNSRules(id, update.Dns.Mode, update.Dns.AllowDomains, update.Dns.DenyDomains); dnsErr != nil {
+		c.logger.Error().Err(dnsErr).Str("id", id).Msg("failed to replace DNS rules in bulk update")
+		dnsErr = fmt.Errorf("replacing DNS rules: %w", dnsErr)
 	}
-	if err := c.server.ReplaceDNSRules(id, update.Dns.Mode, update.Dns.AllowDomains, update.Dns.DenyDomains); err != nil {
-		c.logger.Error().Err(err).Str("id", id).Msg("failed to replace DNS rules in bulk update")
-	}
+
+	return errors.Join(reconcileErr, dnsErr)
 }
 
 // parsedCIDR is a parsed CIDREntry: the network plus its TTL (0 = permanent).
@@ -499,24 +561,26 @@ type parsedCIDR struct {
 	ttl  time.Duration
 }
 
-func (c *ControlPlaneClient) parseBulkCIDRs(id string, update *apiv1.BulkUpdate) (allowCIDRs, denyCIDRs []parsedCIDR, ok bool) {
+// parseBulkCIDRs parses both CIDR lists up front; any invalid entry fails
+// the whole bulk update before anything is mutated.
+func (c *ControlPlaneClient) parseBulkCIDRs(id string, update *apiv1.BulkUpdate) (allowCIDRs, denyCIDRs []parsedCIDR, err error) {
 	for _, entry := range update.AllowCidrs {
-		cidr, err := filter.ParseCIDR(entry.Cidr)
-		if err != nil {
-			c.logger.Error().Err(err).Str("id", id).Str("cidr", entry.Cidr).Msg("failed to parse allow CIDR in bulk update")
-			return nil, nil, false
+		cidr, parseErr := filter.ParseCIDR(entry.Cidr)
+		if parseErr != nil {
+			c.logger.Error().Err(parseErr).Str("id", id).Str("cidr", entry.Cidr).Msg("failed to parse allow CIDR in bulk update")
+			return nil, nil, fmt.Errorf("parsing allow CIDR %q: %w", entry.Cidr, parseErr)
 		}
 		allowCIDRs = append(allowCIDRs, parsedCIDR{cidr: cidr, ttl: entry.GetTtl().AsDuration()})
 	}
 
 	for _, entry := range update.DenyCidrs {
-		cidr, err := filter.ParseCIDR(entry.Cidr)
-		if err != nil {
-			c.logger.Error().Err(err).Str("id", id).Str("cidr", entry.Cidr).Msg("failed to parse deny CIDR in bulk update")
-			return nil, nil, false
+		cidr, parseErr := filter.ParseCIDR(entry.Cidr)
+		if parseErr != nil {
+			c.logger.Error().Err(parseErr).Str("id", id).Str("cidr", entry.Cidr).Msg("failed to parse deny CIDR in bulk update")
+			return nil, nil, fmt.Errorf("parsing deny CIDR %q: %w", entry.Cidr, parseErr)
 		}
 		denyCIDRs = append(denyCIDRs, parsedCIDR{cidr: cidr, ttl: entry.GetTtl().AsDuration()})
 	}
 
-	return allowCIDRs, denyCIDRs, true
+	return allowCIDRs, denyCIDRs, nil
 }

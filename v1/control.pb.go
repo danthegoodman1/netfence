@@ -87,6 +87,7 @@ type DaemonEvent struct {
 	//	*DaemonEvent_Subscribed
 	//	*DaemonEvent_Unsubscribed
 	//	*DaemonEvent_Heartbeat
+	//	*DaemonEvent_CommandResult
 	Event         isDaemonEvent_Event `protobuf_oneof:"event"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -165,6 +166,15 @@ func (x *DaemonEvent) GetHeartbeat() *Heartbeat {
 	return nil
 }
 
+func (x *DaemonEvent) GetCommandResult() *CommandResult {
+	if x != nil {
+		if x, ok := x.Event.(*DaemonEvent_CommandResult); ok {
+			return x.CommandResult
+		}
+	}
+	return nil
+}
+
 type isDaemonEvent_Event interface {
 	isDaemonEvent_Event()
 }
@@ -189,6 +199,12 @@ type DaemonEvent_Heartbeat struct {
 	Heartbeat *Heartbeat `protobuf:"bytes,4,opt,name=heartbeat,proto3,oneof"`
 }
 
+type DaemonEvent_CommandResult struct {
+	// Outcome of a ControlCommand that carried a command_id (see
+	// ControlCommand.command_id / CommandResult).
+	CommandResult *CommandResult `protobuf:"bytes,5,opt,name=command_result,json=commandResult,proto3,oneof"`
+}
+
 func (*DaemonEvent_Sync) isDaemonEvent_Event() {}
 
 func (*DaemonEvent_Subscribed) isDaemonEvent_Event() {}
@@ -196,6 +212,8 @@ func (*DaemonEvent_Subscribed) isDaemonEvent_Event() {}
 func (*DaemonEvent_Unsubscribed) isDaemonEvent_Event() {}
 
 func (*DaemonEvent_Heartbeat) isDaemonEvent_Event() {}
+
+func (*DaemonEvent_CommandResult) isDaemonEvent_Event() {}
 
 // SyncRequest is sent when the daemon connects or reconnects.
 // It lists all current attachments so the control plane can resync.
@@ -700,7 +718,14 @@ type ControlCommand struct {
 	//	*ControlCommand_DenyDomain
 	//	*ControlCommand_RemoveDomain
 	//	*ControlCommand_SubscribedAck
-	Command       isControlCommand_Command `protobuf_oneof:"command"`
+	Command isControlCommand_Command `protobuf_oneof:"command"`
+	// Optional control-plane-chosen correlation id for this command. When
+	// non-empty, the daemon reports the command's outcome with a
+	// CommandResult DaemonEvent echoing this value; when empty (the
+	// default), no result is emitted — fully backward-compatible opt-in.
+	// SubscribedAck is excluded (it is itself the ack of a daemon event and
+	// is answered by the Subscribed handshake), as is SyncAck.
+	CommandId     string `protobuf:"bytes,13,opt,name=command_id,json=commandId,proto3" json:"command_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -848,6 +873,13 @@ func (x *ControlCommand) GetSubscribedAck() *SubscribedAck {
 	return nil
 }
 
+func (x *ControlCommand) GetCommandId() string {
+	if x != nil {
+		return x.CommandId
+	}
+	return ""
+}
+
 type isControlCommand_Command interface {
 	isControlCommand_Command()
 }
@@ -929,6 +961,86 @@ func (*ControlCommand_RemoveDomain) isControlCommand_Command() {}
 
 func (*ControlCommand_SubscribedAck) isControlCommand_Command() {}
 
+// CommandResult reports the outcome of a ControlCommand that carried a
+// non-empty command_id. success is true only when the command fully
+// applied (parse + filter + bookkeeping); a partially-applied command
+// (e.g. one CIDR of a BulkUpdate failing) reports success=false with the
+// aggregated error. Results are best-effort: a saturated event channel
+// drops them (with a daemon-side warning) rather than blocking command
+// processing, so the control plane must treat a missing result as
+// unknown, not failed.
+type CommandResult struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Echo of ControlCommand.command_id
+	CommandId string `protobuf:"bytes,1,opt,name=command_id,json=commandId,proto3" json:"command_id,omitempty"`
+	// The attachment the command targeted (echo of ControlCommand.id)
+	Id string `protobuf:"bytes,2,opt,name=id,proto3" json:"id,omitempty"`
+	// Whether the command fully applied
+	Success bool `protobuf:"varint,3,opt,name=success,proto3" json:"success,omitempty"`
+	// Error detail when success is false
+	Error         string `protobuf:"bytes,4,opt,name=error,proto3" json:"error,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CommandResult) Reset() {
+	*x = CommandResult{}
+	mi := &file_v1_control_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CommandResult) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CommandResult) ProtoMessage() {}
+
+func (x *CommandResult) ProtoReflect() protoreflect.Message {
+	mi := &file_v1_control_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CommandResult.ProtoReflect.Descriptor instead.
+func (*CommandResult) Descriptor() ([]byte, []int) {
+	return file_v1_control_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *CommandResult) GetCommandId() string {
+	if x != nil {
+		return x.CommandId
+	}
+	return ""
+}
+
+func (x *CommandResult) GetId() string {
+	if x != nil {
+		return x.Id
+	}
+	return ""
+}
+
+func (x *CommandResult) GetSuccess() bool {
+	if x != nil {
+		return x.Success
+	}
+	return false
+}
+
+func (x *CommandResult) GetError() string {
+	if x != nil {
+		return x.Error
+	}
+	return ""
+}
+
 // SyncAck acknowledges that the control plane has processed the SyncRequest.
 type SyncAck struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -938,7 +1050,7 @@ type SyncAck struct {
 
 func (x *SyncAck) Reset() {
 	*x = SyncAck{}
-	mi := &file_v1_control_proto_msgTypes[8]
+	mi := &file_v1_control_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -950,7 +1062,7 @@ func (x *SyncAck) String() string {
 func (*SyncAck) ProtoMessage() {}
 
 func (x *SyncAck) ProtoReflect() protoreflect.Message {
-	mi := &file_v1_control_proto_msgTypes[8]
+	mi := &file_v1_control_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -963,7 +1075,7 @@ func (x *SyncAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SyncAck.ProtoReflect.Descriptor instead.
 func (*SyncAck) Descriptor() ([]byte, []int) {
-	return file_v1_control_proto_rawDescGZIP(), []int{8}
+	return file_v1_control_proto_rawDescGZIP(), []int{9}
 }
 
 // SubscribedAck acknowledges a Subscribed event and provides initial configuration.
@@ -989,7 +1101,7 @@ type SubscribedAck struct {
 
 func (x *SubscribedAck) Reset() {
 	*x = SubscribedAck{}
-	mi := &file_v1_control_proto_msgTypes[9]
+	mi := &file_v1_control_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1001,7 +1113,7 @@ func (x *SubscribedAck) String() string {
 func (*SubscribedAck) ProtoMessage() {}
 
 func (x *SubscribedAck) ProtoReflect() protoreflect.Message {
-	mi := &file_v1_control_proto_msgTypes[9]
+	mi := &file_v1_control_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1014,7 +1126,7 @@ func (x *SubscribedAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SubscribedAck.ProtoReflect.Descriptor instead.
 func (*SubscribedAck) Descriptor() ([]byte, []int) {
-	return file_v1_control_proto_rawDescGZIP(), []int{9}
+	return file_v1_control_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *SubscribedAck) GetMode() PolicyMode {
@@ -1055,7 +1167,7 @@ type SetMode struct {
 
 func (x *SetMode) Reset() {
 	*x = SetMode{}
-	mi := &file_v1_control_proto_msgTypes[10]
+	mi := &file_v1_control_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1067,7 +1179,7 @@ func (x *SetMode) String() string {
 func (*SetMode) ProtoMessage() {}
 
 func (x *SetMode) ProtoReflect() protoreflect.Message {
-	mi := &file_v1_control_proto_msgTypes[10]
+	mi := &file_v1_control_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1080,7 +1192,7 @@ func (x *SetMode) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetMode.ProtoReflect.Descriptor instead.
 func (*SetMode) Descriptor() ([]byte, []int) {
-	return file_v1_control_proto_rawDescGZIP(), []int{10}
+	return file_v1_control_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *SetMode) GetMode() PolicyMode {
@@ -1108,7 +1220,7 @@ type BulkUpdate struct {
 
 func (x *BulkUpdate) Reset() {
 	*x = BulkUpdate{}
-	mi := &file_v1_control_proto_msgTypes[11]
+	mi := &file_v1_control_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1120,7 +1232,7 @@ func (x *BulkUpdate) String() string {
 func (*BulkUpdate) ProtoMessage() {}
 
 func (x *BulkUpdate) ProtoReflect() protoreflect.Message {
-	mi := &file_v1_control_proto_msgTypes[11]
+	mi := &file_v1_control_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1133,7 +1245,7 @@ func (x *BulkUpdate) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BulkUpdate.ProtoReflect.Descriptor instead.
 func (*BulkUpdate) Descriptor() ([]byte, []int) {
-	return file_v1_control_proto_rawDescGZIP(), []int{11}
+	return file_v1_control_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *BulkUpdate) GetMode() PolicyMode {
@@ -1182,7 +1294,7 @@ type DnsConfig struct {
 
 func (x *DnsConfig) Reset() {
 	*x = DnsConfig{}
-	mi := &file_v1_control_proto_msgTypes[12]
+	mi := &file_v1_control_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1194,7 +1306,7 @@ func (x *DnsConfig) String() string {
 func (*DnsConfig) ProtoMessage() {}
 
 func (x *DnsConfig) ProtoReflect() protoreflect.Message {
-	mi := &file_v1_control_proto_msgTypes[12]
+	mi := &file_v1_control_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1207,7 +1319,7 @@ func (x *DnsConfig) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DnsConfig.ProtoReflect.Descriptor instead.
 func (*DnsConfig) Descriptor() ([]byte, []int) {
-	return file_v1_control_proto_rawDescGZIP(), []int{12}
+	return file_v1_control_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *DnsConfig) GetMode() DnsMode {
@@ -1249,7 +1361,7 @@ type CIDREntry struct {
 
 func (x *CIDREntry) Reset() {
 	*x = CIDREntry{}
-	mi := &file_v1_control_proto_msgTypes[13]
+	mi := &file_v1_control_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1261,7 +1373,7 @@ func (x *CIDREntry) String() string {
 func (*CIDREntry) ProtoMessage() {}
 
 func (x *CIDREntry) ProtoReflect() protoreflect.Message {
-	mi := &file_v1_control_proto_msgTypes[13]
+	mi := &file_v1_control_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1274,7 +1386,7 @@ func (x *CIDREntry) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CIDREntry.ProtoReflect.Descriptor instead.
 func (*CIDREntry) Descriptor() ([]byte, []int) {
-	return file_v1_control_proto_rawDescGZIP(), []int{13}
+	return file_v1_control_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *CIDREntry) GetCidr() string {
@@ -1304,7 +1416,7 @@ type DomainEntry struct {
 
 func (x *DomainEntry) Reset() {
 	*x = DomainEntry{}
-	mi := &file_v1_control_proto_msgTypes[14]
+	mi := &file_v1_control_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1316,7 +1428,7 @@ func (x *DomainEntry) String() string {
 func (*DomainEntry) ProtoMessage() {}
 
 func (x *DomainEntry) ProtoReflect() protoreflect.Message {
-	mi := &file_v1_control_proto_msgTypes[14]
+	mi := &file_v1_control_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1329,7 +1441,7 @@ func (x *DomainEntry) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DomainEntry.ProtoReflect.Descriptor instead.
 func (*DomainEntry) Descriptor() ([]byte, []int) {
-	return file_v1_control_proto_rawDescGZIP(), []int{14}
+	return file_v1_control_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *DomainEntry) GetDomain() string {
@@ -1356,7 +1468,7 @@ type SetDnsMode struct {
 
 func (x *SetDnsMode) Reset() {
 	*x = SetDnsMode{}
-	mi := &file_v1_control_proto_msgTypes[15]
+	mi := &file_v1_control_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1368,7 +1480,7 @@ func (x *SetDnsMode) String() string {
 func (*SetDnsMode) ProtoMessage() {}
 
 func (x *SetDnsMode) ProtoReflect() protoreflect.Message {
-	mi := &file_v1_control_proto_msgTypes[15]
+	mi := &file_v1_control_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1381,7 +1493,7 @@ func (x *SetDnsMode) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetDnsMode.ProtoReflect.Descriptor instead.
 func (*SetDnsMode) Descriptor() ([]byte, []int) {
-	return file_v1_control_proto_rawDescGZIP(), []int{15}
+	return file_v1_control_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *SetDnsMode) GetMode() DnsMode {
@@ -1406,7 +1518,7 @@ type DnsQueryRequest struct {
 
 func (x *DnsQueryRequest) Reset() {
 	*x = DnsQueryRequest{}
-	mi := &file_v1_control_proto_msgTypes[16]
+	mi := &file_v1_control_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1418,7 +1530,7 @@ func (x *DnsQueryRequest) String() string {
 func (*DnsQueryRequest) ProtoMessage() {}
 
 func (x *DnsQueryRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_v1_control_proto_msgTypes[16]
+	mi := &file_v1_control_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1431,7 +1543,7 @@ func (x *DnsQueryRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DnsQueryRequest.ProtoReflect.Descriptor instead.
 func (*DnsQueryRequest) Descriptor() ([]byte, []int) {
-	return file_v1_control_proto_rawDescGZIP(), []int{16}
+	return file_v1_control_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *DnsQueryRequest) GetId() string {
@@ -1472,7 +1584,7 @@ type DnsQueryResponse struct {
 
 func (x *DnsQueryResponse) Reset() {
 	*x = DnsQueryResponse{}
-	mi := &file_v1_control_proto_msgTypes[17]
+	mi := &file_v1_control_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1484,7 +1596,7 @@ func (x *DnsQueryResponse) String() string {
 func (*DnsQueryResponse) ProtoMessage() {}
 
 func (x *DnsQueryResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_v1_control_proto_msgTypes[17]
+	mi := &file_v1_control_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1497,7 +1609,7 @@ func (x *DnsQueryResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DnsQueryResponse.ProtoReflect.Descriptor instead.
 func (*DnsQueryResponse) Descriptor() ([]byte, []int) {
-	return file_v1_control_proto_rawDescGZIP(), []int{17}
+	return file_v1_control_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *DnsQueryResponse) GetAllow() bool {
@@ -1532,14 +1644,15 @@ var File_v1_control_proto protoreflect.FileDescriptor
 
 const file_v1_control_proto_rawDesc = "" +
 	"\n" +
-	"\x10v1/control.proto\x12\vnetfence.v1\x1a\x1egoogle/protobuf/duration.proto\x1a\x0ev1/types.proto\"\xfa\x01\n" +
+	"\x10v1/control.proto\x12\vnetfence.v1\x1a\x1egoogle/protobuf/duration.proto\x1a\x0ev1/types.proto\"\xbf\x02\n" +
 	"\vDaemonEvent\x12.\n" +
 	"\x04sync\x18\x01 \x01(\v2\x18.netfence.v1.SyncRequestH\x00R\x04sync\x129\n" +
 	"\n" +
 	"subscribed\x18\x02 \x01(\v2\x17.netfence.v1.SubscribedH\x00R\n" +
 	"subscribed\x12?\n" +
 	"\funsubscribed\x18\x03 \x01(\v2\x19.netfence.v1.UnsubscribedH\x00R\funsubscribed\x126\n" +
-	"\theartbeat\x18\x04 \x01(\v2\x16.netfence.v1.HeartbeatH\x00R\theartbeatB\a\n" +
+	"\theartbeat\x18\x04 \x01(\v2\x16.netfence.v1.HeartbeatH\x00R\theartbeat\x12C\n" +
+	"\x0ecommand_result\x18\x05 \x01(\v2\x1a.netfence.v1.CommandResultH\x00R\rcommandResultB\a\n" +
 	"\x05event\"\x82\x02\n" +
 	"\vSyncRequest\x12\x1b\n" +
 	"\tdaemon_id\x18\x01 \x01(\tR\bdaemonId\x12\x1a\n" +
@@ -1587,7 +1700,7 @@ const file_v1_control_proto_rawDesc = "" +
 	"\x0fpackets_blocked\x18\x03 \x01(\x04R\x0epacketsBlocked\x12.\n" +
 	"\x13dns_queries_allowed\x18\x04 \x01(\x04R\x11dnsQueriesAllowed\x12.\n" +
 	"\x13dns_queries_blocked\x18\x05 \x01(\x04R\x11dnsQueriesBlocked\x12$\n" +
-	"\x0emap_full_drops\x18\x06 \x01(\x04R\fmapFullDrops\"\x85\x05\n" +
+	"\x0emap_full_drops\x18\x06 \x01(\x04R\fmapFullDrops\"\xa4\x05\n" +
 	"\x0eControlCommand\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x121\n" +
 	"\bsync_ack\x18\x02 \x01(\v2\x14.netfence.v1.SyncAckH\x00R\asyncAck\x121\n" +
@@ -1606,8 +1719,16 @@ const file_v1_control_proto_rawDesc = "" +
 	" \x01(\v2\x18.netfence.v1.DomainEntryH\x00R\n" +
 	"denyDomain\x12%\n" +
 	"\rremove_domain\x18\v \x01(\tH\x00R\fremoveDomain\x12C\n" +
-	"\x0esubscribed_ack\x18\f \x01(\v2\x1a.netfence.v1.SubscribedAckH\x00R\rsubscribedAckB\t\n" +
-	"\acommand\"\t\n" +
+	"\x0esubscribed_ack\x18\f \x01(\v2\x1a.netfence.v1.SubscribedAckH\x00R\rsubscribedAck\x12\x1d\n" +
+	"\n" +
+	"command_id\x18\r \x01(\tR\tcommandIdB\t\n" +
+	"\acommand\"n\n" +
+	"\rCommandResult\x12\x1d\n" +
+	"\n" +
+	"command_id\x18\x01 \x01(\tR\tcommandId\x12\x0e\n" +
+	"\x02id\x18\x02 \x01(\tR\x02id\x12\x18\n" +
+	"\asuccess\x18\x03 \x01(\bR\asuccess\x12\x14\n" +
+	"\x05error\x18\x04 \x01(\tR\x05error\"\t\n" +
 	"\aSyncAck\"\xd6\x01\n" +
 	"\rSubscribedAck\x12+\n" +
 	"\x04mode\x18\x01 \x01(\x0e2\x17.netfence.v1.PolicyModeR\x04mode\x127\n" +
@@ -1673,7 +1794,7 @@ func file_v1_control_proto_rawDescGZIP() []byte {
 }
 
 var file_v1_control_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_v1_control_proto_msgTypes = make([]protoimpl.MessageInfo, 21)
+var file_v1_control_proto_msgTypes = make([]protoimpl.MessageInfo, 22)
 var file_v1_control_proto_goTypes = []any{
 	(UnsubscribeReason)(0),      // 0: netfence.v1.UnsubscribeReason
 	(*DaemonEvent)(nil),         // 1: netfence.v1.DaemonEvent
@@ -1684,76 +1805,78 @@ var file_v1_control_proto_goTypes = []any{
 	(*Heartbeat)(nil),           // 6: netfence.v1.Heartbeat
 	(*AttachmentStats)(nil),     // 7: netfence.v1.AttachmentStats
 	(*ControlCommand)(nil),      // 8: netfence.v1.ControlCommand
-	(*SyncAck)(nil),             // 9: netfence.v1.SyncAck
-	(*SubscribedAck)(nil),       // 10: netfence.v1.SubscribedAck
-	(*SetMode)(nil),             // 11: netfence.v1.SetMode
-	(*BulkUpdate)(nil),          // 12: netfence.v1.BulkUpdate
-	(*DnsConfig)(nil),           // 13: netfence.v1.DnsConfig
-	(*CIDREntry)(nil),           // 14: netfence.v1.CIDREntry
-	(*DomainEntry)(nil),         // 15: netfence.v1.DomainEntry
-	(*SetDnsMode)(nil),          // 16: netfence.v1.SetDnsMode
-	(*DnsQueryRequest)(nil),     // 17: netfence.v1.DnsQueryRequest
-	(*DnsQueryResponse)(nil),    // 18: netfence.v1.DnsQueryResponse
-	nil,                         // 19: netfence.v1.SyncRequest.MetadataEntry
-	nil,                         // 20: netfence.v1.Attachment.MetadataEntry
-	nil,                         // 21: netfence.v1.Subscribed.MetadataEntry
-	(AttachmentType)(0),         // 22: netfence.v1.AttachmentType
-	(PolicyMode)(0),             // 23: netfence.v1.PolicyMode
-	(DnsMode)(0),                // 24: netfence.v1.DnsMode
-	(TcDirection)(0),            // 25: netfence.v1.TcDirection
-	(*durationpb.Duration)(nil), // 26: google.protobuf.Duration
+	(*CommandResult)(nil),       // 9: netfence.v1.CommandResult
+	(*SyncAck)(nil),             // 10: netfence.v1.SyncAck
+	(*SubscribedAck)(nil),       // 11: netfence.v1.SubscribedAck
+	(*SetMode)(nil),             // 12: netfence.v1.SetMode
+	(*BulkUpdate)(nil),          // 13: netfence.v1.BulkUpdate
+	(*DnsConfig)(nil),           // 14: netfence.v1.DnsConfig
+	(*CIDREntry)(nil),           // 15: netfence.v1.CIDREntry
+	(*DomainEntry)(nil),         // 16: netfence.v1.DomainEntry
+	(*SetDnsMode)(nil),          // 17: netfence.v1.SetDnsMode
+	(*DnsQueryRequest)(nil),     // 18: netfence.v1.DnsQueryRequest
+	(*DnsQueryResponse)(nil),    // 19: netfence.v1.DnsQueryResponse
+	nil,                         // 20: netfence.v1.SyncRequest.MetadataEntry
+	nil,                         // 21: netfence.v1.Attachment.MetadataEntry
+	nil,                         // 22: netfence.v1.Subscribed.MetadataEntry
+	(AttachmentType)(0),         // 23: netfence.v1.AttachmentType
+	(PolicyMode)(0),             // 24: netfence.v1.PolicyMode
+	(DnsMode)(0),                // 25: netfence.v1.DnsMode
+	(TcDirection)(0),            // 26: netfence.v1.TcDirection
+	(*durationpb.Duration)(nil), // 27: google.protobuf.Duration
 }
 var file_v1_control_proto_depIdxs = []int32{
 	2,  // 0: netfence.v1.DaemonEvent.sync:type_name -> netfence.v1.SyncRequest
 	4,  // 1: netfence.v1.DaemonEvent.subscribed:type_name -> netfence.v1.Subscribed
 	5,  // 2: netfence.v1.DaemonEvent.unsubscribed:type_name -> netfence.v1.Unsubscribed
 	6,  // 3: netfence.v1.DaemonEvent.heartbeat:type_name -> netfence.v1.Heartbeat
-	3,  // 4: netfence.v1.SyncRequest.attachments:type_name -> netfence.v1.Attachment
-	19, // 5: netfence.v1.SyncRequest.metadata:type_name -> netfence.v1.SyncRequest.MetadataEntry
-	22, // 6: netfence.v1.Attachment.type:type_name -> netfence.v1.AttachmentType
-	23, // 7: netfence.v1.Attachment.mode:type_name -> netfence.v1.PolicyMode
-	24, // 8: netfence.v1.Attachment.dns_mode:type_name -> netfence.v1.DnsMode
-	20, // 9: netfence.v1.Attachment.metadata:type_name -> netfence.v1.Attachment.MetadataEntry
-	25, // 10: netfence.v1.Attachment.tc_direction:type_name -> netfence.v1.TcDirection
-	22, // 11: netfence.v1.Subscribed.type:type_name -> netfence.v1.AttachmentType
-	23, // 12: netfence.v1.Subscribed.mode:type_name -> netfence.v1.PolicyMode
-	24, // 13: netfence.v1.Subscribed.dns_mode:type_name -> netfence.v1.DnsMode
-	21, // 14: netfence.v1.Subscribed.metadata:type_name -> netfence.v1.Subscribed.MetadataEntry
-	25, // 15: netfence.v1.Subscribed.tc_direction:type_name -> netfence.v1.TcDirection
-	0,  // 16: netfence.v1.Unsubscribed.reason:type_name -> netfence.v1.UnsubscribeReason
-	7,  // 17: netfence.v1.Heartbeat.stats:type_name -> netfence.v1.AttachmentStats
-	9,  // 18: netfence.v1.ControlCommand.sync_ack:type_name -> netfence.v1.SyncAck
-	11, // 19: netfence.v1.ControlCommand.set_mode:type_name -> netfence.v1.SetMode
-	14, // 20: netfence.v1.ControlCommand.allow_cidr:type_name -> netfence.v1.CIDREntry
-	14, // 21: netfence.v1.ControlCommand.deny_cidr:type_name -> netfence.v1.CIDREntry
-	12, // 22: netfence.v1.ControlCommand.bulk_update:type_name -> netfence.v1.BulkUpdate
-	16, // 23: netfence.v1.ControlCommand.set_dns_mode:type_name -> netfence.v1.SetDnsMode
-	15, // 24: netfence.v1.ControlCommand.allow_domain:type_name -> netfence.v1.DomainEntry
-	15, // 25: netfence.v1.ControlCommand.deny_domain:type_name -> netfence.v1.DomainEntry
-	10, // 26: netfence.v1.ControlCommand.subscribed_ack:type_name -> netfence.v1.SubscribedAck
-	23, // 27: netfence.v1.SubscribedAck.mode:type_name -> netfence.v1.PolicyMode
-	14, // 28: netfence.v1.SubscribedAck.allow_cidrs:type_name -> netfence.v1.CIDREntry
-	14, // 29: netfence.v1.SubscribedAck.deny_cidrs:type_name -> netfence.v1.CIDREntry
-	13, // 30: netfence.v1.SubscribedAck.dns:type_name -> netfence.v1.DnsConfig
-	23, // 31: netfence.v1.SetMode.mode:type_name -> netfence.v1.PolicyMode
-	23, // 32: netfence.v1.BulkUpdate.mode:type_name -> netfence.v1.PolicyMode
-	14, // 33: netfence.v1.BulkUpdate.allow_cidrs:type_name -> netfence.v1.CIDREntry
-	14, // 34: netfence.v1.BulkUpdate.deny_cidrs:type_name -> netfence.v1.CIDREntry
-	13, // 35: netfence.v1.BulkUpdate.dns:type_name -> netfence.v1.DnsConfig
-	24, // 36: netfence.v1.DnsConfig.mode:type_name -> netfence.v1.DnsMode
-	15, // 37: netfence.v1.DnsConfig.allow_domains:type_name -> netfence.v1.DomainEntry
-	15, // 38: netfence.v1.DnsConfig.deny_domains:type_name -> netfence.v1.DomainEntry
-	26, // 39: netfence.v1.CIDREntry.ttl:type_name -> google.protobuf.Duration
-	24, // 40: netfence.v1.SetDnsMode.mode:type_name -> netfence.v1.DnsMode
-	1,  // 41: netfence.v1.ControlPlane.Connect:input_type -> netfence.v1.DaemonEvent
-	17, // 42: netfence.v1.ControlPlane.QueryDns:input_type -> netfence.v1.DnsQueryRequest
-	8,  // 43: netfence.v1.ControlPlane.Connect:output_type -> netfence.v1.ControlCommand
-	18, // 44: netfence.v1.ControlPlane.QueryDns:output_type -> netfence.v1.DnsQueryResponse
-	43, // [43:45] is the sub-list for method output_type
-	41, // [41:43] is the sub-list for method input_type
-	41, // [41:41] is the sub-list for extension type_name
-	41, // [41:41] is the sub-list for extension extendee
-	0,  // [0:41] is the sub-list for field type_name
+	9,  // 4: netfence.v1.DaemonEvent.command_result:type_name -> netfence.v1.CommandResult
+	3,  // 5: netfence.v1.SyncRequest.attachments:type_name -> netfence.v1.Attachment
+	20, // 6: netfence.v1.SyncRequest.metadata:type_name -> netfence.v1.SyncRequest.MetadataEntry
+	23, // 7: netfence.v1.Attachment.type:type_name -> netfence.v1.AttachmentType
+	24, // 8: netfence.v1.Attachment.mode:type_name -> netfence.v1.PolicyMode
+	25, // 9: netfence.v1.Attachment.dns_mode:type_name -> netfence.v1.DnsMode
+	21, // 10: netfence.v1.Attachment.metadata:type_name -> netfence.v1.Attachment.MetadataEntry
+	26, // 11: netfence.v1.Attachment.tc_direction:type_name -> netfence.v1.TcDirection
+	23, // 12: netfence.v1.Subscribed.type:type_name -> netfence.v1.AttachmentType
+	24, // 13: netfence.v1.Subscribed.mode:type_name -> netfence.v1.PolicyMode
+	25, // 14: netfence.v1.Subscribed.dns_mode:type_name -> netfence.v1.DnsMode
+	22, // 15: netfence.v1.Subscribed.metadata:type_name -> netfence.v1.Subscribed.MetadataEntry
+	26, // 16: netfence.v1.Subscribed.tc_direction:type_name -> netfence.v1.TcDirection
+	0,  // 17: netfence.v1.Unsubscribed.reason:type_name -> netfence.v1.UnsubscribeReason
+	7,  // 18: netfence.v1.Heartbeat.stats:type_name -> netfence.v1.AttachmentStats
+	10, // 19: netfence.v1.ControlCommand.sync_ack:type_name -> netfence.v1.SyncAck
+	12, // 20: netfence.v1.ControlCommand.set_mode:type_name -> netfence.v1.SetMode
+	15, // 21: netfence.v1.ControlCommand.allow_cidr:type_name -> netfence.v1.CIDREntry
+	15, // 22: netfence.v1.ControlCommand.deny_cidr:type_name -> netfence.v1.CIDREntry
+	13, // 23: netfence.v1.ControlCommand.bulk_update:type_name -> netfence.v1.BulkUpdate
+	17, // 24: netfence.v1.ControlCommand.set_dns_mode:type_name -> netfence.v1.SetDnsMode
+	16, // 25: netfence.v1.ControlCommand.allow_domain:type_name -> netfence.v1.DomainEntry
+	16, // 26: netfence.v1.ControlCommand.deny_domain:type_name -> netfence.v1.DomainEntry
+	11, // 27: netfence.v1.ControlCommand.subscribed_ack:type_name -> netfence.v1.SubscribedAck
+	24, // 28: netfence.v1.SubscribedAck.mode:type_name -> netfence.v1.PolicyMode
+	15, // 29: netfence.v1.SubscribedAck.allow_cidrs:type_name -> netfence.v1.CIDREntry
+	15, // 30: netfence.v1.SubscribedAck.deny_cidrs:type_name -> netfence.v1.CIDREntry
+	14, // 31: netfence.v1.SubscribedAck.dns:type_name -> netfence.v1.DnsConfig
+	24, // 32: netfence.v1.SetMode.mode:type_name -> netfence.v1.PolicyMode
+	24, // 33: netfence.v1.BulkUpdate.mode:type_name -> netfence.v1.PolicyMode
+	15, // 34: netfence.v1.BulkUpdate.allow_cidrs:type_name -> netfence.v1.CIDREntry
+	15, // 35: netfence.v1.BulkUpdate.deny_cidrs:type_name -> netfence.v1.CIDREntry
+	14, // 36: netfence.v1.BulkUpdate.dns:type_name -> netfence.v1.DnsConfig
+	25, // 37: netfence.v1.DnsConfig.mode:type_name -> netfence.v1.DnsMode
+	16, // 38: netfence.v1.DnsConfig.allow_domains:type_name -> netfence.v1.DomainEntry
+	16, // 39: netfence.v1.DnsConfig.deny_domains:type_name -> netfence.v1.DomainEntry
+	27, // 40: netfence.v1.CIDREntry.ttl:type_name -> google.protobuf.Duration
+	25, // 41: netfence.v1.SetDnsMode.mode:type_name -> netfence.v1.DnsMode
+	1,  // 42: netfence.v1.ControlPlane.Connect:input_type -> netfence.v1.DaemonEvent
+	18, // 43: netfence.v1.ControlPlane.QueryDns:input_type -> netfence.v1.DnsQueryRequest
+	8,  // 44: netfence.v1.ControlPlane.Connect:output_type -> netfence.v1.ControlCommand
+	19, // 45: netfence.v1.ControlPlane.QueryDns:output_type -> netfence.v1.DnsQueryResponse
+	44, // [44:46] is the sub-list for method output_type
+	42, // [42:44] is the sub-list for method input_type
+	42, // [42:42] is the sub-list for extension type_name
+	42, // [42:42] is the sub-list for extension extendee
+	0,  // [0:42] is the sub-list for field type_name
 }
 
 func init() { file_v1_control_proto_init() }
@@ -1767,6 +1890,7 @@ func file_v1_control_proto_init() {
 		(*DaemonEvent_Subscribed)(nil),
 		(*DaemonEvent_Unsubscribed)(nil),
 		(*DaemonEvent_Heartbeat)(nil),
+		(*DaemonEvent_CommandResult)(nil),
 	}
 	file_v1_control_proto_msgTypes[7].OneofWrappers = []any{
 		(*ControlCommand_SyncAck)(nil),
@@ -1787,7 +1911,7 @@ func file_v1_control_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_v1_control_proto_rawDesc), len(file_v1_control_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   21,
+			NumMessages:   22,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
