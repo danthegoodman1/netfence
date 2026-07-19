@@ -66,6 +66,8 @@ type DNSServer struct {
 	generation     uint64
 	limits         dnsAdmissionLimits
 	limitCeilings  dnsAdmissionLimits
+	churnLimits    dnsChurnLimits
+	churnCeiling   dnsChurnLimits
 
 	serverMu      sync.Mutex
 	udp           *dns.Server
@@ -97,8 +99,12 @@ func NewDNSServer(attachmentID, listenAddr, upstream string, logger zerolog.Logg
 		upstreams = []string{upstream}
 	}
 	ceilings := resolveDNSAdmissionCeilings(0, dnsAdmissionLimitOverrides{})
+	churnCeiling := resolveDNSChurnCeiling(0, 0)
 	if len(limitCeilings) != 0 {
 		ceilings = limitCeilings[0]
+	}
+	if concrete, ok := sink.(*dnsFilterSink); ok {
+		churnCeiling = concrete.ChurnCeiling()
 	}
 	server := &DNSServer{
 		attachmentID:    attachmentID,
@@ -114,6 +120,8 @@ func NewDNSServer(attachmentID, listenAddr, upstream string, logger zerolog.Logg
 		generation:      1,
 		limits:          ceilings,
 		limitCeilings:   ceilings,
+		churnLimits:     churnCeiling,
+		churnCeiling:    churnCeiling,
 	}
 	if concrete, ok := sink.(*dnsFilterSink); ok {
 		concrete.bindDNS(server)
@@ -436,9 +444,10 @@ type preparedDNSRules struct {
 	policyDomains  map[string]struct{}
 	upstreams      []string
 	limits         dnsAdmissionLimits
+	churn          dnsChurnLimits
 }
 
-func prepareDNSRules(mode apiv1.DnsMode, allowDomains, denyDomains []*apiv1.DomainEntry, upstreamServers []string, fallback string, ceilings dnsAdmissionLimits, overrides dnsAdmissionLimitOverrides) (*preparedDNSRules, error) {
+func prepareDNSRules(mode apiv1.DnsMode, allowDomains, denyDomains []*apiv1.DomainEntry, upstreamServers []string, fallback string, ceilings dnsAdmissionLimits, overrides dnsAdmissionLimitOverrides, churnCeiling dnsChurnLimits, maxChurnUnits uint32) (*preparedDNSRules, error) {
 	if err := validateDNSMode(mode); err != nil {
 		return nil, err
 	}
@@ -450,6 +459,10 @@ func prepareDNSRules(mode apiv1.DnsMode, allowDomains, denyDomains []*apiv1.Doma
 	if err != nil {
 		return nil, err
 	}
+	churn, err := churnCeiling.resolve(maxChurnUnits)
+	if err != nil {
+		return nil, err
+	}
 	prepared := &preparedDNSRules{
 		mode:           mode,
 		allowedDomains: make(map[string]bool, len(allowDomains)),
@@ -457,6 +470,7 @@ func prepareDNSRules(mode apiv1.DnsMode, allowDomains, denyDomains []*apiv1.Doma
 		policyDomains:  make(map[string]struct{}, len(allowDomains)+len(denyDomains)),
 		upstreams:      upstreams,
 		limits:         limits,
+		churn:          churn,
 	}
 	if err := addPreparedDomains(prepared.allowedDomains, prepared.policyDomains, allowDomains, "allow"); err != nil {
 		return nil, err
@@ -506,7 +520,7 @@ func (s *DNSServer) prepareConfig(cfg *apiv1.DnsConfig) (*preparedDNSRules, erro
 		cfg = &apiv1.DnsConfig{Mode: apiv1.DnsMode_DNS_MODE_DISABLED}
 	}
 	return prepareDNSRules(cfg.Mode, cfg.AllowDomains, cfg.DenyDomains, cfg.UpstreamServers,
-		s.defaultUpstream, s.limitCeilings, dnsLimitOverridesFromProto(cfg))
+		s.defaultUpstream, s.limitCeilings, dnsLimitOverridesFromProto(cfg), s.churnCeiling, cfg.MaxChurnUnits)
 }
 
 func (s *DNSServer) applyPreparedRules(prepared *preparedDNSRules) error {
@@ -520,7 +534,7 @@ func (s *DNSServer) applyPreparedRules(prepared *preparedDNSRules) error {
 			return err
 		}
 		resolver := ownershipResolver(prepared.mode, prepared.allowedDomains, prepared.deniedDomains)
-		if err := s.sink.ReconcilePolicy(prepared.limits, prepared.policyDomains, resolver, true); err != nil {
+		if err := s.sink.ReconcilePolicy(prepared.limits, prepared.churn, prepared.policyDomains, resolver, true); err != nil {
 			return errors.Join(err, s.sink.FailClosedIfAmbiguous(err))
 		}
 	}
@@ -529,6 +543,7 @@ func (s *DNSServer) applyPreparedRules(prepared *preparedDNSRules) error {
 	s.deniedDomains = cloneDomainRules(prepared.deniedDomains)
 	s.upstreams = append([]string(nil), prepared.upstreams...)
 	s.limits = prepared.limits
+	s.churnLimits = prepared.churn
 	s.generation++
 	s.logger.Debug().Str("mode", prepared.mode.String()).Uint64("generation", s.generation).Msg("DNS rules replaced")
 	return nil
@@ -544,7 +559,7 @@ func (s *DNSServer) preflightPreparedRules(prepared *preparedDNSRules) error {
 		return nil
 	}
 	resolver := ownershipResolver(prepared.mode, prepared.allowedDomains, prepared.deniedDomains)
-	return s.sink.PreflightPolicy(prepared.limits, prepared.policyDomains, resolver, true)
+	return s.sink.PreflightPolicy(prepared.limits, prepared.churn, prepared.policyDomains, resolver, true)
 }
 
 func cloneDomainRules(rules map[string]bool) map[string]bool {
@@ -564,6 +579,7 @@ func (s *DNSServer) currentConfigLocked() *apiv1.DnsConfig {
 		MaxIpsPerPolicyDomain: s.limits.maxIPsPerPolicyDomain,
 		MaxTrackedDomains:     s.limits.maxTrackedDomains,
 		MaxOwnershipEdges:     s.limits.maxOwnershipEdges,
+		MaxChurnUnits:         s.churnLimits.maxUnits,
 	}
 	for domain, include := range s.allowedDomains {
 		cfg.AllowDomains = append(cfg.AllowDomains, &apiv1.DomainEntry{Domain: domain, IncludeSubdomains: include})
@@ -589,7 +605,7 @@ func (s *DNSServer) mutateConfig(mut func(*apiv1.DnsConfig) error) error {
 	}
 	if s.sink != nil {
 		resolver := ownershipResolver(prepared.mode, prepared.allowedDomains, prepared.deniedDomains)
-		if err := s.sink.ReconcilePolicy(prepared.limits, prepared.policyDomains, resolver, false); err != nil {
+		if err := s.sink.ReconcilePolicy(prepared.limits, prepared.churn, prepared.policyDomains, resolver, false); err != nil {
 			return errors.Join(err, s.sink.FailClosedIfAmbiguous(err))
 		}
 	}
@@ -598,6 +614,7 @@ func (s *DNSServer) mutateConfig(mut func(*apiv1.DnsConfig) error) error {
 	s.deniedDomains = prepared.deniedDomains
 	s.upstreams = prepared.upstreams
 	s.limits = prepared.limits
+	s.churnLimits = prepared.churn
 	s.generation++
 	return nil
 }
@@ -683,7 +700,7 @@ func (s *DNSServer) ReplaceRules(mode apiv1.DnsMode, allowDomains, denyDomains [
 		upstreamServers = upstreamOverride[0]
 	}
 	prepared, err := prepareDNSRules(mode, allowDomains, denyDomains, upstreamServers,
-		s.defaultUpstream, s.limitCeilings, dnsAdmissionLimitOverrides{})
+		s.defaultUpstream, s.limitCeilings, dnsAdmissionLimitOverrides{}, s.churnCeiling, 0)
 	if err != nil {
 		return err
 	}
@@ -944,11 +961,11 @@ func (s *DNSServer) admitAndWrite(w dns.ResponseWriter, req, resp *dns.Msg, snap
 			failClosedErr = errors.Join(failClosedErr, s.sink.QuarantineAmbiguity(err))
 		}
 		admissionErr := errors.Join(err, failClosedErr)
-		if isDNSCapacityError(err) && !errors.Is(err, filter.ErrDNSAllowRollback) {
+		if isDNSAdmissionPressure(err) && !errors.Is(err, filter.ErrDNSAllowRollback) {
 			// The production sink owns the rate-limited capacity warning and
 			// cumulative counter. Keep per-query diagnostics below Warn so
 			// sustained resolver pressure cannot bypass that limiter.
-			s.logger.Debug().Err(admissionErr).Str("domain", snapshot.queryDomain).Msg("DNS response admission rejected by bounded capacity")
+			s.logger.Debug().Err(admissionErr).Str("domain", snapshot.queryDomain).Msg("DNS response rejected by bounded admission pressure")
 		} else {
 			s.logger.Warn().Err(admissionErr).Str("domain", snapshot.queryDomain).Msg("DNS response admission failed")
 		}

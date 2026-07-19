@@ -48,10 +48,10 @@ func (r *recordingSink) AdmitCanonicalResponse(req dnsCanonicalAdmissionRequest)
 	return nil
 }
 
-func (r *recordingSink) ReconcilePolicy(dnsAdmissionLimits, map[string]struct{}, dnsOwnershipResolver, bool) error {
+func (r *recordingSink) ReconcilePolicy(dnsAdmissionLimits, dnsChurnLimits, map[string]struct{}, dnsOwnershipResolver, bool) error {
 	return nil
 }
-func (r *recordingSink) PreflightPolicy(dnsAdmissionLimits, map[string]struct{}, dnsOwnershipResolver, bool) error {
+func (r *recordingSink) PreflightPolicy(dnsAdmissionLimits, dnsChurnLimits, map[string]struct{}, dnsOwnershipResolver, bool) error {
 	return nil
 }
 func (r *recordingSink) Expire(time.Time) error                  { return nil }
@@ -413,13 +413,13 @@ func TestDNSWireCanonicalAliasesSelectOnePolicyAndOwnershipKey(t *testing.T) {
 			prepared, err := prepareDNSRules(apiv1.DnsMode_DNS_MODE_DENYLIST,
 				[]*apiv1.DomainEntry{{Domain: tt.rule}},
 				[]*apiv1.DomainEntry{{Domain: tt.query}}, nil, "127.0.0.1:53", limits,
-				dnsAdmissionLimitOverrides{})
+				dnsAdmissionLimitOverrides{}, resolveDNSChurnCeiling(0, 0), 0)
 			require.NoError(t, err)
 			assert.Equal(t, map[string]struct{}{canonicalRule: {}}, prepared.policyDomains,
 				"the tracked-domain cap must count wire aliases once")
 			_, err = prepareDNSRules(apiv1.DnsMode_DNS_MODE_ALLOWLIST,
 				[]*apiv1.DomainEntry{{Domain: tt.rule}, {Domain: tt.query}}, nil,
-				nil, "127.0.0.1:53", limits, dnsAdmissionLimitOverrides{})
+				nil, "127.0.0.1:53", limits, dnsAdmissionLimitOverrides{}, resolveDNSChurnCeiling(0, 0), 0)
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), "duplicate canonical DNS allow domain")
 
@@ -1331,11 +1331,11 @@ func (s *failOnNthSink) AdmitCanonicalResponse(req dnsCanonicalAdmissionRequest)
 	return s.wrapped.AdmitCanonicalResponse(req)
 }
 
-func (s *failOnNthSink) ReconcilePolicy(l dnsAdmissionLimits, d map[string]struct{}, r dnsOwnershipResolver, a bool) error {
-	return s.wrapped.ReconcilePolicy(l, d, r, a)
+func (s *failOnNthSink) ReconcilePolicy(l dnsAdmissionLimits, c dnsChurnLimits, d map[string]struct{}, r dnsOwnershipResolver, a bool) error {
+	return s.wrapped.ReconcilePolicy(l, c, d, r, a)
 }
-func (s *failOnNthSink) PreflightPolicy(l dnsAdmissionLimits, d map[string]struct{}, r dnsOwnershipResolver, a bool) error {
-	return s.wrapped.PreflightPolicy(l, d, r, a)
+func (s *failOnNthSink) PreflightPolicy(l dnsAdmissionLimits, c dnsChurnLimits, d map[string]struct{}, r dnsOwnershipResolver, a bool) error {
+	return s.wrapped.PreflightPolicy(l, c, d, r, a)
 }
 func (s *failOnNthSink) Expire(now time.Time) error              { return s.wrapped.Expire(now) }
 func (s *failOnNthSink) SeedPinned() error                       { return nil }

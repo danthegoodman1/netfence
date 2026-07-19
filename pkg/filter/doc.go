@@ -86,6 +86,12 @@ type Filter interface {
 	AddDNSAllowedIPs(ips []net.IP) error
 	// RemoveDNSAllowedIPs is the inverse transactional batch operation.
 	RemoveDNSAllowedIPs(ips []net.IP) error
+	// ReplaceDNSAllowedIPs atomically removes and adds exact DNS keys as one
+	// transaction. Capacity is checked against the final state, so a caller may
+	// replace an entry in a full map without a fail-open remove/add gap. On any
+	// mutation failure the complete pre-call snapshot is restored or the error
+	// wraps ErrDNSAllowRollback.
+	ReplaceDNSAllowedIPs(remove, add []net.IP) error
 	// DNSAllowedIPs lists canonical, sorted exact-tier host addresses.
 	DNSAllowedIPs() ([]net.IP, error)
 	// DNSAllowOccupancy reports exact-tier per-family occupancy and capacity.

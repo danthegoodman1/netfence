@@ -69,11 +69,11 @@ already present in the eBPF map.
 
 | Path | Median latency |
 | --- | ---: |
-| Normal socket connect, no eBPF | ~2.956 us |
-| Warm allowlist, protected LPM hit | ~2.978 us |
-| Warm allowlist, DNS exact-host hit | ~3.005 us |
-| DNS exact overhead | ~49 ns vs baseline (+1.7%); ~27 ns vs LPM (+0.9%), within sample noise |
-| Allowlist miss, local block | ~1.849 us |
+| Normal socket connect, no eBPF | ~2.647 us |
+| Warm allowlist, protected LPM hit | ~2.691 us |
+| Warm allowlist, DNS exact-host hit | ~2.741 us |
+| DNS exact overhead | ~94 ns vs baseline (+3.6%); ~50 ns vs LPM (+1.9%), within sample noise |
+| Allowlist miss, local block | ~1.652 us |
 
 There is no "kernel miss asks parent process" path today. A cgroup allowlist
 miss is decided locally by eBPF and is blocked immediately.
@@ -87,10 +87,10 @@ is an improvement, not a regression.
 
 | Path | Reference | Current median | Delta |
 | --- | ---: | ---: | ---: |
-| Proxy query cold, in-process policy function | ~26.7 us | ~30.472 us | +14.1% |
-| Proxy query warm | ~25.3 us | ~29.039 us | +14.8% |
-| Allowlist query cold with local upstream | ~68.0 us | ~53.851 us | -20.8% |
-| Allowlist query warm with local upstream | ~67.4 us | ~52.772 us | -21.7% |
+| Proxy query cold, in-process policy function | ~26.7 us | ~31.336 us | +17.4% |
+| Proxy query warm | ~25.3 us | ~27.964 us | +10.5% |
+| Allowlist query cold with local upstream | ~68.0 us | ~53.510 us | -21.3% |
+| Allowlist query warm with local upstream | ~67.4 us | ~53.432 us | -20.7% |
 
 Cold rows synchronize through the real attachment mutation barrier and clear
 the benchmark ownership graph and fake exact-map snapshot between queries.
@@ -109,12 +109,18 @@ validation. Both it and normal resolver traffic traverse the attachment
 mutation barrier, while normal resolver traffic admits each complete response
 as one transaction.
 
-| Internal operation | Current median | Allocations |
+| Internal scalability diagnostic | Current median | Memory / allocations |
 | --- | ---: | ---: |
-| Cached single-record test-helper admission | ~0.366 us | 80 B, 4 allocs/op |
-| Cold ownership admission | ~0.344 us | 40 B, 2 allocs/op |
-| Warm ownership refresh with 4,095 unrelated entries | ~0.144 us | 0 B, 0 allocs/op |
-| No-op expiry scan across 4,095 entries | ~62.472 us/scan | 0 B, 0 allocs/op |
+| Cold new-key admission, empty ownership graph | ~370.3 ns | 232 B, 5 allocs/op |
+| Cold new-key admission, 4,095 unrelated entries | ~451.2 ns | 232 B, 5 allocs/op |
+| Physical-capacity pressure and LRU replacement | ~3.820 ms | ~4.23 MB (4,226,243 B), 4,336 allocs/op |
+| Exhausted physical-budget precheck | ~611.9 ns | 344 B, 9 allocs/op |
+| Maximum-edge pressure, 64-address response | ~6.849 ms | ~7.66 MB (7,658,774 B), 2,233 allocs/op |
+| Maximum-graph work guard, permitted full plan | ~2.763 ms | ~4.26 MB (4,264,386 B), 3,074 allocs/op |
+| Maximum-graph work guard, exhausted pre-projection rejection | ~10.935 us | 8.76 KB (8,760 B), 14 allocs/op |
+| Churn-budget operation near the numeric ceiling | ~18.98 ns | 0 B, 0 allocs/op |
+| Coherent ownership-stats snapshot | ~2.094 ns | 0 B, 0 allocs/op |
+| No-op expiry scan across 4,095 entries | ~74.849 us/scan | 0 B, 0 allocs/op |
 
 # Design
 
@@ -164,6 +170,11 @@ dns:
   max_ips_per_policy_domain: 1024
   max_tracked_domains: 1024
   max_ownership_edges: 8192
+  # Rolling physical-admission/LRU mutation budget and slow-planning work
+  # allowance. The window is daemon-global and immutable until restart;
+  # DnsConfig.max_churn_units may only lower the daemon ceiling.
+  max_churn_units: 8192
+  churn_window: 1m
 ```
 
 Attach returns the concrete `dns_address`; configure that exact address as the
@@ -215,21 +226,60 @@ tier. DNS DENYLIST default-allow and explicit-allow answers are tracked too,
 even while packet DENYLIST ignores exact allows, so a later packet-mode switch
 to ALLOWLIST can use already-returned cached addresses without a requery.
 
-All normal/live userspace ownership state is bounded by the five `dns.*`
+All normal/live userspace ownership state is bounded by the five ownership
 settings above. Restored synthetic provisional edges are exempt from those
 logical limits so they cannot be forgotten before reconciliation, but remain
-bounded by the physical IPv4/IPv6 exact maps. `DnsConfig` may only lower limits
-per attachment; zero inherits the daemon ceiling.
-Configured policy domains and live query domains share
+bounded by the physical IPv4/IPv6 exact maps. Configured policy domains and
+live query domains share
 `max_tracked_domains`, and each `(query, matched owner, IP)` TTL record consumes
-one `max_ownership_edges` slot. In this conservative bounded-admission stage,
-capacity pressure does not evict the live working set: Netfence increments
-`map_full_drops`, emits a rate-limited warning, and returns `SERVFAIL` for new
-address-bearing admissions. Capacity becomes available after TTL expiry or
-prompt policy removal. Raising a daemon `dns.*` ceiling requires a config
-change and daemon restart; per-attachment `DnsConfig` cannot raise it. Raising
-physical `filter.max_dns_rule_entries` is load-time sizing and also requires
-recreating the attachment/map (pinned maps cannot be resized in place).
+one `max_ownership_edges` slot.
+
+On pressure, admission projects expired TTL edges away first. It then reclaims
+complete logical query/owner edges with the least physical collateral before
+recency, followed by deterministic resolver-observed LRU (canonical IP breaks
+ties). A physical eviction removes the whole DNS exact key and all of its DNS
+owners. The incoming physical IP and exact incoming `(IP, query, owner)` edge
+are protected for the response transaction. Restored provisional ownership
+protects its physical key until authoritative reconciliation, but unrelated
+normal DNS metadata sharing that key may still be reclaimed. Authoritative
+control-plane/system allows and every deny remain in separate LPM tiers and
+are never candidates for DNS reclamation.
+
+The rolling per-attachment churn budget charges one unit for a new physical
+exact key and one for each live physical DNS key evicted; a full old-to-new
+replacement therefore costs two. Refreshes, logical-only reclamation, expiry,
+and policy removal cost zero. Events remain active while their age is less than
+`dns.churn_window` and expire at the exact boundary. `DnsConfig.max_churn_units`
+may only lower the daemon ceiling; zero inherits it. The window cannot be
+changed by the control plane, and changing the daemon ceiling/window requires
+a restart. Lowering and later raising an attachment limit does not forget
+still-active history.
+
+A separate rolling work ledger bounds expensive ownership-graph planning. Fast
+refreshes and ordinary admissions never touch it. Before a pressure path clones
+or analyzes the graph, Netfence charges stable work units derived from current
+physical keys, ownership edges, tracked domains, and response size relative to
+their immutable daemon/map ceilings. That attempt charge is retained even when
+the plan proves impossible or a later exact-map transaction fails, closing the
+zero-mutation retry path for CPU/allocation pressure without changing the
+transactional physical-churn accounting above. At the default ceilings, the
+allowance admits eight maximum-equivalent graph passes per window; lowering
+`DnsConfig.max_churn_units` retains at least one. Lowering and later raising the
+limit never rescales or forgets active work history.
+
+When no eligible DNS state can satisfy a bound, or either rolling allowance is
+exhausted, Netfence preserves the admitted working set and returns `SERVFAIL`
+without returning the unadmitted address. Capacity failures increment
+`map_full_drops`; physical-churn and planning-work throttles do not. Heartbeats
+expose exact-map current, capacity, and process-generation high-water values
+plus cumulative DNS LRU evictions, all admission failures, and an aggregate
+budget-throttle count covering both rolling guards. Capacity, physical-budget,
+and work-budget pressure/recovery logs are rate-limited independently.
+Operators can wait for TTL/window recovery, reduce response/domain churn or
+repeated cap-pressure attempts, or raise `DnsConfig.max_churn_units` up to the
+daemon `dns.max_churn_units` ceiling. Raising the daemon ceiling requires a
+restart; increasing `filter.max_dns_rule_entries` also requires recreating the
+attachment because pinned maps cannot be resized in place.
 
 ## Per host
 

@@ -41,7 +41,7 @@ func TestDNSOwnershipSharedIPPromptRemovalAndTTL(t *testing.T) {
 	assert.True(t, entry.owners.occupied)
 	assert.Equal(t, oneEdge, entry.owners.inlineKey)
 	assert.Equal(t, clock.Now().Add(time.Minute), entry.owners.inlineDeadline)
-	assert.Equal(t, clock.Now().Add(2*time.Minute), entry.owners.overflow[twoEdge])
+	assert.Equal(t, clock.Now().Add(2*time.Minute), entry.owners.overflow[twoEdge].deadline)
 	dnsAllowed, _ := ff.dnsSnapshot()
 	assert.ElementsMatch(t, []string{"203.0.113.10", "203.0.113.11"}, dnsAllowed)
 	_, lpmAllowed, _, _ := ff.snapshot()
@@ -127,7 +127,7 @@ func TestDNSOwnerEdgeSetInlineRefreshOverflowAndExpiryPromotion(t *testing.T) {
 	entry = manager.entries[netipMustParse(t, "192.0.2.90")]
 	assert.Equal(t, 2, entry.owners.len())
 	assert.Equal(t, clock.Now().Add(2*time.Minute), entry.owners.inlineDeadline)
-	assert.Equal(t, clock.Now().Add(3*time.Minute), entry.owners.overflow[twoEdge])
+	assert.Equal(t, clock.Now().Add(3*time.Minute), entry.owners.overflow[twoEdge].deadline)
 
 	clock.Advance(2 * time.Minute)
 	require.NoError(t, manager.expire(clock.Now()))
@@ -163,19 +163,26 @@ func TestDNSOwnerEdgeSetPermanentDeadlineWinsMaxUpdates(t *testing.T) {
 	assert.Nil(t, permanentFirst.overflow)
 }
 
-func TestDNSOwnerEdgeSetRemapCollapseUsesMaximumDeadline(t *testing.T) {
+func TestDNSOwnerEdgeSetRemapCollapseKeepsIndependentDeadlineAndRecencyMaxima(t *testing.T) {
 	clock := newFakeClock()
-	ff := &fakeFilter{dnsAllowed: []string{"192.0.2.91"}}
+	ff := &fakeFilter{dnsAllowed: []string{"192.0.2.91", "192.0.2.92"}}
 	limits := dnsAdmissionLimits{2, 2, 2, 4, 4}
 	manager, err := newDNSOwnershipManager(ff, limits, time.Second, clock.Now)
 	require.NoError(t, err)
 	addr := netipMustParse(t, "192.0.2.91")
+	otherAddr := netipMustParse(t, "192.0.2.92")
 	query := "collapse.example"
-	shortEdge := dnsOwnershipKey{query: query, owner: dnsPolicyOwner{kind: dnsOwnerRule, domain: "short.example"}}
-	longEdge := dnsOwnershipKey{query: query, owner: dnsPolicyOwner{kind: dnsOwnerRule, domain: "long.example"}}
-	owners := newDNSOwnerEdgeSet(shortEdge, clock.Now().Add(time.Minute))
-	assert.True(t, owners.putMax(longEdge, clock.Now().Add(3*time.Minute)))
-	manager.entries[addr] = dnsOwnedIP{addr: addr, owners: owners}
+	deadlineEdge := dnsOwnershipKey{query: query, owner: dnsPolicyOwner{kind: dnsOwnerRule, domain: "deadline.example"}}
+	recencyEdge := dnsOwnershipKey{query: query, owner: dnsPolicyOwner{kind: dnsOwnerRule, domain: "recency.example"}}
+	base := clock.Now()
+	owners := newDNSOwnerEdgeSet(deadlineEdge, base.Add(3*time.Minute))
+	owners.observe(deadlineEdge, base)
+	assert.True(t, owners.putMaxObserved(recencyEdge, base.Add(time.Minute), base.Add(2*time.Second)))
+	manager.entries[addr] = dnsOwnedIP{addr: addr, owners: owners, lastObserved: base.Add(2 * time.Second)}
+	otherEdge := dnsOwnershipKey{query: "other.example", owner: dnsPolicyOwner{kind: dnsOwnerRule, domain: "other.example"}}
+	otherOwners := newDNSOwnerEdgeSet(otherEdge, base.Add(time.Hour))
+	otherOwners.observe(otherEdge, base.Add(time.Second))
+	manager.entries[otherAddr] = dnsOwnedIP{addr: otherAddr, owners: otherOwners, lastObserved: base.Add(time.Second)}
 	manager.rebuildOwnershipIndexes()
 
 	newOwner := dnsPolicyOwner{kind: dnsOwnerRule, domain: "example"}
@@ -185,11 +192,23 @@ func TestDNSOwnerEdgeSetRemapCollapseUsesMaximumDeadline(t *testing.T) {
 	remapped := dnsOwnershipKey{query: query, owner: newOwner}
 	deadline, ok := entry.owners.get(remapped)
 	require.True(t, ok)
-	assert.Equal(t, clock.Now().Add(3*time.Minute), deadline,
+	assert.Equal(t, base.Add(3*time.Minute), deadline,
 		"colliding remaps retain the maximum edge deadline")
+	assert.Equal(t, base.Add(2*time.Second), entry.owners.observed(remapped),
+		"colliding remaps independently retain the maximum observation")
+	assert.Equal(t, base.Add(2*time.Second), entry.lastObserved)
 	assert.Equal(t, 1, entry.owners.len())
 	assert.Nil(t, entry.owners.overflow)
 	assert.Zero(t, ff.dnsRemoveCallCount())
+
+	require.NoError(t, manager.admit(dnsAdmissionRequest{
+		queryDomain: "incoming.example",
+		owner:       dnsPolicyOwner{kind: dnsOwnerRule, domain: "incoming.example"},
+		records:     []dnsAdmissionRecord{{ip: net.ParseIP("192.0.2.93"), ttl: time.Hour}},
+	}))
+	allowed, _ := ff.dnsSnapshot()
+	assert.ElementsMatch(t, []string{"192.0.2.91", "192.0.2.93"}, allowed,
+		"the retained recency maximum keeps the remapped key newer than .92 during physical LRU")
 	assertDNSOwnershipIndexes(t, manager)
 }
 
@@ -360,7 +379,7 @@ func TestDNSOwnershipCapacityFailureIsAtomicAndRefreshNeedsNoCapacity(t *testing
 	assert.Equal(t, 1, calls, "refreshing an admitted address needs no new exact capacity")
 }
 
-func TestDNSOwnershipTrackedDomainCapsIncludePolicyAndLiveQueriesAtomically(t *testing.T) {
+func TestDNSOwnershipTrackedDomainCapsIncludePolicyAndReclaimOldLiveQueries(t *testing.T) {
 	clock := newFakeClock()
 	ff := &fakeFilter{}
 	limits := dnsAdmissionLimits{2, 2, 2, 2, 4}
@@ -385,27 +404,25 @@ func TestDNSOwnershipTrackedDomainCapsIncludePolicyAndLiveQueriesAtomically(t *t
 		queryDomain: "a.example", owner: owner,
 		records: []dnsAdmissionRecord{{ip: shared, ttl: time.Minute}},
 	}))
-	before := cloneDNSOwnedEntries(manager.entries)
-	beforeQueries := cloneUint64Map(manager.queryRefs)
-	beforeEdges := manager.edgeCount
 	beforeAllowed, beforeCalls := ff.dnsSnapshot()
 
 	err = manager.admit(dnsAdmissionRequest{
 		queryDomain: "b.example", owner: owner,
 		records: []dnsAdmissionRecord{{ip: shared, ttl: time.Minute}},
 	})
-	require.ErrorIs(t, err, errDNSAdmissionCapacity)
-	assert.Contains(t, err.Error(), "total policy/query domains")
-	assert.Equal(t, before, manager.entries)
-	assert.Equal(t, beforeQueries, manager.queryRefs)
-	assert.Equal(t, beforeEdges, manager.edgeCount)
+	require.NoError(t, err)
+	entry := manager.entries[netipMustParse(t, "192.0.2.30")]
+	assert.Equal(t, []dnsOwnershipKey{{query: "b.example", owner: owner}}, dnsLRUEdgeKeys(entry),
+		"the old live query is reclaimed while the configured policy domain remains tracked")
+	assert.Equal(t, map[string]uint64{"b.example": 1}, manager.queryRefs)
+	assert.Equal(t, uint64(1), manager.edgeCount)
 	afterAllowed, afterCalls := ff.dnsSnapshot()
 	assert.Equal(t, beforeAllowed, afterAllowed)
-	assert.Equal(t, beforeCalls, afterCalls)
+	assert.Equal(t, beforeCalls, afterCalls, "logical reclamation on a shared physical key needs no exact-map call")
 	assertDNSOwnershipIndexes(t, manager)
 }
 
-func TestDNSOwnershipEdgeCapRejectsSharedPhysicalIPWithoutMutation(t *testing.T) {
+func TestDNSOwnershipEdgeCapReclaimsSharedPhysicalIPWithoutMapMutation(t *testing.T) {
 	clock := newFakeClock()
 	ff := &fakeFilter{}
 	limits := dnsAdmissionLimits{2, 2, 2, 4, 1}
@@ -417,9 +434,6 @@ func TestDNSOwnershipEdgeCapRejectsSharedPhysicalIPWithoutMutation(t *testing.T)
 		owner:       dnsPolicyOwner{kind: dnsOwnerRule, domain: "one.example"},
 		records:     []dnsAdmissionRecord{{ip: shared, ttl: time.Minute}},
 	}))
-	before := cloneDNSOwnedEntries(manager.entries)
-	beforeQueries := cloneUint64Map(manager.queryRefs)
-	beforeOwnerRefs := snapshotOwnerIPRefs(manager.ownerIPRefs)
 	beforeAllowed, beforeCalls := ff.dnsSnapshot()
 
 	err = manager.admit(dnsAdmissionRequest{
@@ -427,19 +441,19 @@ func TestDNSOwnershipEdgeCapRejectsSharedPhysicalIPWithoutMutation(t *testing.T)
 		owner:       dnsPolicyOwner{kind: dnsOwnerRule, domain: "two.example"},
 		records:     []dnsAdmissionRecord{{ip: shared, ttl: time.Minute}},
 	})
-	require.ErrorIs(t, err, errDNSAdmissionCapacity)
-	assert.Contains(t, err.Error(), "ownership would use 2 edges")
-	assert.Equal(t, before, manager.entries)
-	assert.Equal(t, beforeQueries, manager.queryRefs)
-	assert.Equal(t, beforeOwnerRefs, snapshotOwnerIPRefs(manager.ownerIPRefs))
+	require.NoError(t, err)
+	entry := manager.entries[netipMustParse(t, "192.0.2.31")]
+	assert.Equal(t, []dnsOwnershipKey{{
+		query: "two.example", owner: dnsPolicyOwner{kind: dnsOwnerRule, domain: "two.example"},
+	}}, dnsLRUEdgeKeys(entry))
 	assert.Equal(t, uint64(1), manager.edgeCount)
 	afterAllowed, afterCalls := ff.dnsSnapshot()
 	assert.Equal(t, beforeAllowed, afterAllowed)
-	assert.Equal(t, beforeCalls, afterCalls, "shared physical capacity must not be touched on edge rejection")
+	assert.Equal(t, beforeCalls, afterCalls, "shared physical capacity must not be touched on logical edge reclamation")
 	assertDNSOwnershipIndexes(t, manager)
 }
 
-func TestDNSOwnershipPolicyOwnerCapCountsUniqueIPsAcrossWildcardQueries(t *testing.T) {
+func TestDNSOwnershipPolicyOwnerCapReclaimsOldAddressAcrossWildcardQueries(t *testing.T) {
 	clock := newFakeClock()
 	ff := &fakeFilter{}
 	limits := dnsAdmissionLimits{2, 1, 1, 4, 4}
@@ -458,29 +472,24 @@ func TestDNSOwnershipPolicyOwnerCapCountsUniqueIPsAcrossWildcardQueries(t *testi
 	}
 	assert.Equal(t, uint64(2), manager.edgeCount, "each query keeps its own TTL edge")
 	assert.Equal(t, 1, manager.ownerIPRefs[owner].uniqueLen(), "a shared IP consumes one matched-owner address slot")
-	before := cloneDNSOwnedEntries(manager.entries)
-	beforeQueries := cloneUint64Map(manager.queryRefs)
-	beforeOwnerRefs := snapshotOwnerIPRefs(manager.ownerIPRefs)
-	beforeAllowed, beforeCalls := ff.dnsSnapshot()
-
 	err = manager.admit(dnsAdmissionRequest{
 		queryDomain: "c.example",
 		owner:       owner,
 		records:     []dnsAdmissionRecord{{ip: net.ParseIP("192.0.2.41"), ttl: time.Minute}},
 	})
-	require.ErrorIs(t, err, errDNSAdmissionCapacity)
-	assert.Contains(t, err.Error(), `policy owner "example" would own 2 unique addresses`)
-	assert.Equal(t, before, manager.entries)
-	assert.Equal(t, beforeQueries, manager.queryRefs)
-	assert.Equal(t, beforeOwnerRefs, snapshotOwnerIPRefs(manager.ownerIPRefs))
-	assert.Equal(t, uint64(2), manager.edgeCount)
-	afterAllowed, afterCalls := ff.dnsSnapshot()
-	assert.Equal(t, beforeAllowed, afterAllowed)
-	assert.Equal(t, beforeCalls, afterCalls)
+	require.NoError(t, err)
+	assert.NotContains(t, manager.queryRefs, "a.example")
+	assert.NotContains(t, manager.queryRefs, "b.example")
+	assert.Equal(t, map[string]uint64{"c.example": 1}, manager.queryRefs)
+	assert.Equal(t, uint64(1), manager.edgeCount)
+	afterAllowed, _ := ff.dnsSnapshot()
+	assert.Equal(t, []string{"192.0.2.41"}, afterAllowed)
+	assert.Equal(t, 1, ff.dnsReplaceCalls)
+	assert.Equal(t, uint64(1), manager.stats().lruEvictions)
 	assertDNSOwnershipIndexes(t, manager)
 }
 
-func TestDNSOwnerIPRefSetInlineOverflowFailureAndExpiryRebuild(t *testing.T) {
+func TestDNSOwnerIPRefSetInlineOverflowLRUAndExpiryRebuild(t *testing.T) {
 	clock := newFakeClock()
 	ff := &fakeFilter{}
 	limits := dnsAdmissionLimits{3, 1, 2, 4, 4}
@@ -515,27 +524,20 @@ func TestDNSOwnerIPRefSetInlineOverflowFailureAndExpiryRebuild(t *testing.T) {
 	assert.Equal(t, uint64(2), refs.count(firstAddr))
 	assert.Equal(t, uint64(1), refs.count(secondAddr))
 	assert.Len(t, refs.overflow, 1, "a second distinct owner address uses bounded overflow")
-	beforeEntries := cloneDNSOwnedEntries(manager.entries)
-	beforeQueries := cloneUint64Map(manager.queryRefs)
-	beforeRefs := snapshotOwnerIPRefs(manager.ownerIPRefs)
-	beforeInline := refs
-	beforeInline.overflow = cloneUint64Map(refs.overflow)
-	beforeAllowed, beforeCalls := ff.dnsSnapshot()
-
 	err = manager.admit(dnsAdmissionRequest{
 		queryDomain: "d.example",
 		owner:       owner,
 		records:     []dnsAdmissionRecord{{ip: net.ParseIP("192.0.2.52"), ttl: time.Minute}},
 	})
-	require.ErrorIs(t, err, errDNSAdmissionCapacity)
-	assert.Equal(t, beforeEntries, manager.entries)
-	assert.Equal(t, beforeQueries, manager.queryRefs)
-	assert.Equal(t, beforeRefs, snapshotOwnerIPRefs(manager.ownerIPRefs))
-	assert.Equal(t, beforeInline, manager.ownerIPRefs[owner],
-		"failed admission must not mutate the inline/overflow representation")
-	afterAllowed, afterCalls := ff.dnsSnapshot()
-	assert.Equal(t, beforeAllowed, afterAllowed)
-	assert.Equal(t, beforeCalls, afterCalls)
+	require.NoError(t, err)
+	refs = manager.ownerIPRefs[owner]
+	assert.Equal(t, 2, refs.uniqueLen())
+	assert.Zero(t, refs.count(firstAddr), "the oldest owner/address group is reclaimed as one unit")
+	assert.Equal(t, uint64(1), refs.count(secondAddr))
+	assert.Equal(t, uint64(1), refs.count(netipMustParse(t, "192.0.2.52")))
+	afterAllowed, _ := ff.dnsSnapshot()
+	assert.ElementsMatch(t, []string{"192.0.2.51", "192.0.2.52"}, afterAllowed)
+	assert.Equal(t, 1, ff.dnsReplaceCalls)
 
 	clock.Advance(time.Minute)
 	require.NoError(t, manager.expire(clock.Now()))
@@ -682,7 +684,7 @@ func TestDNSOwnershipWildcardRemapCapRejectsConfigAtomically(t *testing.T) {
 	overrides := dnsAdmissionLimitOverrides{maxIPsPerPolicyDomain: 1}
 	initial, err := prepareDNSRules(apiv1.DnsMode_DNS_MODE_ALLOWLIST,
 		[]*apiv1.DomainEntry{{Domain: "a.example"}, {Domain: "b.example"}}, nil, nil,
-		server.defaultDNSUpstream, dnsServer.limitCeilings, overrides)
+		server.defaultDNSUpstream, dnsServer.limitCeilings, overrides, dnsServer.churnCeiling, 0)
 	require.NoError(t, err)
 	require.NoError(t, dnsServer.applyPreparedRules(initial))
 	require.NoError(t, dnsServer.addIPToFilter("a.example", net.ParseIP("192.0.2.1"), 32, 60))
@@ -690,7 +692,7 @@ func TestDNSOwnershipWildcardRemapCapRejectsConfigAtomically(t *testing.T) {
 
 	wildcard, err := prepareDNSRules(apiv1.DnsMode_DNS_MODE_ALLOWLIST,
 		[]*apiv1.DomainEntry{{Domain: "example", IncludeSubdomains: true}}, nil, nil,
-		server.defaultDNSUpstream, dnsServer.limitCeilings, overrides)
+		server.defaultDNSUpstream, dnsServer.limitCeilings, overrides, dnsServer.churnCeiling, 0)
 	require.NoError(t, err)
 	err = dnsServer.applyPreparedRules(wildcard)
 	require.Error(t, err)
@@ -911,27 +913,372 @@ func TestDNSCapacityWarningsAreRateLimitedButOtherFailuresRemainVisible(t *testi
 	assert.Equal(t, uint64(5), sink.CapacityDropCount())
 }
 
-func TestDNSOwnershipCounterArithmeticCannotWrap(t *testing.T) {
-	ff := &fakeFilter{}
-	limits := dnsAdmissionLimits{math.MaxUint32, 1, math.MaxUint32, math.MaxUint32, math.MaxUint32}
-	manager, err := newDNSOwnershipManager(ff, limits, time.Second, time.Now)
-	require.NoError(t, err)
-	manager.normalIPv4 = math.MaxUint32
-	err = manager.admit(dnsAdmissionRequest{
-		queryDomain: "overflow.example",
-		owner:       dnsPolicyOwner{kind: dnsOwnerRule, domain: "overflow.example"},
-		records:     []dnsAdmissionRecord{{ip: net.ParseIP("192.0.2.1"), ttl: time.Minute}},
-	})
-	require.ErrorIs(t, err, errDNSAdmissionCapacity)
-	assert.Contains(t, err.Error(), "4294967296")
+func TestDNSCapacityAndBudgetWarningsUseIndependentRateLimits(t *testing.T) {
+	server, _, _, _, dnsServer := newTestServerWithAttachment(t)
+	clock := newFakeClock()
+	server.now = clock.Now
+	var logs bytes.Buffer
+	sink := dnsServer.sink.(*dnsFilterSink)
+	sink.logger = zerolog.New(&logs)
 
-	manager.normalIPv4 = 0
-	manager.edgeCount = math.MaxUint32
-	err = manager.admit(dnsAdmissionRequest{
-		queryDomain: "overflow.example",
-		owner:       dnsPolicyOwner{kind: dnsOwnerRule, domain: "overflow.example"},
-		records:     []dnsAdmissionRecord{{ip: net.ParseIP("192.0.2.1"), ttl: time.Minute}},
-	})
+	sink.manager.limits.maxIPsPerResponse = 0
+	req := dnsAdmissionRequest{
+		queryDomain: "capacity.example",
+		owner:       dnsPolicyOwner{kind: dnsOwnerRule, domain: "capacity.example"},
+		records:     []dnsAdmissionRecord{{ip: net.ParseIP("192.0.2.1"), ttl: time.Hour}},
+	}
+	require.ErrorIs(t, sink.AdmitResponse(req), errDNSAdmissionCapacity)
+	require.ErrorIs(t, sink.AdmitResponse(req), errDNSAdmissionCapacity)
+
+	sink.manager.limits.maxIPsPerResponse = 1
+	sink.manager.churnLimits.maxUnits = 1
+	require.NoError(t, sink.AdmitResponse(req))
+	req.queryDomain = "budget.example"
+	req.owner.domain = "budget.example"
+	req.records[0].ip = net.ParseIP("192.0.2.2")
+	require.ErrorIs(t, sink.AdmitResponse(req), errDNSAdmissionBudget)
+	require.ErrorIs(t, sink.AdmitResponse(req), errDNSAdmissionBudget)
+
+	output := logs.String()
+	assert.Equal(t, 1, strings.Count(output, "DNS exact-tier admission rejected; existing working set preserved"),
+		"same-class capacity failures remain rate-limited")
+	assert.Equal(t, 1, strings.Count(output, "DNS rolling churn budget throttled admission; existing working set preserved"),
+		"the first distinct budget warning is not suppressed by a recent capacity warning")
+	assert.Equal(t, uint64(2), sink.CapacityDropCount())
+	assert.Equal(t, uint64(2), sink.BudgetThrottleCount())
+	assert.Equal(t, uint64(4), sink.AdmissionFailureCount())
+}
+
+func TestDNSPressureRecoveryClearsOnlyEvidenceBackedDimensions(t *testing.T) {
+	_, _, _, _, dnsServer := newTestServerWithAttachment(t)
+	var logs bytes.Buffer
+	sink := dnsServer.sink.(*dnsFilterSink)
+	sink.logger = zerolog.New(&logs)
+
+	sink.pressureActive.Store(dnsCapacityPressure | dnsBudgetPressure)
+	sink.pressureReported.Store(dnsCapacityPressure | dnsBudgetPressure)
+	require.NoError(t, sink.recordAdmissionResult(nil, dnsAdmissionOutcome{
+		changed: true, resolvedPressure: dnsCapacityPressure | dnsBudgetPressure,
+	}))
+	assert.Equal(t, dnsBudgetPressure, sink.pressureActive.Load(),
+		"a zero-unit slow-path success may resolve capacity but cannot prove budget recovery")
+	assert.Contains(t, logs.String(), "DNS admission pressure partially recovered")
+	assert.Contains(t, logs.String(), `"capacity_recovered":true`)
+	assert.Contains(t, logs.String(), `"budget_recovered":false`)
+
+	before := logs.Len()
+	require.NoError(t, sink.recordAdmissionResult(nil, dnsAdmissionOutcome{changed: true}))
+	require.NoError(t, sink.recordAdmissionResult(nil, dnsAdmissionOutcome{
+		changed: true, resolvedPressure: dnsBudgetPressure,
+	}))
+	assert.Equal(t, dnsBudgetPressure, sink.pressureActive.Load(),
+		"expired same-physical reauthorization and synthetic zero-unit evidence do not clear budget pressure")
+	assert.Equal(t, before, logs.Len())
+
+	require.NoError(t, sink.recordAdmissionResult(nil, dnsAdmissionOutcome{
+		changed: true, committedUnits: 1, resolvedPressure: dnsBudgetPressure,
+	}))
+	assert.Zero(t, sink.pressureActive.Load())
+	assert.Contains(t, logs.String(), `"budget_recovered":true`)
+	assert.Contains(t, logs.String(), "DNS admission pressure recovered")
+
+	logs.Reset()
+	sink.pressureActive.Store(dnsCapacityPressure)
+	sink.pressureReported.Store(dnsCapacityPressure)
+	require.NoError(t, sink.recordAdmissionResult(nil, dnsAdmissionOutcome{
+		changed: true, resolvedPressure: dnsCapacityPressure,
+	}))
+	assert.Zero(t, sink.pressureActive.Load(), "capacity-only pressure clears independently on a zero-unit slow success")
+
+	logs.Reset()
+	sink.pressureActive.Store(dnsBudgetPressure)
+	sink.pressureReported.Store(dnsBudgetPressure)
+	require.NoError(t, sink.recordAdmissionResult(nil, dnsAdmissionOutcome{
+		changed: true, committedUnits: 1, resolvedPressure: dnsBudgetPressure,
+	}))
+	assert.Zero(t, sink.pressureActive.Load(), "budget-only pressure clears independently on a charged success")
+}
+
+func TestDNSWorkPressureRequiresPermittedSlowPlanEvidenceAndFlapLogsStayBounded(t *testing.T) {
+	_, _, _, _, dnsServer := newTestServerWithAttachment(t)
+	var logs bytes.Buffer
+	sink := dnsServer.sink.(*dnsFilterSink)
+	sink.logger = zerolog.New(&logs)
+
+	for range 2 {
+		err := sink.recordAdmissionResult(dnsWorkBudgetError("synthetic full-graph attempt"), dnsAdmissionOutcome{})
+		require.ErrorIs(t, err, errDNSAdmissionWorkBudget)
+	}
+	assert.Equal(t, dnsWorkPressure, sink.pressureActive.Load())
+	assert.Equal(t, dnsWorkPressure, sink.pressureReported.Load())
+	assert.Equal(t, 1, strings.Count(logs.String(), "DNS rolling ownership-planning work budget throttled admission"),
+		"work pressure has its own warning limiter")
+
+	require.NoError(t, sink.recordAdmissionResult(nil, dnsAdmissionOutcome{
+		changed: true, committedUnits: 1, resolvedPressure: dnsCapacityPressure | dnsBudgetPressure,
+	}))
+	assert.Equal(t, dnsWorkPressure, sink.pressureActive.Load(),
+		"a fast or physical-only success cannot prove that slow planning is available again")
+	assert.Zero(t, strings.Count(logs.String(), "DNS admission pressure recovered"))
+
+	require.NoError(t, sink.recordAdmissionResult(nil, dnsAdmissionOutcome{
+		changed: true, resolvedPressure: dnsWorkPressure,
+	}))
+	assert.Zero(t, sink.pressureActive.Load())
+	assert.Zero(t, sink.pressureReported.Load())
+	assert.Contains(t, logs.String(), `"work_budget_recovered":true`)
+	assert.Equal(t, 1, strings.Count(logs.String(), "DNS admission pressure recovered"))
+
+	for range 20 {
+		require.ErrorIs(t,
+			sink.recordAdmissionResult(dnsWorkBudgetError("synthetic work flap"), dnsAdmissionOutcome{}),
+			errDNSAdmissionWorkBudget)
+		require.NoError(t, sink.recordAdmissionResult(nil, dnsAdmissionOutcome{
+			changed: true, resolvedPressure: dnsWorkPressure,
+		}))
+	}
+	assert.Equal(t, 1, strings.Count(logs.String(), "DNS rolling ownership-planning work budget throttled admission"))
+	assert.Equal(t, 1, strings.Count(logs.String(), "DNS admission pressure recovered"),
+		"suppressed work warnings cannot create unpaired recovery logs")
+	assert.Zero(t, sink.pressureActive.Load())
+	assert.Zero(t, sink.pressureReported.Load())
+	assert.Equal(t, uint64(22), sink.BudgetThrottleCount())
+	assert.Equal(t, uint64(22), sink.AdmissionFailureCount())
+}
+
+func TestDNSRealBudgetRecoveryRequiresChargedSuccessAtExactWindow(t *testing.T) {
+	server, _, _, _, dnsServer := newTestServerWithAttachment(t)
+	clock := newFakeClock()
+	server.now = clock.Now
+	var logs bytes.Buffer
+	sink := dnsServer.sink.(*dnsFilterSink)
+	sink.logger = zerolog.New(&logs)
+	sink.manager.minTTL = time.Second
+	sink.manager.churnLimits.maxUnits = 1
+
+	request := func(query, rawIP string, ttl time.Duration) dnsAdmissionRequest {
+		return dnsAdmissionRequest{
+			queryDomain: query,
+			owner:       dnsPolicyOwner{kind: dnsOwnerRule, domain: query},
+			records:     []dnsAdmissionRecord{{ip: net.ParseIP(rawIP), ttl: ttl}},
+		}
+	}
+	require.NoError(t, sink.AdmitResponse(request("expiring.example", "192.0.2.1", time.Second)))
+	require.ErrorIs(t, sink.AdmitResponse(request("new.example", "192.0.2.2", time.Hour)), errDNSAdmissionBudget)
+	assert.Equal(t, dnsBudgetPressure, sink.pressureActive.Load())
+
+	clock.Advance(2 * time.Second)
+	require.NoError(t, sink.AdmitResponse(request("expiring.example", "192.0.2.1", time.Hour)))
+	assert.Equal(t, dnsBudgetPressure, sink.pressureActive.Load(),
+		"expired same-physical reauthorization costs zero and cannot clear budget pressure")
+	require.ErrorIs(t, sink.AdmitResponse(request("new.example", "192.0.2.2", time.Hour)), errDNSAdmissionBudget)
+	assert.Equal(t, 0, strings.Count(logs.String(), "DNS admission pressure recovered"))
+
+	clock.Advance(58 * time.Second)
+	require.NoError(t, sink.AdmitResponse(request("new.example", "192.0.2.2", time.Hour)))
+	assert.Zero(t, sink.pressureActive.Load())
+	assert.Equal(t, 1, strings.Count(logs.String(), "DNS admission pressure recovered"),
+		"the first charged admission at age==window emits exactly one visible recovery")
+}
+
+func TestDNSRealSlowLogicalSuccessPartiallyRecoversCapacityNotBudget(t *testing.T) {
+	server, _, _, _, dnsServer := newTestServerWithAttachment(t)
+	clock := newFakeClock()
+	server.now = clock.Now
+	var logs bytes.Buffer
+	sink := dnsServer.sink.(*dnsFilterSink)
+	sink.logger = zerolog.New(&logs)
+	sink.manager.churnLimits.maxUnits = 1
+	sink.manager.limits.maxOwnershipEdges = 1
+
+	request := func(query, rawIP string) dnsAdmissionRequest {
+		return dnsAdmissionRequest{
+			queryDomain: query,
+			owner:       dnsPolicyOwner{kind: dnsOwnerRule, domain: query},
+			records:     []dnsAdmissionRecord{{ip: net.ParseIP(rawIP), ttl: time.Hour}},
+		}
+	}
+	require.NoError(t, sink.AdmitResponse(request("old.example", "192.0.2.1")))
+	require.ErrorIs(t, sink.AdmitResponse(request("budget.example", "192.0.2.2")), errDNSAdmissionBudget)
+	sink.manager.limits.maxIPsPerResponse = 0
+	require.ErrorIs(t, sink.AdmitResponse(request("capacity.example", "192.0.2.3")), errDNSAdmissionCapacity)
+	assert.Equal(t, dnsCapacityPressure|dnsBudgetPressure, sink.pressureActive.Load())
+	assert.Equal(t, dnsCapacityPressure|dnsBudgetPressure, sink.pressureReported.Load())
+
+	sink.manager.limits.maxIPsPerResponse = 1
+	require.NoError(t, sink.AdmitResponse(request("logical.example", "192.0.2.1")))
+	assert.Equal(t, dnsBudgetPressure, sink.pressureActive.Load())
+	assert.Equal(t, dnsBudgetPressure, sink.pressureReported.Load())
+	assert.Contains(t, logs.String(), "DNS admission pressure partially recovered")
+	assert.Contains(t, logs.String(), `"capacity_recovered":true`)
+	assert.Contains(t, logs.String(), `"budget_recovered":false`)
+
+	sink.manager.limits.maxOwnershipEdges = 2
+	clock.Advance(time.Minute)
+	require.NoError(t, sink.AdmitResponse(request("charged.example", "192.0.2.2")))
+	assert.Zero(t, sink.pressureActive.Load())
+	assert.Zero(t, sink.pressureReported.Load())
+}
+
+func TestDNSPressureRecoveryLogsStayBoundedDuringFailSuccessFlapping(t *testing.T) {
+	server, _, _, _, dnsServer := newTestServerWithAttachment(t)
+	clock := newFakeClock()
+	server.now = clock.Now
+	var logs bytes.Buffer
+	sink := dnsServer.sink.(*dnsFilterSink)
+	sink.logger = zerolog.New(&logs)
+
+	for range 20 {
+		require.Error(t, sink.recordAdmissionResult(dnsCapacityError("synthetic flap"), dnsAdmissionOutcome{}))
+		require.NoError(t, sink.recordAdmissionResult(nil, dnsAdmissionOutcome{
+			changed: true, committedUnits: 1, resolvedPressure: dnsCapacityPressure,
+		}))
+	}
+	assert.Equal(t, 1, strings.Count(logs.String(), "DNS exact-tier admission rejected; existing working set preserved"))
+	assert.Equal(t, 1, strings.Count(logs.String(), "DNS admission pressure recovered"),
+		"a suppressed pressure warning cannot create an unpaired recovery log")
+	assert.Zero(t, sink.pressureActive.Load())
+	assert.Zero(t, sink.pressureReported.Load())
+}
+
+func TestDNSPressureLogLimiterHandlesUnixEpochAndExactBoundary(t *testing.T) {
+	var limiter dnsPressureLogLimiter
+	assert.True(t, dnsPressureLogAllowed(&limiter, 0))
+	assert.False(t, dnsPressureLogAllowed(&limiter, 0), "Unix epoch must not alias the uninitialized limiter")
+	assert.False(t, dnsPressureLogAllowed(&limiter, int64(dnsCapacityWarnInterval)-1))
+	assert.True(t, dnsPressureLogAllowed(&limiter, int64(dnsCapacityWarnInterval)),
+		"the limiter reopens at the exact interval boundary")
+}
+
+func TestDNSPressureTelemetryExportsOccupancyHighWaterEvictionsAndSeparateDrops(t *testing.T) {
+	server, _, _, ff, dnsServer := newTestServerWithAttachment(t)
+	sink := dnsServer.sink.(*dnsFilterSink)
+	sink.manager.limits = dnsAdmissionLimits{1, 1, 1, 4, 4}
+	sink.manager.churnLimits.maxUnits = 3
+
+	request := func(query, rawIP string) dnsAdmissionRequest {
+		return dnsAdmissionRequest{
+			queryDomain: query,
+			owner:       dnsPolicyOwner{kind: dnsOwnerRule, domain: query},
+			records:     []dnsAdmissionRecord{{ip: net.ParseIP(rawIP), ttl: time.Hour}},
+		}
+	}
+	require.NoError(t, sink.AdmitResponse(request("one.example", "192.0.2.1")))
+	require.NoError(t, sink.AdmitResponse(request("two.example", "192.0.2.2")))
+	require.ErrorIs(t, sink.AdmitResponse(request("three.example", "192.0.2.3")), errDNSAdmissionBudget)
+	sink.manager.limits.maxIPsPerResponse = 0
+	require.ErrorIs(t, sink.AdmitResponse(request("capacity.example", "192.0.2.4")), errDNSAdmissionCapacity)
+	sink.manager.limits.maxIPsPerResponse = 1
+	sink.manager.limits.maxIPsPerFamily = 2
+	sink.manager.churnLimits.maxUnits = 8
+	ff.dnsAddErr = errors.New("injected exact I/O")
+	require.Error(t, sink.AdmitResponse(request("io.example", "192.0.2.5")))
+	ff.dnsAddErr = errors.Join(errors.New("injected ambiguous exact I/O"), filter.ErrDNSAllowRollback)
+	require.ErrorIs(t, sink.AdmitResponse(request("rollback.example", "192.0.2.6")), filter.ErrDNSAllowRollback)
+	ff.dnsAddErr = nil
+	require.ErrorIs(t,
+		sink.recordAdmissionResult(dnsWorkBudgetError("synthetic planner saturation"), dnsAdmissionOutcome{}),
+		errDNSAdmissionWorkBudget)
+
+	stats := server.GetAttachmentStats()
+	require.Len(t, stats, 1)
+	assert.Equal(t, uint32(1), stats[0].DnsExactIpv4Entries)
+	assert.Equal(t, sink.manager.capacity.IPv4Capacity, stats[0].DnsExactIpv4Capacity)
+	assert.Equal(t, uint32(1), stats[0].DnsExactIpv4HighWater)
+	assert.Zero(t, stats[0].DnsExactIpv6Entries)
+	assert.Equal(t, sink.manager.capacity.IPv6Capacity, stats[0].DnsExactIpv6Capacity)
+	assert.Zero(t, stats[0].DnsExactIpv6HighWater)
+	assert.Equal(t, uint64(1), stats[0].DnsLruEvictions)
+	assert.Equal(t, uint64(5), stats[0].DnsAdmissionFailures,
+		"telemetry counts mutation budget, work budget, capacity, arbitrary I/O, and rollback-ambiguous failures")
+	assert.Equal(t, uint64(2), stats[0].DnsBudgetThrottles,
+		"the public budget throttle counter aggregates physical-churn and slow-plan work guards")
+	assert.Equal(t, uint64(1), stats[0].MapFullDrops,
+		"rolling budget throttle is not a compatibility map-full drop")
+}
+
+func TestDNSOwnershipCounterArithmeticCannotWrap(t *testing.T) {
+	limits := dnsAdmissionLimits{math.MaxUint32, 1, math.MaxUint32, math.MaxUint32, math.MaxUint32}
+	for _, tc := range []struct {
+		name       string
+		mutate     func(*dnsOwnershipManager)
+		wantDetail string
+	}{
+		{"physical", func(m *dnsOwnershipManager) { m.physicalIPv4 = math.MaxUint64 }, "physical exact-entry counter overflow"},
+		{"normal", func(m *dnsOwnershipManager) { m.normalIPv4 = math.MaxUint64 }, "normal exact-entry counter overflow"},
+		{"edges", func(m *dnsOwnershipManager) { m.edgeCount = math.MaxUint64 }, "ownership edge counter overflow"},
+		{"domains", func(m *dnsOwnershipManager) { m.trackedDomains = math.MaxUint64 }, "tracked-domain counter overflow"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ff := &fakeFilter{}
+			manager, err := newDNSOwnershipManager(ff, limits, time.Second, time.Now)
+			require.NoError(t, err)
+			tc.mutate(manager)
+			beforeEntries := cloneDNSOwnedEntries(manager.entries)
+			beforeBudget := manager.churnBudget
+			beforeStats := manager.stats()
+			beforeScalars := []uint64{manager.normalIPv4, manager.normalIPv6, manager.physicalIPv4, manager.physicalIPv6, manager.edgeCount, manager.trackedDomains}
+
+			err = manager.admit(dnsAdmissionRequest{
+				queryDomain: "overflow.example",
+				owner:       dnsPolicyOwner{kind: dnsOwnerRule, domain: "overflow.example"},
+				records:     []dnsAdmissionRecord{{ip: net.ParseIP("192.0.2.1"), ttl: time.Minute}},
+			})
+			require.ErrorIs(t, err, errDNSAdmissionCapacity)
+			assert.Contains(t, err.Error(), tc.wantDetail)
+			assert.Equal(t, beforeEntries, manager.entries)
+			assert.Equal(t, beforeBudget.buckets, manager.churnBudget.buckets)
+			assert.Equal(t, beforeBudget.head, manager.churnBudget.head)
+			assert.Equal(t, beforeBudget.activeUnits, manager.churnBudget.activeUnits)
+			assert.Equal(t, beforeStats, manager.stats())
+			assert.Equal(t, beforeScalars, []uint64{manager.normalIPv4, manager.normalIPv6, manager.physicalIPv4, manager.physicalIPv6, manager.edgeCount, manager.trackedDomains})
+			allowed, calls := ff.dnsSnapshot()
+			assert.Empty(t, allowed)
+			assert.Zero(t, calls)
+		})
+	}
+
+	value, ok := checkedAddUint64(math.MaxUint64, 1)
+	assert.False(t, ok)
+	assert.Zero(t, value)
+}
+
+func TestDNSOwnershipConservativeSlowProjectionSelfHealsStaleAggregates(t *testing.T) {
+	limits := dnsAdmissionLimits{math.MaxUint32, 1, math.MaxUint32, math.MaxUint32, math.MaxUint32}
+	for _, tc := range []struct {
+		name   string
+		mutate func(*dnsOwnershipManager)
+	}{
+		{"physical", func(m *dnsOwnershipManager) { m.physicalIPv4 = math.MaxUint32 }},
+		{"normal", func(m *dnsOwnershipManager) { m.normalIPv4 = math.MaxUint32 }},
+		{"edges", func(m *dnsOwnershipManager) { m.edgeCount = math.MaxUint32 }},
+		{"domains", func(m *dnsOwnershipManager) { m.trackedDomains = math.MaxUint32 }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ff := &fakeFilter{}
+			manager, err := newDNSOwnershipManager(ff, limits, time.Second, time.Now)
+			require.NoError(t, err)
+			tc.mutate(manager)
+			require.NoError(t, manager.admit(dnsAdmissionRequest{
+				queryDomain: "heal.example",
+				owner:       dnsPolicyOwner{kind: dnsOwnerRule, domain: "heal.example"},
+				records:     []dnsAdmissionRecord{{ip: net.ParseIP("192.0.2.1"), ttl: time.Minute}},
+			}))
+			assertDNSOwnershipIndexes(t, manager)
+			allowed, calls := ff.dnsSnapshot()
+			assert.Equal(t, []string{"192.0.2.1"}, allowed)
+			assert.Equal(t, 1, calls)
+		})
+	}
+
+	usage := dnsOwnedUsage{
+		normal4:  uint64(math.MaxUint32) + 1,
+		domains:  map[string]struct{}{},
+		ownerIPs: map[dnsPolicyOwner]map[netip.Addr]struct{}{},
+	}
+	violations := dnsUsageViolations(usage, limits, filter.DNSAllowOccupancy{IPv4Capacity: math.MaxUint32, IPv6Capacity: math.MaxUint32})
+	assert.True(t, violations.ipv4)
+	err := dnsUsageCapacityError(usage, limits, filter.DNSAllowOccupancy{IPv4Capacity: math.MaxUint32, IPv6Capacity: math.MaxUint32})
 	require.ErrorIs(t, err, errDNSAdmissionCapacity)
 	assert.Contains(t, err.Error(), "4294967296")
 }
@@ -1109,12 +1456,17 @@ func snapshotOwnerIPRefs(input map[dnsPolicyOwner]dnsOwnerIPRefSet) map[dnsPolic
 	return snapshot
 }
 
-func assertDNSOwnershipIndexes(t *testing.T, manager *dnsOwnershipManager) {
+func assertDNSOwnershipIndexes(t testing.TB, manager *dnsOwnershipManager) {
 	t.Helper()
-	want4, want6, wantEdges := uint64(0), uint64(0), uint64(0)
+	want4, want6, wantPhysical4, wantPhysical6, wantEdges := uint64(0), uint64(0), uint64(0), uint64(0), uint64(0)
 	wantQueries := make(map[string]uint64)
 	wantOwnerIPs := make(map[dnsPolicyOwner]map[netip.Addr]uint64)
 	for addr, entry := range manager.entries {
+		if addr.Is4() {
+			wantPhysical4++
+		} else {
+			wantPhysical6++
+		}
 		if entryHasNormalOwner(entry) {
 			if addr.Is4() {
 				want4++
@@ -1138,7 +1490,19 @@ func assertDNSOwnershipIndexes(t *testing.T, manager *dnsOwnershipManager) {
 	}
 	assert.Equal(t, want4, manager.normalIPv4)
 	assert.Equal(t, want6, manager.normalIPv6)
+	assert.Equal(t, wantPhysical4, manager.physicalIPv4)
+	assert.Equal(t, wantPhysical6, manager.physicalIPv6)
 	assert.Equal(t, wantEdges, manager.edgeCount)
 	assert.Equal(t, wantQueries, manager.queryRefs)
 	assert.Equal(t, wantOwnerIPs, snapshotOwnerIPRefs(manager.ownerIPRefs))
+	wantDomains := cloneDomainSet(manager.policyDomains)
+	for query := range wantQueries {
+		wantDomains[query] = struct{}{}
+	}
+	assert.Equal(t, uint64(len(wantDomains)), manager.trackedDomains)
+	stats := manager.stats()
+	assert.Equal(t, saturatingDNSCount(wantPhysical4), stats.occupancy.IPv4Entries)
+	assert.Equal(t, saturatingDNSCount(wantPhysical6), stats.occupancy.IPv6Entries)
+	assert.GreaterOrEqual(t, stats.highWater4, stats.occupancy.IPv4Entries)
+	assert.GreaterOrEqual(t, stats.highWater6, stats.occupancy.IPv6Entries)
 }

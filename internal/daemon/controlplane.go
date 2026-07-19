@@ -1135,9 +1135,13 @@ func (c *ControlPlaneClient) validateSubscribedAck(id string, ack *apiv1.Subscri
 	if err != nil {
 		return err
 	}
+	churnCeiling, err := c.server.dnsChurnCeilingForAttachment(id)
+	if err != nil {
+		return err
+	}
 	if _, err := prepareDNSRules(dnsConfig.Mode, dnsConfig.AllowDomains, dnsConfig.DenyDomains,
 		dnsConfig.UpstreamServers, c.server.defaultDNSUpstream, ceilings,
-		dnsLimitOverridesFromProto(dnsConfig)); err != nil {
+		dnsLimitOverridesFromProto(dnsConfig), churnCeiling, dnsConfig.MaxChurnUnits); err != nil {
 		return fmt.Errorf("validating DNS configuration: %w", err)
 	}
 	_, _, err = c.parseBulkCIDRs(id, &apiv1.BulkUpdate{
@@ -1189,9 +1193,13 @@ func (c *ControlPlaneClient) applyBulkUpdate(id string, update *apiv1.BulkUpdate
 	if err != nil {
 		return err
 	}
+	dnsChurnCeiling, err := c.server.dnsChurnCeilingForAttachment(id)
+	if err != nil {
+		return err
+	}
 	preparedDNS, err := prepareDNSRules(dnsConfig.Mode, dnsConfig.AllowDomains, dnsConfig.DenyDomains,
 		dnsConfig.UpstreamServers, c.server.defaultDNSUpstream, dnsCeilings,
-		dnsLimitOverridesFromProto(dnsConfig))
+		dnsLimitOverridesFromProto(dnsConfig), dnsChurnCeiling, dnsConfig.MaxChurnUnits)
 	if err != nil {
 		return fmt.Errorf("validating DNS configuration: %w", err)
 	}

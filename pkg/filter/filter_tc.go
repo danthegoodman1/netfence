@@ -633,6 +633,16 @@ func (f *TCFilter) RemoveDNSAllowedIPs(ips []net.IP) error {
 	return removeExactDNSIPs(b, ips)
 }
 
+func (f *TCFilter) ReplaceDNSAllowedIPs(remove, add []net.IP) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	b, err := f.exactDNSBackendLocked()
+	if err != nil {
+		return err
+	}
+	return replaceExactDNSIPs(b, remove, add)
+}
+
 func (f *TCFilter) DNSAllowedIPs() ([]net.IP, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

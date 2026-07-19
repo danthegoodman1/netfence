@@ -28,9 +28,12 @@ import (
 
 const dnsWorkloadHelperEnv = "NETFENCE_DNS_WORKLOAD_HELPER"
 
+const dnsExactTrafficChurnWindow = 10 * time.Second
+
 type workloadDNSUpstream struct {
 	addr       string
 	answers    map[string][]string
+	ttl        uint32
 	udpQueries atomic.Uint64
 	tcpQueries atomic.Uint64
 }
@@ -40,13 +43,17 @@ func startWorkloadDNSUpstream(t *testing.T, answerIP string) *workloadDNSUpstrea
 }
 
 func startWorkloadDNSUpstreamAnswers(t *testing.T, answers map[string][]string) *workloadDNSUpstream {
+	return startWorkloadDNSUpstreamAnswersTTL(t, answers, 60)
+}
+
+func startWorkloadDNSUpstreamAnswersTTL(t *testing.T, answers map[string][]string, ttl uint32) *workloadDNSUpstream {
 	t.Helper()
 	udpConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
 	require.NoError(t, err)
 	tcpLn, err := net.Listen("tcp4", udpConn.LocalAddr().String())
 	require.NoError(t, err)
 
-	upstream := &workloadDNSUpstream{addr: udpConn.LocalAddr().String(), answers: answers}
+	upstream := &workloadDNSUpstream{addr: udpConn.LocalAddr().String(), answers: answers, ttl: ttl}
 	handler := dns.HandlerFunc(func(w dns.ResponseWriter, req *dns.Msg) {
 		_, tcp := w.RemoteAddr().(*net.TCPAddr)
 		if tcp {
@@ -66,7 +73,7 @@ func startWorkloadDNSUpstreamAnswers(t *testing.T, answers map[string][]string) 
 				}
 				for _, answerIP := range answerIPs {
 					resp.Answer = append(resp.Answer, &dns.A{
-						Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
+						Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: upstream.ttl},
 						A:   net.ParseIP(answerIP).To4(),
 					})
 				}
@@ -139,6 +146,7 @@ type dnsExactTrafficMatrix struct {
 	sharedIP, sharedPort     string
 	workingIP, workingPort   string
 	capacityIP, capacityPort string
+	budgetIP, budgetPort     string
 	flipIP, flipPort         string
 	resolve                  func(domain, expectedIP string)
 	resolveRcode             func(domain string, expectedRcode int)
@@ -152,6 +160,7 @@ func exerciseDNSExactOwnershipTraffic(t *testing.T, srv *daemon.Server, attachme
 		{Domain: "owner-two.test"},
 		{Domain: "working.test"},
 		{Domain: "capacity.test"},
+		{Domain: "budget.test"},
 		{Domain: "mode-flip.test"},
 	}
 	require.NoError(t, srv.ReplaceDNSRules(attachment.Id, apiv1.DnsMode_DNS_MODE_ALLOWLIST,
@@ -160,49 +169,100 @@ func exerciseDNSExactOwnershipTraffic(t *testing.T, srv *daemon.Server, attachme
 
 	assert.False(t, matrix.connect(matrix.sharedIP, matrix.sharedPort), "unresolved shared destination must start blocked")
 	assert.False(t, matrix.connect(matrix.workingIP, matrix.workingPort), "unresolved working destination must start blocked")
-	assert.False(t, matrix.connect(matrix.capacityIP, matrix.capacityPort), "unresolved capacity destination must start blocked")
-	assert.False(t, matrix.connect(matrix.flipIP, matrix.flipPort), "unresolved mode-flip destination must start blocked")
 
+	budgetStarted := time.Now()
 	matrix.resolve("owner-one.test", matrix.sharedIP)
 	matrix.resolve("owner-two.test", matrix.sharedIP)
 	matrix.resolve("working.test", matrix.workingIP)
 	assert.True(t, matrix.connect(matrix.sharedIP, matrix.sharedPort))
 	assert.True(t, matrix.connect(matrix.workingIP, matrix.workingPort))
 
-	// Both exact IPv4 slots are live. A third unique answer must be suppressed
-	// as SERVFAIL without disturbing either admitted destination.
-	matrix.resolveRcode("capacity.test", dns.RcodeServerFailure)
-	assert.False(t, matrix.connect(matrix.capacityIP, matrix.capacityPort))
-	assert.True(t, matrix.connect(matrix.sharedIP, matrix.sharedPort), "capacity rejection must preserve the shared working set")
-	assert.True(t, matrix.connect(matrix.workingIP, matrix.workingPort), "capacity rejection must preserve the other working key")
-	var attachmentStats *apiv1.AttachmentStats
-	for _, stats := range srv.GetAttachmentStats() {
-		if stats.Id == attachment.Id {
-			attachmentStats = stats
-			break
-		}
-	}
-	require.NotNil(t, attachmentStats)
-	assert.Equal(t, uint64(1), attachmentStats.MapFullDrops)
-
-	// Dropping one of two query owners must keep the shared exact key. Dropping
-	// the last owner removes it promptly; an overlapping CP LPM allow provides
-	// continuous coverage until that independent rule is removed too.
+	// Dropping one of two query owners keeps the shared exact key. Protected
+	// control-plane allow and deny rules are installed before LRU pressure so
+	// traffic can prove that neither independent LPM tier is reclaimed.
 	require.NoError(t, srv.RemoveDomain(attachment.Id, "owner-one.test"))
 	assert.True(t, matrix.connect(matrix.sharedIP, matrix.sharedPort), "the second query owner must keep the shared exact key")
 	_, sharedCIDR, err := net.ParseCIDR(matrix.sharedIP + "/32")
 	require.NoError(t, err)
 	require.NoError(t, srv.AllowCIDR(attachment.Id, sharedCIDR, 0))
+	_, workingCIDR, err := net.ParseCIDR(matrix.workingIP + "/32")
+	require.NoError(t, err)
+	require.NoError(t, srv.DenyCIDR(attachment.Id, workingCIDR, 0))
+
+	// The exact tier is full with shared (oldest) and working. The first new
+	// answer deterministically replaces shared for two physical churn units;
+	// together with the two initial admissions this reaches the configured
+	// four-unit ceiling. A second replacement is immediately throttled, returns
+	// no address, and preserves the admitted pair.
+	matrix.resolve("capacity.test", matrix.capacityIP)
+	lastChargedAt := time.Now()
+	matrix.resolveRcode("budget.test", dns.RcodeServerFailure)
+	require.Less(t, time.Since(budgetStarted), dnsExactTrafficChurnWindow,
+		"the throttle discriminator must run before any initial admission can age out of the rolling window")
+	attachmentStats := requireDNSAttachmentStats(t, srv, attachment.Id)
+	assert.Equal(t, uint32(2), attachmentStats.DnsExactIpv4Entries)
+	assert.Equal(t, uint32(2), attachmentStats.DnsExactIpv4Capacity)
+	assert.Equal(t, uint32(2), attachmentStats.DnsExactIpv4HighWater)
+	assert.Equal(t, uint64(1), attachmentStats.DnsLruEvictions)
+	assert.Equal(t, uint64(1), attachmentStats.DnsAdmissionFailures)
+	assert.Equal(t, uint64(1), attachmentStats.DnsBudgetThrottles)
+	assert.Zero(t, attachmentStats.MapFullDrops, "rolling budget pressure must not masquerade as map-full pressure")
+
+	assert.True(t, matrix.connect(matrix.sharedIP, matrix.sharedPort),
+		"the protected CP allow must survive eviction of the shared DNS exact key")
+	assert.True(t, matrix.connect(matrix.workingIP, matrix.workingPort),
+		"packet ALLOWLIST must still reach the non-evicted working exact key")
+	assert.True(t, matrix.connect(matrix.capacityIP, matrix.capacityPort), "the successful replacement must be reachable")
+	assert.False(t, matrix.connect(matrix.budgetIP, matrix.budgetPort), "the throttled answer must never become reachable")
+	require.NoError(t, srv.SetFilterMode(attachment.Id, apiv1.PolicyMode_POLICY_MODE_DENYLIST))
+	assert.False(t, matrix.connect(matrix.workingIP, matrix.workingPort),
+		"packet DENYLIST must prove that the protected CP deny survived DNS LRU")
+	require.NoError(t, srv.RemoveDeniedCIDR(attachment.Id, workingCIDR))
+	assert.True(t, matrix.connect(matrix.workingIP, matrix.workingPort),
+		"removing the protected deny must immediately restore DENYLIST default access")
+	require.NoError(t, srv.SetFilterMode(attachment.Id, apiv1.PolicyMode_POLICY_MODE_ALLOWLIST))
+	assert.True(t, matrix.connect(matrix.workingIP, matrix.workingPort),
+		"switching back to ALLOWLIST must reveal that the working exact key survived")
+
+	// Removing the last stale query owner cannot disturb CP coverage. Removing
+	// that CP allow then exposes that LRU already removed the exact key. The
+	// non-evicted working exact key remains installed throughout these independent
+	// LPM and packet-mode transitions.
 	require.NoError(t, srv.RemoveDomain(attachment.Id, "owner-two.test"))
-	assert.True(t, matrix.connect(matrix.sharedIP, matrix.sharedPort), "CP LPM coverage must survive prompt exact-owner removal")
+	assert.True(t, matrix.connect(matrix.sharedIP, matrix.sharedPort))
 	require.NoError(t, srv.RemoveAllowedCIDR(attachment.Id, sharedCIDR))
-	assert.False(t, matrix.connect(matrix.sharedIP, matrix.sharedPort),
-		"removing CP coverage must expose that the DNS exact owner was already evicted, not left in LPM")
+	assert.False(t, matrix.connect(matrix.sharedIP, matrix.sharedPort))
 	assert.True(t, matrix.connect(matrix.workingIP, matrix.workingPort))
+	assert.True(t, matrix.connect(matrix.capacityIP, matrix.capacityPort))
+
+	// Every charged event precedes lastChargedAt. Waiting one complete immutable
+	// window from that captured post-commit instant is therefore sufficient on
+	// slow CI without guessing how much setup time remains. The next answer is
+	// admitted, evicts the now-oldest working key, and visibly recovers budget
+	// service while cumulative failure counters remain stable.
+	recoveryAt := lastChargedAt.Add(dnsExactTrafficChurnWindow + 500*time.Millisecond)
+	if wait := time.Until(recoveryAt); wait > 0 {
+		t.Logf("waiting %s for exact DNS churn-window recovery", wait.Round(time.Millisecond))
+		time.Sleep(wait)
+	}
+	matrix.resolve("budget.test", matrix.budgetIP)
+	assert.False(t, matrix.connect(matrix.workingIP, matrix.workingPort), "recovered replacement must evict the oldest exact key")
+	assert.True(t, matrix.connect(matrix.capacityIP, matrix.capacityPort))
+	assert.True(t, matrix.connect(matrix.budgetIP, matrix.budgetPort))
+	attachmentStats = requireDNSAttachmentStats(t, srv, attachment.Id)
+	assert.Equal(t, uint32(2), attachmentStats.DnsExactIpv4Entries)
+	assert.Equal(t, uint32(2), attachmentStats.DnsExactIpv4HighWater)
+	assert.Equal(t, uint64(2), attachmentStats.DnsLruEvictions)
+	assert.Equal(t, uint64(1), attachmentStats.DnsAdmissionFailures)
+	assert.Equal(t, uint64(1), attachmentStats.DnsBudgetThrottles)
+	assert.Zero(t, attachmentStats.MapFullDrops)
 
 	// DNS DENYLIST still maintains exact default-allow ownership even while
 	// packet DENYLIST ignores that tier. Flipping packet policy to ALLOWLIST
-	// must make the cached destination reachable without another query.
+	// must make the cached destination reachable without another query. Free a
+	// slot first so this discriminator is independent of another pressure-plan
+	// allowance in the just-recovered rolling window.
+	require.NoError(t, srv.RemoveDomain(attachment.Id, "capacity.test"))
 	require.NoError(t, srv.ReplaceDNSRules(attachment.Id, apiv1.DnsMode_DNS_MODE_DENYLIST,
 		nil, nil, []string{upstream.addr}))
 	require.NoError(t, srv.SetFilterMode(attachment.Id, apiv1.PolicyMode_POLICY_MODE_DENYLIST))
@@ -213,10 +273,22 @@ func exerciseDNSExactOwnershipTraffic(t *testing.T, srv *daemon.Server, attachme
 	require.NoError(t, srv.SetFilterMode(attachment.Id, apiv1.PolicyMode_POLICY_MODE_ALLOWLIST))
 	assert.True(t, matrix.connect(matrix.flipIP, matrix.flipPort),
 		"packet ALLOWLIST must immediately consult the exact key admitted under DNS DENYLIST")
-	assert.True(t, matrix.connect(matrix.workingIP, matrix.workingPort), "surviving ownership must remain reachable across the mode flip")
-	assert.False(t, matrix.connect(matrix.capacityIP, matrix.capacityPort), "packet ALLOWLIST must block the never-admitted capacity destination")
+	assert.True(t, matrix.connect(matrix.budgetIP, matrix.budgetPort), "surviving ownership must remain reachable across the mode flip")
+	assert.False(t, matrix.connect(matrix.capacityIP, matrix.capacityPort), "prompt policy removal must free the exact slot used by the mode-flip answer")
+	assert.False(t, matrix.connect(matrix.workingIP, matrix.workingPort), "the recovered LRU replacement must remain effective")
 	assert.False(t, matrix.connect(matrix.sharedIP, matrix.sharedPort), "packet ALLOWLIST must block the now-ownerless shared destination")
 	assert.Equal(t, queriesAfterAnswer, upstream.udpQueries.Load(), "mode flip and connects must not rely on a DNS requery")
+}
+
+func requireDNSAttachmentStats(t testing.TB, srv *daemon.Server, id string) *apiv1.AttachmentStats {
+	t.Helper()
+	for _, stats := range srv.GetAttachmentStats() {
+		if stats.Id == id {
+			return stats
+		}
+	}
+	t.Fatalf("attachment %s missing from stats", id)
+	return nil
 }
 
 func dnsHelperEnvironment(server, domain, qtype, expectedIP string, expectedTXT int, expectTruncated bool, expectedRcode int) []string {
@@ -387,7 +459,7 @@ func TestCgroupDaemonDNSWorkloadTraffic(t *testing.T) {
 	assert.Equal(t, globalTCPBefore, global.tcpQueries.Load(), "override large query must not fall through to global TCP")
 }
 
-func TestCgroupDNSExactOwnershipAndCapacityTraffic(t *testing.T) {
+func TestCgroupDNSExactOwnershipLRUAndBudgetTraffic(t *testing.T) {
 	if os.Getuid() != 0 {
 		t.Skip("test requires root")
 	}
@@ -397,8 +469,9 @@ func TestCgroupDNSExactOwnershipAndCapacityTraffic(t *testing.T) {
 		workingIP  = "198.18.1.3"
 		capacityIP = "198.18.1.4"
 		flipIP     = "198.18.1.5"
+		budgetIP   = "198.18.1.6"
 	)
-	for _, ip := range []string{listenerIP, sharedIP, workingIP, capacityIP, flipIP} {
+	for _, ip := range []string{listenerIP, sharedIP, workingIP, capacityIP, flipIP, budgetIP} {
 		_ = ipCmd("addr", "del", ip+"/32", "dev", "lo")
 		require.NoError(t, ipCmd("addr", "add", ip+"/32", "dev", "lo"))
 		ip := ip
@@ -410,19 +483,25 @@ func TestCgroupDNSExactOwnershipAndCapacityTraffic(t *testing.T) {
 	t.Cleanup(closeWorking)
 	capacityPort, closeCapacity := listenTCP(t, capacityIP)
 	t.Cleanup(closeCapacity)
+	budgetPort, closeBudget := listenTCP(t, budgetIP)
+	t.Cleanup(closeBudget)
 	flipPort, closeFlip := listenTCP(t, flipIP)
 	t.Cleanup(closeFlip)
 
-	upstream := startWorkloadDNSUpstreamAnswers(t, map[string][]string{
+	upstream := startWorkloadDNSUpstreamAnswersTTL(t, map[string][]string{
 		"owner-one.test": {sharedIP},
 		"owner-two.test": {sharedIP},
 		"working.test":   {workingIP},
 		"capacity.test":  {capacityIP},
+		"budget.test":    {budgetIP},
 		"mode-flip.test": {flipIP},
-	})
+	}, 300)
 	cgroupPath, cleanupCgroup := setupTestCgroup(t, "netfence-dns-exact-ownership")
 	t.Cleanup(cleanupCgroup)
-	for ip, port := range map[string]string{sharedIP: sharedPort, workingIP: workingPort, capacityIP: capacityPort, flipIP: flipPort} {
+	for ip, port := range map[string]string{
+		sharedIP: sharedPort, workingIP: workingPort, capacityIP: capacityPort,
+		budgetIP: budgetPort, flipIP: flipPort,
+	} {
 		require.True(t, runInCgroup(cgroupPath, ip+" "+port), "cgroup exact-ownership topology is broken for %s", ip)
 	}
 	cfg := &config.Config{
@@ -436,6 +515,8 @@ func TestCgroupDNSExactOwnershipAndCapacityTraffic(t *testing.T) {
 			MaxIPsPerPolicyDomain: 2,
 			MaxTrackedDomains:     16,
 			MaxOwnershipEdges:     16,
+			MaxChurnUnits:         4,
+			ChurnWindow:           dnsExactTrafficChurnWindow,
 		},
 		Filter: config.FilterConfig{MaxDNSRuleEntries: 2},
 	}
@@ -453,6 +534,7 @@ func TestCgroupDNSExactOwnershipAndCapacityTraffic(t *testing.T) {
 		sharedIP: sharedIP, sharedPort: sharedPort,
 		workingIP: workingIP, workingPort: workingPort,
 		capacityIP: capacityIP, capacityPort: capacityPort,
+		budgetIP: budgetIP, budgetPort: budgetPort,
 		flipIP: flipIP, flipPort: flipPort,
 		resolve: func(domain, expectedIP string) {
 			runDNSHelperInCgroup(t, cgroupPath, attachment.DnsAddress, domain, "A", expectedIP, 0, false)
@@ -502,7 +584,7 @@ func TestTCDaemonDNSWorkloadTraffic(t *testing.T) {
 		"each truncated override UDP answer must retry against that same upstream over TCP")
 }
 
-func TestTCDNSExactOwnershipAndCapacityTraffic(t *testing.T) {
+func TestTCDNSExactOwnershipLRUAndBudgetTraffic(t *testing.T) {
 	if os.Getuid() != 0 {
 		t.Skip("test requires root")
 	}
@@ -511,8 +593,9 @@ func TestTCDNSExactOwnershipAndCapacityTraffic(t *testing.T) {
 	const (
 		capacityIP = "10.199.0.6"
 		flipIP     = "10.199.0.7"
+		budgetIP   = "10.199.0.8"
 	)
-	for _, ip := range []string{capacityIP, flipIP} {
+	for _, ip := range []string{capacityIP, flipIP, budgetIP} {
 		require.NoError(t, ipCmd("addr", "add", ip+"/24", "dev", vethHostIf))
 	}
 	sharedPort, closeShared := listenTCP(t, vethAllowedIP)
@@ -521,24 +604,28 @@ func TestTCDNSExactOwnershipAndCapacityTraffic(t *testing.T) {
 	t.Cleanup(closeWorking)
 	capacityPort, closeCapacity := listenTCP(t, capacityIP)
 	t.Cleanup(closeCapacity)
+	budgetPort, closeBudget := listenTCP(t, budgetIP)
+	t.Cleanup(closeBudget)
 	flipPort, closeFlip := listenTCP(t, flipIP)
 	t.Cleanup(closeFlip)
 	for ip, port := range map[string]string{
 		vethAllowedIP: sharedPort,
 		vethBlockedIP: workingPort,
 		capacityIP:    capacityPort,
+		budgetIP:      budgetPort,
 		flipIP:        flipPort,
 	} {
 		require.True(t, nsConnectTCP(ip, port), "TC exact-ownership topology is broken for %s", ip)
 	}
 
-	upstream := startWorkloadDNSUpstreamAnswers(t, map[string][]string{
+	upstream := startWorkloadDNSUpstreamAnswersTTL(t, map[string][]string{
 		"owner-one.test": {vethAllowedIP},
 		"owner-two.test": {vethAllowedIP},
 		"working.test":   {vethBlockedIP},
 		"capacity.test":  {capacityIP},
+		"budget.test":    {budgetIP},
 		"mode-flip.test": {flipIP},
-	})
+	}, 300)
 	cfg := &config.Config{
 		DNS: config.DNSConfig{
 			ListenAddr:            vethHostIP,
@@ -550,6 +637,8 @@ func TestTCDNSExactOwnershipAndCapacityTraffic(t *testing.T) {
 			MaxIPsPerPolicyDomain: 2,
 			MaxTrackedDomains:     16,
 			MaxOwnershipEdges:     16,
+			MaxChurnUnits:         4,
+			ChurnWindow:           dnsExactTrafficChurnWindow,
 		},
 		Filter: config.FilterConfig{MaxDNSRuleEntries: 2},
 	}
@@ -569,6 +658,7 @@ func TestTCDNSExactOwnershipAndCapacityTraffic(t *testing.T) {
 		sharedIP: vethAllowedIP, sharedPort: sharedPort,
 		workingIP: vethBlockedIP, workingPort: workingPort,
 		capacityIP: capacityIP, capacityPort: capacityPort,
+		budgetIP: budgetIP, budgetPort: budgetPort,
 		flipIP: flipIP, flipPort: flipPort,
 		resolve: func(domain, expectedIP string) {
 			runDNSHelperInNetns(t, attachment.DnsAddress, domain, "A", expectedIP, 0, false)

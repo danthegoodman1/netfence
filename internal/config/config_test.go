@@ -4,6 +4,7 @@ import (
 	"math"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestValidateIndependentDNSExactMapCapacity(t *testing.T) {
@@ -81,6 +82,34 @@ func TestValidateDNSOwnershipFieldOrderIsDeterministic(t *testing.T) {
 		err := cfg.Validate()
 		if err == nil || !strings.Contains(err.Error(), "dns.max_ips_per_family") {
 			t.Fatalf("first invalid field changed on run %d: %v", i, err)
+		}
+	}
+}
+
+func TestDNSChurnDefaultsAndValidation(t *testing.T) {
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DNS.MaxChurnUnits != 8192 || cfg.DNS.ChurnWindow != time.Minute {
+		t.Fatalf("DNS churn defaults = %d/%s, want 8192/1m", cfg.DNS.MaxChurnUnits, cfg.DNS.ChurnWindow)
+	}
+
+	invalid := validBase()
+	invalid.DNS.MaxChurnUnits = -1
+	if err := invalid.Validate(); err == nil || !strings.Contains(err.Error(), "dns.max_churn_units") {
+		t.Fatalf("negative churn ceiling should name its knob, got %v", err)
+	}
+	invalid = validBase()
+	invalid.DNS.ChurnWindow = -time.Second
+	if err := invalid.Validate(); err == nil || !strings.Contains(err.Error(), "dns.churn_window") {
+		t.Fatalf("negative churn window should name its knob, got %v", err)
+	}
+	if int64(math.MaxUint32) < int64(^uint(0)>>1) {
+		invalid = validBase()
+		invalid.DNS.MaxChurnUnits = int(math.MaxUint32) + 1
+		if err := invalid.Validate(); err == nil || !strings.Contains(err.Error(), "dns.max_churn_units") {
+			t.Fatalf("overflowing churn ceiling should be rejected, got %v", err)
 		}
 	}
 }

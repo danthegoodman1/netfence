@@ -180,6 +180,26 @@ message AttachmentStats {
   // failure. Mutually exclusive with dns_queries_allowed (successfully
   // answered policy-allowed queries) and dns_queries_blocked (policy REFUSED).
   uint64 dns_queries_errors = 7;
+  // Current physical occupancy/capacity and process-generation high-water
+  // marks for the two DNS exact-host maps. Restored provisional pins count in
+  // physical occupancy until authoritative reconciliation.
+  uint32 dns_exact_ipv4_entries = 8;
+  uint32 dns_exact_ipv4_capacity = 9;
+  uint32 dns_exact_ipv4_high_water = 10;
+  uint32 dns_exact_ipv6_entries = 11;
+  uint32 dns_exact_ipv6_capacity = 12;
+  uint32 dns_exact_ipv6_high_water = 13;
+  // Successfully committed physical DNS-only LRU evictions. Expiry and
+  // policy-driven removal do not increment this counter.
+  uint64 dns_lru_evictions = 14;
+  // All address-bearing DNS admission failures, including capacity, rolling
+  // budget, exact-map I/O, and rollback ambiguity.
+  uint64 dns_admission_failures = 15;
+  // Admissions rejected by either the rolling physical-churn budget or the
+  // normalized slow-planning work guard. This is intentionally separate from
+  // map_full_drops because rejection is due to a rolling mutation/attempt
+  // allowance, not inability to represent the state or a raw map insertion.
+  uint64 dns_budget_throttles = 16;
 }
 
 // ControlCommand represents commands sent from the control plane to the daemon.
@@ -327,6 +347,17 @@ message DnsConfig {
   // Shared physical IPs still consume one edge for each independent query and
   // matched owner.
   uint32 max_ownership_edges = 9;
+
+  // Per-attachment rolling DNS churn-unit limit. Zero inherits the daemon's
+  // dns.max_churn_units ceiling; a non-zero value may only lower it. A new
+  // physical exact admission costs one unit and each unexpired LRU physical
+  // eviction costs one. Expiry/policy removal and refresh of an already
+  // admitted key cost zero. The same limit also gates stable normalized work
+  // units for ownership-graph pressure planning; attempt units are committed
+  // before projection and retained even when the plan or later filter write
+  // fails. The rolling window is the daemon-global dns.churn_window and cannot
+  // be weakened by a control-plane update.
+  uint32 max_churn_units = 10;
 }
 
 // CIDREntry represents a CIDR with an optional TTL. In complete

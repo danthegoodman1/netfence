@@ -74,6 +74,9 @@ type Server struct {
 	// dnsAdmissionCeilings are both the zero-value per-attachment defaults and
 	// hard daemon ceilings for bounded resolver ownership metadata.
 	dnsAdmissionCeilings dnsAdmissionLimits
+	// dnsChurnCeiling bounds the rolling per-attachment exact admission/LRU
+	// budget. Its window is immutable for this daemon generation.
+	dnsChurnCeiling dnsChurnLimits
 
 	// pinRoot is the bpffs directory attachment BPF state is pinned under
 	// (config filter.bpf_pin_dir; "" disables pinning). detachOnStop selects
@@ -469,6 +472,7 @@ func NewServer(cfg *config.Config, st *store.Store, logger zerolog.Logger, versi
 		maxTrackedDomains:     uint32(cfg.DNS.MaxTrackedDomains),
 		maxOwnershipEdges:     uint32(cfg.DNS.MaxOwnershipEdges),
 	})
+	dnsChurnCeiling := resolveDNSChurnCeiling(uint32(cfg.DNS.MaxChurnUnits), cfg.DNS.ChurnWindow)
 	dnsListenIP, err := resolveConcreteDNSListenIP(cfg.DNS.ListenAddr)
 	if err != nil {
 		return nil, fmt.Errorf("resolving dns.listen_addr: %w", err)
@@ -504,6 +508,7 @@ func NewServer(cfg *config.Config, st *store.Store, logger zerolog.Logger, versi
 		maxRuleEntries:       maxRuleEntries,
 		maxDNSRuleEntries:    maxDNSRuleEntries,
 		dnsAdmissionCeilings: dnsAdmissionCeilings,
+		dnsChurnCeiling:      dnsChurnCeiling,
 		pinRoot:              pinRoot,
 		detachOnStop:         cfg.Filter.DetachOnStop,
 		newFilter: func(pinDir, target string, attachType apiv1.AttachmentType, mode apiv1.PolicyMode, direction apiv1.TcDirection, maxRules uint32) (filter.Filter, error) {
@@ -2307,22 +2312,34 @@ func (s *Server) GetAttachmentStats() []*apiv1.AttachmentStats {
 			continue
 		}
 		stats = append(stats, &apiv1.AttachmentStats{
-			Id:                id,
-			PacketsAllowed:    snapshot.packetsAllowed,
-			PacketsBlocked:    snapshot.packetsBlocked,
-			DnsQueriesAllowed: snapshot.dnsAllowed,
-			DnsQueriesBlocked: snapshot.dnsBlocked,
-			DnsQueriesErrors:  snapshot.dnsErrors,
-			MapFullDrops:      snapshot.mapFullDrops,
+			Id:                    id,
+			PacketsAllowed:        snapshot.packetsAllowed,
+			PacketsBlocked:        snapshot.packetsBlocked,
+			DnsQueriesAllowed:     snapshot.dnsAllowed,
+			DnsQueriesBlocked:     snapshot.dnsBlocked,
+			DnsQueriesErrors:      snapshot.dnsErrors,
+			MapFullDrops:          snapshot.mapFullDrops,
+			DnsExactIpv4Entries:   snapshot.dnsExactIPv4Entries,
+			DnsExactIpv4Capacity:  snapshot.dnsExactIPv4Capacity,
+			DnsExactIpv4HighWater: snapshot.dnsExactIPv4HighWater,
+			DnsExactIpv6Entries:   snapshot.dnsExactIPv6Entries,
+			DnsExactIpv6Capacity:  snapshot.dnsExactIPv6Capacity,
+			DnsExactIpv6HighWater: snapshot.dnsExactIPv6HighWater,
+			DnsLruEvictions:       snapshot.dnsLRUEvictions,
+			DnsAdmissionFailures:  snapshot.dnsAdmissionFailures,
+			DnsBudgetThrottles:    snapshot.dnsBudgetThrottles,
 		})
 	}
 	return stats
 }
 
 type attachmentStatsSnapshot struct {
-	packetsAllowed, packetsBlocked uint64
-	dnsAllowed, dnsBlocked         uint64
-	dnsErrors, mapFullDrops        uint64
+	packetsAllowed, packetsBlocked                                   uint64
+	dnsAllowed, dnsBlocked                                           uint64
+	dnsErrors, mapFullDrops                                          uint64
+	dnsExactIPv4Entries, dnsExactIPv4Capacity, dnsExactIPv4HighWater uint32
+	dnsExactIPv6Entries, dnsExactIPv6Capacity, dnsExactIPv6HighWater uint32
+	dnsLRUEvictions, dnsAdmissionFailures, dnsBudgetThrottles        uint64
 }
 
 func (s *Server) readAttachmentStats(id string) (attachmentStatsSnapshot, bool) {
@@ -2347,6 +2364,16 @@ func (s *Server) readAttachmentStats(id string) (attachmentStatsSnapshot, bool) 
 	}
 	if state.dnsSink != nil {
 		snapshot.mapFullDrops += state.dnsSink.CapacityDropCount()
+		ownership := state.dnsSink.OwnershipStats()
+		snapshot.dnsExactIPv4Entries = ownership.occupancy.IPv4Entries
+		snapshot.dnsExactIPv4Capacity = ownership.occupancy.IPv4Capacity
+		snapshot.dnsExactIPv4HighWater = ownership.highWater4
+		snapshot.dnsExactIPv6Entries = ownership.occupancy.IPv6Entries
+		snapshot.dnsExactIPv6Capacity = ownership.occupancy.IPv6Capacity
+		snapshot.dnsExactIPv6HighWater = ownership.highWater6
+		snapshot.dnsLRUEvictions = ownership.lruEvictions
+		snapshot.dnsAdmissionFailures = state.dnsSink.AdmissionFailureCount()
+		snapshot.dnsBudgetThrottles = state.dnsSink.BudgetThrottleCount()
 	}
 	return snapshot, true
 }
@@ -2444,8 +2471,12 @@ func (s *Server) ReplaceDNSRules(id string, mode apiv1.DnsMode, allowDomains, de
 	if err != nil {
 		return err
 	}
+	churnCeiling, err := s.dnsChurnCeilingForAttachment(id)
+	if err != nil {
+		return err
+	}
 	prepared, err := prepareDNSRules(mode, allowDomains, denyDomains, upstreamServers,
-		s.defaultDNSUpstream, ceilings, dnsAdmissionLimitOverrides{})
+		s.defaultDNSUpstream, ceilings, dnsAdmissionLimitOverrides{}, churnCeiling, 0)
 	if err != nil {
 		return err
 	}
@@ -2459,11 +2490,13 @@ func (s *Server) ReplaceDNSRules(id string, mode apiv1.DnsMode, allowDomains, de
 
 func (s *Server) replaceDNSRulesAdmitted(id string, state *attachmentState, mode apiv1.DnsMode, allowDomains, denyDomains []*apiv1.DomainEntry, upstreamServers []string) error {
 	ceilings := s.dnsAdmissionCeilings
+	churnCeiling := s.dnsChurnCeiling
 	if state != nil && state.dns != nil {
 		ceilings = state.dns.limitCeilings
+		churnCeiling = state.dns.churnCeiling
 	}
 	prepared, err := prepareDNSRules(mode, allowDomains, denyDomains, upstreamServers,
-		s.defaultDNSUpstream, ceilings, dnsAdmissionLimitOverrides{})
+		s.defaultDNSUpstream, ceilings, dnsAdmissionLimitOverrides{}, churnCeiling, 0)
 	if err != nil {
 		return err
 	}
@@ -2481,6 +2514,19 @@ func (s *Server) dnsLimitCeilingsForAttachment(id string) (dnsAdmissionLimits, e
 		return s.dnsAdmissionCeilings, nil
 	}
 	return state.dns.limitCeilings, nil
+}
+
+func (s *Server) dnsChurnCeilingForAttachment(id string) (dnsChurnLimits, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	state := s.attachments[id]
+	if state == nil || state.cleanupNeeded || state.mutationsClosed {
+		return dnsChurnLimits{}, fmt.Errorf("attachment not found or unavailable: %s", id)
+	}
+	if state.dns == nil {
+		return s.dnsChurnCeiling, nil
+	}
+	return state.dns.churnCeiling, nil
 }
 
 func (s *Server) replaceDNSPreparedAdmitted(id string, state *attachmentState, prepared *preparedDNSRules) error {

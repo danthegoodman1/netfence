@@ -38,8 +38,10 @@ type DNSConfig struct {
 	// MaxIPsPerFamily is the default and hard ceiling for one attachment's
 	// logical DNS-derived IPv4 and IPv6 working sets. Zero derives the ceiling
 	// from filter.max_dns_rule_entries (4096 when that setting is also zero).
-	// A new address-bearing response beyond any DNS ownership ceiling is
-	// rejected as SERVFAIL without evicting the current working set.
+	// Pressure reclaims expired ownership first, then uses deterministic,
+	// collateral-aware DNS LRU within the rolling churn budget. If no eligible
+	// state or budget remains, the response is rejected as SERVFAIL and the
+	// admitted working set is preserved.
 	MaxIPsPerFamily int `mapstructure:"max_ips_per_family"`
 	// MaxIPsPerResponse bounds unique A/AAAA addresses admitted for one DNS
 	// response. Zero uses the safe default (64).
@@ -56,6 +58,17 @@ type DNSConfig struct {
 	// MaxOwnershipEdges bounds (query domain, policy owner, IP) TTL records.
 	// Zero uses the safe default (8192).
 	MaxOwnershipEdges int `mapstructure:"max_ownership_edges"`
+	// MaxChurnUnits is the daemon ceiling for one attachment's rolling DNS
+	// admission/eviction budget and normalized slow-planning work allowance. A
+	// new physical exact key and an unexpired LRU eviction each cost one mutation
+	// unit. Expensive ownership-graph attempts use stable work units committed
+	// before projection and retained even if planning or the filter later fails.
+	// Zero uses the safe default (8192).
+	MaxChurnUnits int `mapstructure:"max_churn_units"`
+	// ChurnWindow is the daemon-global rolling budget window. It is fixed for
+	// the daemon generation so a control-plane update cannot silently weaken
+	// rate limiting by shortening the window. Zero uses one minute.
+	ChurnWindow time.Duration `mapstructure:"churn_window"`
 }
 
 type FilterConfig struct {
@@ -153,6 +166,8 @@ func Load(configPath string) (*Config, error) {
 	v.SetDefault("log_level", "info")
 	v.SetDefault("socket", "/var/run/netfence.sock")
 	v.SetDefault("dns.min_filter_ttl", 60*time.Second)
+	v.SetDefault("dns.max_churn_units", 8192)
+	v.SetDefault("dns.churn_window", time.Minute)
 	v.SetDefault("filter.max_rule_entries", 4096)
 	v.SetDefault("filter.max_dns_rule_entries", 4096)
 	v.SetDefault("filter.bpf_pin_dir", "/sys/fs/bpf/netfence")
@@ -199,6 +214,9 @@ func (c *Config) Validate() error {
 	if c.DNS.MinFilterTTL < 0 {
 		return fmt.Errorf("dns.min_filter_ttl must not be negative")
 	}
+	if c.DNS.ChurnWindow < 0 {
+		return fmt.Errorf("dns.churn_window must not be negative")
+	}
 	for _, field := range []struct {
 		name  string
 		value int
@@ -208,6 +226,7 @@ func (c *Config) Validate() error {
 		{"dns.max_ips_per_policy_domain", c.DNS.MaxIPsPerPolicyDomain},
 		{"dns.max_tracked_domains", c.DNS.MaxTrackedDomains},
 		{"dns.max_ownership_edges", c.DNS.MaxOwnershipEdges},
+		{"dns.max_churn_units", c.DNS.MaxChurnUnits},
 	} {
 		name, value := field.name, field.value
 		if value < 0 || int64(value) > math.MaxUint32 {

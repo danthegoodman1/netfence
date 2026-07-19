@@ -243,3 +243,129 @@ func TestExactDNSRemoveAmbiguousAppliedDeleteRestoresProvenSnapshot(t *testing.T
 		t.Fatalf("unexpected ambiguous-delete recovery operations: want %v, got %v", wantOps, b.ops)
 	}
 }
+
+func TestExactDNSReplaceUsesFinalCapacityAndDeterministicOrder(t *testing.T) {
+	b := newFakeExactBackend(1, net.ParseIP("192.0.2.1"), net.ParseIP("2001:db8::1"))
+	err := replaceExactDNSIPs(b,
+		[]net.IP{net.ParseIP("2001:db8::1"), net.ParseIP("192.0.2.1")},
+		[]net.IP{net.ParseIP("2001:db8::2"), net.ParseIP("192.0.2.2")},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"192.0.2.2", "2001:db8::2"}
+	if got := exactIPStrings(t, b); !reflect.DeepEqual(got, want) {
+		t.Fatalf("replacement contents: want %v, got %v", want, got)
+	}
+	wantOps := []string{
+		"delete 192.0.2.1", "delete 2001:db8::1",
+		"put 192.0.2.2", "put 2001:db8::2",
+	}
+	if !reflect.DeepEqual(b.ops, wantOps) {
+		t.Fatalf("replacement order: want %v, got %v", wantOps, b.ops)
+	}
+}
+
+func TestExactDNSReplaceOverlapIsUntouched(t *testing.T) {
+	b := newFakeExactBackend(2, net.ParseIP("192.0.2.1"), net.ParseIP("192.0.2.2"))
+	err := replaceExactDNSIPs(b,
+		[]net.IP{net.ParseIP("192.0.2.1"), net.ParseIP("192.0.2.1")},
+		[]net.IP{net.ParseIP("::ffff:192.0.2.1")},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(b.ops) != 0 {
+		t.Fatalf("a canonical key present in both sets must not be touched: %v", b.ops)
+	}
+	want := []string{"192.0.2.1", "192.0.2.2"}
+	if got := exactIPStrings(t, b); !reflect.DeepEqual(got, want) {
+		t.Fatalf("overlap replacement contents: want %v, got %v", want, got)
+	}
+}
+
+func TestExactDNSReplacePreflightsFinalCrossFamilyCapacity(t *testing.T) {
+	b := newFakeExactBackend(1, net.ParseIP("192.0.2.1"), net.ParseIP("2001:db8::1"))
+	err := replaceExactDNSIPs(b,
+		[]net.IP{net.ParseIP("192.0.2.1")},
+		[]net.IP{net.ParseIP("192.0.2.2"), net.ParseIP("2001:db8::2")},
+	)
+	if !errors.Is(err, ErrDNSAllowCapacity) {
+		t.Fatalf("want final IPv6 capacity error, got %v", err)
+	}
+	if len(b.ops) != 0 {
+		t.Fatalf("capacity failure mutated backend: %v", b.ops)
+	}
+}
+
+func TestExactDNSReplaceFailureRestoresWholeSnapshot(t *testing.T) {
+	b := newFakeExactBackend(2, net.ParseIP("192.0.2.1"), net.ParseIP("192.0.2.2"))
+	b.failPutAt = 1
+	b.mutateOnPut = true
+	err := replaceExactDNSIPs(b,
+		[]net.IP{net.ParseIP("192.0.2.1")},
+		[]net.IP{net.ParseIP("192.0.2.3")},
+	)
+	if !errors.Is(err, syscall.EIO) || errors.Is(err, ErrDNSAllowRollback) {
+		t.Fatalf("want proven rollback of original failure, got %v", err)
+	}
+	want := []string{"192.0.2.1", "192.0.2.2"}
+	if got := exactIPStrings(t, b); !reflect.DeepEqual(got, want) {
+		t.Fatalf("replacement rollback: want %v, got %v", want, got)
+	}
+}
+
+func TestExactDNSReplaceAmbiguousAppliedDeleteRestoresWholeSnapshot(t *testing.T) {
+	b := newFakeExactBackend(1, net.ParseIP("192.0.2.1"))
+	b.failDeleteAt = 1
+	b.mutateOnDelete = true
+	err := replaceExactDNSIPs(b,
+		[]net.IP{net.ParseIP("192.0.2.1")},
+		[]net.IP{net.ParseIP("192.0.2.2")},
+	)
+	if !errors.Is(err, syscall.EIO) || errors.Is(err, ErrDNSAllowRollback) {
+		t.Fatalf("want proven rollback of ambiguous delete, got %v", err)
+	}
+	if got := exactIPStrings(t, b); !reflect.DeepEqual(got, []string{"192.0.2.1"}) {
+		t.Fatalf("ambiguous replacement delete rollback: %v", got)
+	}
+	wantOps := []string{"delete 192.0.2.1", "put 192.0.2.1"}
+	if !reflect.DeepEqual(b.ops, wantOps) {
+		t.Fatalf("ambiguous replacement delete recovery: want %v, got %v", wantOps, b.ops)
+	}
+}
+
+func TestExactDNSReplaceAmbiguousDeleteRestoreFailureIsTypedRollback(t *testing.T) {
+	b := newFakeExactBackend(1, net.ParseIP("192.0.2.1"))
+	b.failDeleteAt = 1
+	b.mutateOnDelete = true
+	b.failPutAt = 1
+	err := replaceExactDNSIPs(b,
+		[]net.IP{net.ParseIP("192.0.2.1")},
+		[]net.IP{net.ParseIP("192.0.2.2")},
+	)
+	if !errors.Is(err, syscall.EIO) || !errors.Is(err, ErrDNSAllowRollback) {
+		t.Fatalf("unrestored ambiguous delete must retain original error and typed rollback ambiguity, got %v", err)
+	}
+	if got := exactIPStrings(t, b); len(got) != 0 {
+		t.Fatalf("test must prove the original key remains missing: %v", got)
+	}
+}
+
+func TestExactDNSReplaceResidualIsRollbackAmbiguity(t *testing.T) {
+	b := newFakeExactBackend(1, net.ParseIP("192.0.2.1"))
+	b.failPutAt = 1
+	b.mutateOnPut = true
+	newKey, err := canonicalExactIPKeys([]net.IP{net.ParseIP("192.0.2.2")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.failDelete[newKey[0]] = syscall.EBUSY
+	err = replaceExactDNSIPs(b,
+		[]net.IP{net.ParseIP("192.0.2.1")},
+		[]net.IP{net.ParseIP("192.0.2.2")},
+	)
+	if !errors.Is(err, ErrDNSAllowRollback) {
+		t.Fatalf("residual replacement must be ambiguous, got %v", err)
+	}
+}

@@ -169,6 +169,73 @@ func removeExactDNSIPs(b exactDNSBackend, ips []net.IP) error {
 	return nil
 }
 
+// replaceExactDNSIPs applies one final-state transaction. Deletions happen
+// before insertions so a full map can exchange keys, but every validation and
+// final-capacity check happens before the first syscall. A key present in both
+// sets remains present and is not touched.
+func replaceExactDNSIPs(b exactDNSBackend, remove, add []net.IP) error {
+	removeKeys, err := canonicalExactIPKeys(remove)
+	if err != nil {
+		return err
+	}
+	addKeys, err := canonicalExactIPKeys(add)
+	if err != nil {
+		return err
+	}
+	if len(removeKeys) == 0 && len(addKeys) == 0 {
+		return nil
+	}
+	before, occupancy, err := snapshotExactDNS(b)
+	if err != nil {
+		return err
+	}
+	desired := make(map[exactIPKey]struct{}, len(before)+len(addKeys))
+	for key := range before {
+		desired[key] = struct{}{}
+	}
+	for _, key := range removeKeys {
+		delete(desired, key)
+	}
+	for _, key := range addKeys {
+		desired[key] = struct{}{}
+	}
+	var final4, final6 uint64
+	for key := range desired {
+		if key.family == exactIPv4 {
+			final4++
+		} else {
+			final6++
+		}
+	}
+	if final4 > uint64(occupancy.IPv4Capacity) {
+		return fmt.Errorf("%w: replacement would use %d/%d IPv4 entries", ErrDNSAllowCapacity, final4, occupancy.IPv4Capacity)
+	}
+	if final6 > uint64(occupancy.IPv6Capacity) {
+		return fmt.Errorf("%w: replacement would use %d/%d IPv6 entries", ErrDNSAllowCapacity, final6, occupancy.IPv6Capacity)
+	}
+
+	for _, key := range removeKeys {
+		if _, existed := before[key]; !existed {
+			continue
+		}
+		if _, keep := desired[key]; keep {
+			continue
+		}
+		if err := b.delete(key); err != nil {
+			return exactMutationFailure(b, before, fmt.Errorf("removing DNS exact allow %s during replacement: %w", key.ip(), err))
+		}
+	}
+	for _, key := range addKeys {
+		if _, existed := before[key]; existed {
+			continue
+		}
+		if err := b.put(key); err != nil {
+			return exactMutationFailure(b, before, fmt.Errorf("adding DNS exact allow %s during replacement: %w", key.ip(), err))
+		}
+	}
+	return nil
+}
+
 func exactMutationFailure(b exactDNSBackend, before map[exactIPKey]struct{}, mutationErr error) error {
 	if rollbackErr := restoreExactDNSSnapshot(b, before); rollbackErr != nil {
 		return errors.Join(mutationErr, fmt.Errorf("%w: caller must fail closed/quarantine until exact-tier reconciliation: %w", ErrDNSAllowRollback, rollbackErr))

@@ -710,6 +710,16 @@ func (f *CgroupFilter) RemoveDNSAllowedIPs(ips []net.IP) error {
 	return removeExactDNSIPs(b, ips)
 }
 
+func (f *CgroupFilter) ReplaceDNSAllowedIPs(remove, add []net.IP) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	b, err := f.exactDNSBackendLocked()
+	if err != nil {
+		return err
+	}
+	return replaceExactDNSIPs(b, remove, add)
+}
+
 func (f *CgroupFilter) DNSAllowedIPs() ([]net.IP, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

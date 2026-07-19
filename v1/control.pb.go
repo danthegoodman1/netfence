@@ -663,8 +663,28 @@ type AttachmentStats struct {
 	// failure. Mutually exclusive with dns_queries_allowed (successfully
 	// answered policy-allowed queries) and dns_queries_blocked (policy REFUSED).
 	DnsQueriesErrors uint64 `protobuf:"varint,7,opt,name=dns_queries_errors,json=dnsQueriesErrors,proto3" json:"dns_queries_errors,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// Current physical occupancy/capacity and process-generation high-water
+	// marks for the two DNS exact-host maps. Restored provisional pins count in
+	// physical occupancy until authoritative reconciliation.
+	DnsExactIpv4Entries   uint32 `protobuf:"varint,8,opt,name=dns_exact_ipv4_entries,json=dnsExactIpv4Entries,proto3" json:"dns_exact_ipv4_entries,omitempty"`
+	DnsExactIpv4Capacity  uint32 `protobuf:"varint,9,opt,name=dns_exact_ipv4_capacity,json=dnsExactIpv4Capacity,proto3" json:"dns_exact_ipv4_capacity,omitempty"`
+	DnsExactIpv4HighWater uint32 `protobuf:"varint,10,opt,name=dns_exact_ipv4_high_water,json=dnsExactIpv4HighWater,proto3" json:"dns_exact_ipv4_high_water,omitempty"`
+	DnsExactIpv6Entries   uint32 `protobuf:"varint,11,opt,name=dns_exact_ipv6_entries,json=dnsExactIpv6Entries,proto3" json:"dns_exact_ipv6_entries,omitempty"`
+	DnsExactIpv6Capacity  uint32 `protobuf:"varint,12,opt,name=dns_exact_ipv6_capacity,json=dnsExactIpv6Capacity,proto3" json:"dns_exact_ipv6_capacity,omitempty"`
+	DnsExactIpv6HighWater uint32 `protobuf:"varint,13,opt,name=dns_exact_ipv6_high_water,json=dnsExactIpv6HighWater,proto3" json:"dns_exact_ipv6_high_water,omitempty"`
+	// Successfully committed physical DNS-only LRU evictions. Expiry and
+	// policy-driven removal do not increment this counter.
+	DnsLruEvictions uint64 `protobuf:"varint,14,opt,name=dns_lru_evictions,json=dnsLruEvictions,proto3" json:"dns_lru_evictions,omitempty"`
+	// All address-bearing DNS admission failures, including capacity, rolling
+	// budget, exact-map I/O, and rollback ambiguity.
+	DnsAdmissionFailures uint64 `protobuf:"varint,15,opt,name=dns_admission_failures,json=dnsAdmissionFailures,proto3" json:"dns_admission_failures,omitempty"`
+	// Admissions rejected by either the rolling physical-churn budget or the
+	// normalized slow-planning work guard. This is intentionally separate from
+	// map_full_drops because rejection is due to a rolling mutation/attempt
+	// allowance, not inability to represent the state or a raw map insertion.
+	DnsBudgetThrottles uint64 `protobuf:"varint,16,opt,name=dns_budget_throttles,json=dnsBudgetThrottles,proto3" json:"dns_budget_throttles,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *AttachmentStats) Reset() {
@@ -742,6 +762,69 @@ func (x *AttachmentStats) GetMapFullDrops() uint64 {
 func (x *AttachmentStats) GetDnsQueriesErrors() uint64 {
 	if x != nil {
 		return x.DnsQueriesErrors
+	}
+	return 0
+}
+
+func (x *AttachmentStats) GetDnsExactIpv4Entries() uint32 {
+	if x != nil {
+		return x.DnsExactIpv4Entries
+	}
+	return 0
+}
+
+func (x *AttachmentStats) GetDnsExactIpv4Capacity() uint32 {
+	if x != nil {
+		return x.DnsExactIpv4Capacity
+	}
+	return 0
+}
+
+func (x *AttachmentStats) GetDnsExactIpv4HighWater() uint32 {
+	if x != nil {
+		return x.DnsExactIpv4HighWater
+	}
+	return 0
+}
+
+func (x *AttachmentStats) GetDnsExactIpv6Entries() uint32 {
+	if x != nil {
+		return x.DnsExactIpv6Entries
+	}
+	return 0
+}
+
+func (x *AttachmentStats) GetDnsExactIpv6Capacity() uint32 {
+	if x != nil {
+		return x.DnsExactIpv6Capacity
+	}
+	return 0
+}
+
+func (x *AttachmentStats) GetDnsExactIpv6HighWater() uint32 {
+	if x != nil {
+		return x.DnsExactIpv6HighWater
+	}
+	return 0
+}
+
+func (x *AttachmentStats) GetDnsLruEvictions() uint64 {
+	if x != nil {
+		return x.DnsLruEvictions
+	}
+	return 0
+}
+
+func (x *AttachmentStats) GetDnsAdmissionFailures() uint64 {
+	if x != nil {
+		return x.DnsAdmissionFailures
+	}
+	return 0
+}
+
+func (x *AttachmentStats) GetDnsBudgetThrottles() uint64 {
+	if x != nil {
+		return x.DnsBudgetThrottles
 	}
 	return 0
 }
@@ -1372,8 +1455,18 @@ type DnsConfig struct {
 	// Shared physical IPs still consume one edge for each independent query and
 	// matched owner.
 	MaxOwnershipEdges uint32 `protobuf:"varint,9,opt,name=max_ownership_edges,json=maxOwnershipEdges,proto3" json:"max_ownership_edges,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	// Per-attachment rolling DNS churn-unit limit. Zero inherits the daemon's
+	// dns.max_churn_units ceiling; a non-zero value may only lower it. A new
+	// physical exact admission costs one unit and each unexpired LRU physical
+	// eviction costs one. Expiry/policy removal and refresh of an already
+	// admitted key cost zero. The same limit also gates stable normalized work
+	// units for ownership-graph pressure planning; attempt units are committed
+	// before projection and retained even when the plan or later filter write
+	// fails. The rolling window is the daemon-global dns.churn_window and cannot
+	// be weakened by a control-plane update.
+	MaxChurnUnits uint32 `protobuf:"varint,10,opt,name=max_churn_units,json=maxChurnUnits,proto3" json:"max_churn_units,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *DnsConfig) Reset() {
@@ -1465,6 +1558,13 @@ func (x *DnsConfig) GetMaxTrackedDomains() uint32 {
 func (x *DnsConfig) GetMaxOwnershipEdges() uint32 {
 	if x != nil {
 		return x.MaxOwnershipEdges
+	}
+	return 0
+}
+
+func (x *DnsConfig) GetMaxChurnUnits() uint32 {
+	if x != nil {
+		return x.MaxChurnUnits
 	}
 	return 0
 }
@@ -1821,7 +1921,7 @@ const file_v1_control_proto_rawDesc = "" +
 	"\x06reason\x18\x02 \x01(\x0e2\x1e.netfence.v1.UnsubscribeReasonR\x06reason\x12\x14\n" +
 	"\x05error\x18\x03 \x01(\tR\x05error\"?\n" +
 	"\tHeartbeat\x122\n" +
-	"\x05stats\x18\x01 \x03(\v2\x1c.netfence.v1.AttachmentStatsR\x05stats\"\xa7\x02\n" +
+	"\x05stats\x18\x01 \x03(\v2\x1c.netfence.v1.AttachmentStatsR\x05stats\"\x87\x06\n" +
 	"\x0fAttachmentStats\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12'\n" +
 	"\x0fpackets_allowed\x18\x02 \x01(\x04R\x0epacketsAllowed\x12'\n" +
@@ -1829,7 +1929,17 @@ const file_v1_control_proto_rawDesc = "" +
 	"\x13dns_queries_allowed\x18\x04 \x01(\x04R\x11dnsQueriesAllowed\x12.\n" +
 	"\x13dns_queries_blocked\x18\x05 \x01(\x04R\x11dnsQueriesBlocked\x12$\n" +
 	"\x0emap_full_drops\x18\x06 \x01(\x04R\fmapFullDrops\x12,\n" +
-	"\x12dns_queries_errors\x18\a \x01(\x04R\x10dnsQueriesErrors\"\xa4\x05\n" +
+	"\x12dns_queries_errors\x18\a \x01(\x04R\x10dnsQueriesErrors\x123\n" +
+	"\x16dns_exact_ipv4_entries\x18\b \x01(\rR\x13dnsExactIpv4Entries\x125\n" +
+	"\x17dns_exact_ipv4_capacity\x18\t \x01(\rR\x14dnsExactIpv4Capacity\x128\n" +
+	"\x19dns_exact_ipv4_high_water\x18\n" +
+	" \x01(\rR\x15dnsExactIpv4HighWater\x123\n" +
+	"\x16dns_exact_ipv6_entries\x18\v \x01(\rR\x13dnsExactIpv6Entries\x125\n" +
+	"\x17dns_exact_ipv6_capacity\x18\f \x01(\rR\x14dnsExactIpv6Capacity\x128\n" +
+	"\x19dns_exact_ipv6_high_water\x18\r \x01(\rR\x15dnsExactIpv6HighWater\x12*\n" +
+	"\x11dns_lru_evictions\x18\x0e \x01(\x04R\x0fdnsLruEvictions\x124\n" +
+	"\x16dns_admission_failures\x18\x0f \x01(\x04R\x14dnsAdmissionFailures\x120\n" +
+	"\x14dns_budget_throttles\x18\x10 \x01(\x04R\x12dnsBudgetThrottles\"\xa4\x05\n" +
 	"\x0eControlCommand\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x121\n" +
 	"\bsync_ack\x18\x02 \x01(\v2\x14.netfence.v1.SyncAckH\x00R\asyncAck\x121\n" +
@@ -1875,7 +1985,7 @@ const file_v1_control_proto_rawDesc = "" +
 	"allowCidrs\x125\n" +
 	"\n" +
 	"deny_cidrs\x18\x03 \x03(\v2\x16.netfence.v1.CIDREntryR\tdenyCidrs\x12(\n" +
-	"\x03dns\x18\x04 \x01(\v2\x16.netfence.v1.DnsConfigR\x03dns\"\xd4\x03\n" +
+	"\x03dns\x18\x04 \x01(\v2\x16.netfence.v1.DnsConfigR\x03dns\"\xfc\x03\n" +
 	"\tDnsConfig\x12(\n" +
 	"\x04mode\x18\x01 \x01(\x0e2\x14.netfence.v1.DnsModeR\x04mode\x12=\n" +
 	"\rallow_domains\x18\x02 \x03(\v2\x18.netfence.v1.DomainEntryR\fallowDomains\x12;\n" +
@@ -1885,7 +1995,9 @@ const file_v1_control_proto_rawDesc = "" +
 	"\x14max_ips_per_response\x18\x06 \x01(\rR\x11maxIpsPerResponse\x128\n" +
 	"\x19max_ips_per_policy_domain\x18\a \x01(\rR\x15maxIpsPerPolicyDomain\x12.\n" +
 	"\x13max_tracked_domains\x18\b \x01(\rR\x11maxTrackedDomains\x12.\n" +
-	"\x13max_ownership_edges\x18\t \x01(\rR\x11maxOwnershipEdges\"L\n" +
+	"\x13max_ownership_edges\x18\t \x01(\rR\x11maxOwnershipEdges\x12&\n" +
+	"\x0fmax_churn_units\x18\n" +
+	" \x01(\rR\rmaxChurnUnits\"L\n" +
 	"\tCIDREntry\x12\x12\n" +
 	"\x04cidr\x18\x01 \x01(\tR\x04cidr\x12+\n" +
 	"\x03ttl\x18\x02 \x01(\v2\x19.google.protobuf.DurationR\x03ttl\"T\n" +

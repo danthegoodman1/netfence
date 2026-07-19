@@ -26,8 +26,10 @@ type fakeFilter struct {
 	dnsAllowed           []string
 	dnsAddCalls          int
 	dnsRemoveCalls       int
+	dnsReplaceCalls      int
 	dnsAddErr            error
 	dnsRemoveErr         error
+	dnsReplaceErr        error
 	dnsCapacity4         uint32
 	dnsCapacity6         uint32
 	dnsListOverride      []net.IP
@@ -235,6 +237,22 @@ func (f *fakeFilter) RemoveDNSAllowedIPs(ips []net.IP) error {
 	}
 	for _, ip := range ips {
 		f.dnsAllowed = removeString(f.dnsAllowed, ip.String())
+	}
+	return nil
+}
+
+func (f *fakeFilter) ReplaceDNSAllowedIPs(remove, add []net.IP) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.dnsReplaceCalls++
+	if f.dnsReplaceErr != nil {
+		return f.dnsReplaceErr
+	}
+	for _, ip := range remove {
+		f.dnsAllowed = removeString(f.dnsAllowed, ip.String())
+	}
+	for _, ip := range add {
+		f.dnsAllowed = appendUnique(f.dnsAllowed, ip.String())
 	}
 	return nil
 }
