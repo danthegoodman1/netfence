@@ -9,12 +9,16 @@ import (
 	apiv1 "github.com/danthegoodman1/netfence/v1"
 )
 
-func createFilter(_, _ string, _ apiv1.AttachmentType, _ apiv1.PolicyMode, _ apiv1.TcDirection, _ uint32) (filter.Filter, error) {
+func createFilter(_, _ string, _ apiv1.AttachmentType, _ apiv1.PolicyMode, _ apiv1.TcDirection, _, _ uint32) (filter.Filter, error) {
 	return nil, nil
 }
 
 func loadPinnedFilter(_, _ string, _ apiv1.AttachmentType, _ apiv1.TcDirection) (filter.Filter, error) {
 	return nil, fmt.Errorf("pinned BPF filters are only supported on linux")
+}
+
+func loadPinnedFilterWithOptions(pinDir, target string, attachType apiv1.AttachmentType, direction apiv1.TcDirection, _ uint32) (filter.Filter, error) {
+	return loadPinnedFilter(pinDir, target, attachType, direction)
 }
 
 func apiModeToFilterMode(mode apiv1.PolicyMode) filter.PolicyMode {

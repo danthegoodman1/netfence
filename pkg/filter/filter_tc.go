@@ -66,7 +66,26 @@ func NewTCFilter(ifaceName string, mode PolicyMode, direction TCDirection, carve
 }
 
 // NewTCFilterWithOptions is NewTCFilter with load-time tuning (see Options).
-func NewTCFilterWithOptions(ifaceName string, mode PolicyMode, direction TCDirection, carveouts Carveouts, opts Options) (*TCFilter, error) {
+// On an ordinary construction failure it returns (nil, err). If cleanup
+// itself is ambiguous, it instead returns a non-nil partial filter with the
+// error: the caller owns that partial attachment and must retain its target
+// ownership/quarantine until cleanup is explicitly resolved.
+func NewTCFilterWithOptions(ifaceName string, mode PolicyMode, direction TCDirection, carveouts Carveouts, opts Options) (_ *TCFilter, retErr error) {
+	pinClaimed := false
+	if opts.PinDir != "" {
+		if err := claimPinDir(opts.PinDir); err != nil {
+			return nil, err
+		}
+		pinClaimed = true
+		defer func() {
+			if retErr == nil || !pinClaimed {
+				return
+			}
+			if err := os.RemoveAll(opts.PinDir); err != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("cleaning claimed TC pin dir %s: %w", opts.PinDir, err))
+			}
+		}()
+	}
 	// Load the eBPF spec and bake the carve-out flags in before load: the
 	// JIT folds the constant, so the per-packet cost is zero, and the value
 	// is per-attachment because each filter loads its own program instance.
@@ -89,18 +108,29 @@ func NewTCFilterWithOptions(ifaceName string, mode PolicyMode, direction TCDirec
 	if err := spec.LoadAndAssign(objs, nil); err != nil {
 		return nil, fmt.Errorf("loading TC BPF objects: %w", err)
 	}
+	fail := func(primary error, partial *TCFilter) (*TCFilter, error) {
+		if pinClaimed {
+			if unpinErr := os.RemoveAll(opts.PinDir); unpinErr != nil {
+				pinClaimed = false
+				return partial, errors.Join(primary, fmt.Errorf("unpinning partially constructed TC filter: %w", unpinErr))
+			}
+			pinClaimed = false
+		}
+		if closeErr := partial.Close(); closeErr != nil {
+			return partial, errors.Join(primary, fmt.Errorf("closing partially constructed TC filter: %w", closeErr))
+		}
+		return nil, primary
+	}
 
 	// Set the policy mode
 	if err := objs.PolicyMode.Put(uint32(0), uint8(mode)); err != nil {
-		objs.Close()
-		return nil, fmt.Errorf("setting policy mode: %w", err)
+		return fail(fmt.Errorf("setting policy mode: %w", err), &TCFilter{objs: objs, pinDir: opts.PinDir, removePinDir: os.RemoveAll})
 	}
 
 	// Attach to interface using TCX (modern TC attachment)
 	iface, err := net.InterfaceByName(ifaceName)
 	if err != nil {
-		objs.Close()
-		return nil, fmt.Errorf("getting interface %s: %w", ifaceName, err)
+		return fail(fmt.Errorf("getting interface %s: %w", ifaceName, err), &TCFilter{objs: objs, pinDir: opts.PinDir, removePinDir: os.RemoveAll})
 	}
 
 	attach := ebpf.AttachTCXEgress
@@ -114,8 +144,7 @@ func NewTCFilterWithOptions(ifaceName string, mode PolicyMode, direction TCDirec
 		Attach:    attach,
 	})
 	if err != nil {
-		objs.Close()
-		return nil, fmt.Errorf("attaching TC filter to interface %s (%s): %w", ifaceName, direction, err)
+		return fail(fmt.Errorf("attaching TC filter to interface %s (%s): %w", ifaceName, direction, err), &TCFilter{objs: objs, pinDir: opts.PinDir, removePinDir: os.RemoveAll})
 	}
 
 	f := &TCFilter{
@@ -126,16 +155,18 @@ func NewTCFilterWithOptions(ifaceName string, mode PolicyMode, direction TCDirec
 		tcLink:       tcLink,
 		removePinDir: os.RemoveAll,
 	}
+	if err := writePinSchemaVersion(f.objs.PinSchemaVersion, currentPinSchemaVersion); err != nil {
+		return fail(fmt.Errorf("initializing TC pin schema: %w", err), f)
+	}
 
 	// Pin link + maps last, once everything is attached: a crash before this
 	// point leaves nothing pinned (state dies with the process, as before),
 	// while a successful pin means the full set is adoptable after a restart.
 	if opts.PinDir != "" {
 		if err := pinAll(opts.PinDir, f.pinnables()); err != nil {
-			_ = os.RemoveAll(opts.PinDir)
-			_ = f.Close()
-			return nil, fmt.Errorf("pinning TC filter state: %w", err)
+			return fail(fmt.Errorf("pinning TC filter state: %w", err), f)
 		}
+		pinClaimed = false
 	}
 
 	return f, nil
@@ -150,7 +181,17 @@ func NewTCFilterWithOptions(ifaceName string, mode PolicyMode, direction TCDirec
 //
 // On error the partially-loaded handles are closed and the pins are left in
 // place for the caller to inspect or remove.
-func LoadPinnedTCFilter(ifaceName string, direction TCDirection, pinDir string) (_ *TCFilter, retErr error) {
+func LoadPinnedTCFilter(ifaceName string, direction TCDirection, pinDir string) (*TCFilter, error) {
+	return loadPinnedTCFilter(ifaceName, direction, pinDir, nil, Options{}, pinMigrationOps{})
+}
+
+// LoadPinnedTCFilterWithOptions is the explicit legacy-schema upgrade entry
+// point. See LoadPinnedCgroupFilterWithOptions for the safety contract.
+func LoadPinnedTCFilterWithOptions(ifaceName string, direction TCDirection, pinDir string, originalCarveouts Carveouts, opts Options) (*TCFilter, error) {
+	return loadPinnedTCFilter(ifaceName, direction, pinDir, &originalCarveouts, opts, pinMigrationOps{})
+}
+
+func loadPinnedTCFilter(ifaceName string, direction TCDirection, pinDir string, originalCarveouts *Carveouts, opts Options, migrationOps pinMigrationOps) (_ *TCFilter, retErr error) {
 	f := &TCFilter{
 		objs:         &tcObjects{},
 		ifaceName:    ifaceName,
@@ -160,19 +201,86 @@ func LoadPinnedTCFilter(ifaceName string, direction TCDirection, pinDir string) 
 	}
 	defer closePinnedLoadOnError(&retErr, f.closeHandles)
 
-	if err := loadPinnedMaps(pinDir, map[string]**ebpf.Map{
+	marker, markerPresent, err := loadOptionalPinnedMap(pinDir, pinSchemaVersion)
+	if err != nil {
+		return nil, err
+	}
+	f.objs.PinSchemaVersion = marker
+	committed, err := classifyPinnedSchema(marker, markerPresent)
+	if err != nil {
+		return nil, err
+	}
+	legacyRequired := []string{
+		pinAllowedIPv4, pinAllowedIPv6, pinDeniedIPv4, pinDeniedIPv6, pinPolicyMode, pinStats, pinLinkTCX,
+	}
+	if committed {
+		if err := validatePinnedDirectorySet(pinDir,
+			append(append([]string{}, legacyRequired...), pinDNSAllowedIPv4, pinDNSAllowedIPv6, pinSchemaVersion), nil); err != nil {
+			return nil, err
+		}
+	} else if err := validatePinnedDirectorySet(pinDir, legacyRequired,
+		[]string{pinDNSAllowedIPv4, pinDNSAllowedIPv6, pinSchemaVersion}); err != nil {
+		return nil, err
+	}
+
+	requiredMaps := map[string]**ebpf.Map{
 		pinAllowedIPv4: &f.objs.AllowedIpv4,
 		pinAllowedIPv6: &f.objs.AllowedIpv6,
 		pinDeniedIPv4:  &f.objs.DeniedIpv4,
 		pinDeniedIPv6:  &f.objs.DeniedIpv6,
 		pinPolicyMode:  &f.objs.PolicyMode,
 		pinStats:       &f.objs.Stats,
-	}); err != nil {
+	}
+	if committed {
+		requiredMaps[pinDNSAllowedIPv4] = &f.objs.DnsAllowedIpv4
+		requiredMaps[pinDNSAllowedIPv6] = &f.objs.DnsAllowedIpv6
+		err = loadCommittedPinnedMaps(pinDir, requiredMaps)
+	} else {
+		err = loadUncommittedRequiredPinnedMaps(pinDir, requiredMaps)
+	}
+	if err != nil {
 		return nil, err
+	}
+
+	exact4Present, exact6Present := committed, committed
+	if !committed {
+		f.objs.DnsAllowedIpv4, exact4Present, err = loadOptionalPinnedMap(pinDir, pinDNSAllowedIPv4)
+		if err != nil {
+			return nil, err
+		}
+		f.objs.DnsAllowedIpv6, exact6Present, err = loadOptionalPinnedMap(pinDir, pinDNSAllowedIPv6)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if committed {
+		spec, err := loadTc()
+		if err != nil {
+			return nil, fmt.Errorf("loading current TC spec to validate committed pins: %w", err)
+		}
+		if err := validatePinnedMapsAgainstSpec(spec, map[string]*ebpf.Map{
+			pinAllowedIPv4:    f.objs.AllowedIpv4,
+			pinAllowedIPv6:    f.objs.AllowedIpv6,
+			pinDeniedIPv4:     f.objs.DeniedIpv4,
+			pinDeniedIPv6:     f.objs.DeniedIpv6,
+			pinDNSAllowedIPv4: f.objs.DnsAllowedIpv4,
+			pinDNSAllowedIPv6: f.objs.DnsAllowedIpv6,
+			pinPolicyMode:     f.objs.PolicyMode,
+			pinStats:          f.objs.Stats,
+			pinSchemaVersion:  f.objs.PinSchemaVersion,
+		}); err != nil {
+			return nil, err
+		}
 	}
 
 	l, err := link.LoadPinnedLink(filepath.Join(pinDir, pinLinkTCX), nil)
 	if err != nil {
+		if committed {
+			return nil, pinnedCommittedObjectLoadError("link", pinLinkTCX, err)
+		}
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("%w: uncommitted/legacy pin set is missing required link %s; preserving possible partial enforcement", ErrPinnedSchemaIncompatible, pinLinkTCX)
+		}
 		return nil, pinnedObjectLoadError("link", pinLinkTCX, err)
 	}
 	f.tcLink = l
@@ -186,24 +294,152 @@ func LoadPinnedTCFilter(ifaceName string, direction TCDirection, pinDir string) 
 	if err != nil {
 		return nil, fmt.Errorf("getting interface %s: %w", ifaceName, err)
 	}
-	if err := validateTCXLinkTarget(l, pinLinkTCX, iface.Index); err != nil {
+	if iface.Index <= 0 {
+		return nil, fmt.Errorf("%w: current TCX target exposes no identity", ErrPinnedSchemaIncompatible)
+	}
+	expectedAttach := ebpf.AttachTCXEgress
+	if direction == DirectionIngress {
+		expectedAttach = ebpf.AttachTCXIngress
+	}
+	pinnedIfindex, err := tcxLinkTargetIfindex(l, pinLinkTCX, expectedAttach)
+	if err != nil {
 		return nil, err
 	}
-
-	return f, nil
-}
-
-// pinnables returns every object that must be pinned for the filter to
-// survive the process, keyed by pin file name.
-func (f *TCFilter) pinnables() map[string]pinner {
-	return map[string]pinner{
+	linkMaps := map[string]*ebpf.Map{
 		pinAllowedIPv4: f.objs.AllowedIpv4,
 		pinAllowedIPv6: f.objs.AllowedIpv6,
 		pinDeniedIPv4:  f.objs.DeniedIpv4,
 		pinDeniedIPv6:  f.objs.DeniedIpv6,
 		pinPolicyMode:  f.objs.PolicyMode,
 		pinStats:       f.objs.Stats,
-		pinLinkTCX:     f.tcLink,
+	}
+	if committed {
+		linkMaps[pinDNSAllowedIPv4] = f.objs.DnsAllowedIpv4
+		linkMaps[pinDNSAllowedIPv6] = f.objs.DnsAllowedIpv6
+	}
+	if err := verifyPinnedLinkUsesMaps(l, linkMaps); err != nil {
+		return nil, fmt.Errorf("verifying TCX link map identity before adoption/migration: %w", err)
+	}
+	// As with cgroup, schema/map coherence outranks a discardable target
+	// reincarnation classification.
+	if pinnedIfindex != uint32(iface.Index) {
+		return nil, fmt.Errorf("%w: pinned link %s is attached to ifindex %d but the interface is now ifindex %d", ErrPinnedTargetMismatch, pinLinkTCX, pinnedIfindex, iface.Index)
+	}
+
+	if committed {
+		return f, nil
+	}
+	if originalCarveouts == nil {
+		return nil, fmt.Errorf("%w: TC pin set %s has no committed current schema marker", ErrPinnedSchemaUpgradeRequired, pinDir)
+	}
+	if err := f.migratePinnedSchema(*originalCarveouts, opts, markerPresent, exact4Present, exact6Present, migrationOps); err != nil {
+		return nil, err
+	}
+
+	return f, nil
+}
+
+func (f *TCFilter) migratePinnedSchema(carveouts Carveouts, opts Options, markerPresent, exact4Present, exact6Present bool, migrationOps pinMigrationOps) (retErr error) {
+	ops := migrationOps.withDefaults()
+	spec, err := loadTc()
+	if err != nil {
+		return fmt.Errorf("loading current TC BPF spec for pinned migration: %w", err)
+	}
+	if err := applyOptions(spec, opts); err != nil {
+		return fmt.Errorf("applying TC migration options: %w", err)
+	}
+	carveoutVar, ok := spec.Variables["carveout_flags"]
+	if !ok {
+		return fmt.Errorf("current TC BPF spec missing carveout_flags variable")
+	}
+	if err := carveoutVar.Set(carveouts.flags()); err != nil {
+		return fmt.Errorf("setting migration carve-out flags: %w", err)
+	}
+	replacements := map[string]*ebpf.Map{
+		pinAllowedIPv4: f.objs.AllowedIpv4,
+		pinAllowedIPv6: f.objs.AllowedIpv6,
+		pinDeniedIPv4:  f.objs.DeniedIpv4,
+		pinDeniedIPv6:  f.objs.DeniedIpv6,
+		pinPolicyMode:  f.objs.PolicyMode,
+		pinStats:       f.objs.Stats,
+	}
+	if exact4Present {
+		replacements[pinDNSAllowedIPv4] = f.objs.DnsAllowedIpv4
+	}
+	if exact6Present {
+		replacements[pinDNSAllowedIPv6] = f.objs.DnsAllowedIpv6
+	}
+	if markerPresent {
+		replacements[pinSchemaVersion] = f.objs.PinSchemaVersion
+	}
+	if err := replacementMapOptions(spec, replacements); err != nil {
+		return err
+	}
+
+	upgraded := &tcObjects{}
+	if err := spec.LoadAndAssign(upgraded, &ebpf.CollectionOptions{MapReplacements: replacements}); err != nil {
+		return fmt.Errorf("loading current TC program over pinned maps: %w", err)
+	}
+	defer func() {
+		if upgraded != nil {
+			if err := upgraded.Close(); err != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("closing TC migration objects: %w", err))
+			}
+		}
+	}()
+
+	if err := ops.writeSchema(upgraded.PinSchemaVersion, 0); err != nil {
+		return err
+	}
+	if err := pinMigrationMapIfMissing(ops, f.pinDir, pinDNSAllowedIPv4, exact4Present, upgraded.DnsAllowedIpv4); err != nil {
+		return err
+	}
+	if err := pinMigrationMapIfMissing(ops, f.pinDir, pinDNSAllowedIPv6, exact6Present, upgraded.DnsAllowedIpv6); err != nil {
+		return err
+	}
+	if err := pinMigrationMapIfMissing(ops, f.pinDir, pinSchemaVersion, markerPresent, upgraded.PinSchemaVersion); err != nil {
+		return err
+	}
+	if err := ops.updateLink(f.tcLink, upgraded.FilterEgress); err != nil {
+		return fmt.Errorf("updating pinned TCX link %s (schema marker remains in-progress): %w", pinLinkTCX, err)
+	}
+	expectedAttach := ebpf.AttachTCXEgress
+	if f.direction == DirectionIngress {
+		expectedAttach = ebpf.AttachTCXIngress
+	}
+	if err := verifyUpdatedLinkProgram(f.tcLink, upgraded.FilterEgress, expectedAttach); err != nil {
+		return fmt.Errorf("verifying pinned TCX link %s before schema commit: %w", pinLinkTCX, err)
+	}
+	if err := ops.writeSchema(upgraded.PinSchemaVersion, currentPinSchemaVersion); err != nil {
+		return fmt.Errorf("committing migrated TC pin schema: %w", err)
+	}
+	if err := upgraded.tcPrograms.Close(); err != nil {
+		return fmt.Errorf("closing migrated TC program handles: %w", err)
+	}
+	upgraded.tcPrograms = tcPrograms{}
+	old := f.objs
+	f.objs = upgraded
+	upgraded = nil
+	if err := old.Close(); err != nil {
+		return fmt.Errorf("closing pre-migration TC map handles: %w", err)
+	}
+	return nil
+}
+
+// pinnables returns every object that must be pinned for the filter to
+// survive the process, keyed by pin file name.
+func (f *TCFilter) pinnables() map[string]pinner {
+	return map[string]pinner{
+		pinAllowedIPv4:    f.objs.AllowedIpv4,
+		pinAllowedIPv6:    f.objs.AllowedIpv6,
+		pinDeniedIPv4:     f.objs.DeniedIpv4,
+		pinDeniedIPv6:     f.objs.DeniedIpv6,
+		pinDNSAllowedIPv4: f.objs.DnsAllowedIpv4,
+		pinDNSAllowedIPv6: f.objs.DnsAllowedIpv6,
+		pinPolicyMode:     f.objs.PolicyMode,
+		pinStats:          f.objs.Stats,
+		pinSchemaVersion:  f.objs.PinSchemaVersion,
+		pinLinkTCX:        f.tcLink,
 	}
 }
 
@@ -368,6 +604,55 @@ func (f *TCFilter) RemoveDeniedIP(cidr *net.IPNet) error {
 	return nil
 }
 
+func (f *TCFilter) exactDNSBackendLocked() (exactDNSBackend, error) {
+	if f.objs == nil || f.objs.DnsAllowedIpv4 == nil || f.objs.DnsAllowedIpv6 == nil {
+		return nil, fmt.Errorf("filter handles are closed")
+	}
+	return bpfExactDNSBackend{ipv4: f.objs.DnsAllowedIpv4, ipv6: f.objs.DnsAllowedIpv6}, nil
+}
+
+// AddDNSAllowedIPs adds a validated all-or-rollback batch to the exact DNS
+// allow tier. See Filter for the rollback-ambiguity contract.
+func (f *TCFilter) AddDNSAllowedIPs(ips []net.IP) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	b, err := f.exactDNSBackendLocked()
+	if err != nil {
+		return err
+	}
+	return addExactDNSIPs(b, ips)
+}
+
+func (f *TCFilter) RemoveDNSAllowedIPs(ips []net.IP) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	b, err := f.exactDNSBackendLocked()
+	if err != nil {
+		return err
+	}
+	return removeExactDNSIPs(b, ips)
+}
+
+func (f *TCFilter) DNSAllowedIPs() ([]net.IP, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	b, err := f.exactDNSBackendLocked()
+	if err != nil {
+		return nil, err
+	}
+	return listExactDNSIPs(b)
+}
+
+func (f *TCFilter) DNSAllowOccupancy() (DNSAllowOccupancy, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	b, err := f.exactDNSBackendLocked()
+	if err != nil {
+		return DNSAllowOccupancy{}, err
+	}
+	return exactDNSOccupancy(b)
+}
+
 // ClearRules removes all configured allowlist and denylist entries.
 func (f *TCFilter) ClearRules() error {
 	f.mu.Lock()
@@ -384,6 +669,12 @@ func (f *TCFilter) ClearRules() error {
 	}
 	if err := clearMap[IPv6LPMKey](f.objs.DeniedIpv6); err != nil {
 		return fmt.Errorf("clearing denied IPv6 rules: %w", err)
+	}
+	if err := clearMap[[4]byte](f.objs.DnsAllowedIpv4); err != nil {
+		return fmt.Errorf("clearing DNS exact IPv4 rules: %w", err)
+	}
+	if err := clearMap[[16]byte](f.objs.DnsAllowedIpv6); err != nil {
+		return fmt.Errorf("clearing DNS exact IPv6 rules: %w", err)
 	}
 	return nil
 }

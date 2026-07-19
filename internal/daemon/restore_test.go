@@ -83,6 +83,7 @@ func newRestoreEnv(t *testing.T, port int, storeMode apiv1.PolicyMode) *restoreE
 	// exists, and both construction paths are observable.
 	server.ensurePinRoot = func(string) error { return nil }
 	server.validatePinRoot = func(string) error { return nil }
+	server.inspectPinSchema = func(string) (filter.PinnedSchemaState, error) { return filter.PinnedSchemaCurrent, nil }
 	server.targetPresence = func(apiv1.AttachmentType, string) (bool, error) { return true, nil }
 	server.loadPinnedFilter = func(pinDir, target string, attachType apiv1.AttachmentType, direction apiv1.TcDirection) (filter.Filter, error) {
 		env.mu.Lock()
@@ -341,6 +342,37 @@ func TestRestoreAmbiguousNewFilterFailureAbortsAndRetainsDurableRow(t *testing.T
 	assert.Zero(t, deleteCalls, "ambiguous construction failure must not delete ownership")
 	assertRestoreDurableOwnershipRetained(t, env, before)
 	assertDNSPortFree(t, env.port)
+}
+
+func TestRestoreConstructorErrorCleansReturnedPartialOwnership(t *testing.T) {
+	for i, detachErr := range []error{nil, syscall.EIO} {
+		name := "detach_succeeds"
+		if detachErr != nil {
+			name = "detach_ambiguous"
+		}
+		t.Run(name, func(t *testing.T) {
+			env := newRestoreEnv(t, 12361+i, apiv1.PolicyMode_POLICY_MODE_ALLOWLIST)
+			stubRestoreWatcher(env.server)
+			before, err := env.st.GetAttachment(env.id)
+			require.NoError(t, err)
+			partial := &fakeFilter{mode: filter.ModeBlockAll}
+			partial.setDetachErr(detachErr)
+			env.server.newFilter = func(string, string, apiv1.AttachmentType, apiv1.PolicyMode, apiv1.TcDirection, uint32) (filter.Filter, error) {
+				return partial, syscall.EACCES
+			}
+
+			err = env.server.Start()
+			require.Error(t, err)
+			assert.ErrorIs(t, err, syscall.EACCES)
+			if detachErr != nil {
+				assert.ErrorIs(t, err, detachErr)
+				assert.ErrorContains(t, err, "cleaning partially constructed replacement filter")
+			}
+			assert.Equal(t, 1, partial.detachCallCount(), "restore must clean constructor-returned partial ownership")
+			assertRestoreDurableOwnershipRetained(t, env, before)
+			assertDNSPortFree(t, env.port)
+		})
+	}
 }
 
 func TestRestoreAmbiguousTargetWatchFailureAbortsAndRetainsDurableRow(t *testing.T) {
@@ -836,10 +868,64 @@ func TestRestoreTargetGoneUsesOldPersistedPinRootAndAbortsOnRemovalFailure(t *te
 			require.NoError(t, err)
 			t.Cleanup(env.server.Stop)
 			assert.Zero(t, newFilterCalls, "proven target absence must authorize cleanup without probing a replacement filter")
-			assert.Equal(t, []string{oldPinDir, oldPinDir}, removed,
-				"gone-target cleanup may idempotently remove only the exact old path")
+			assert.Equal(t, []string{oldPinDir}, removed,
+				"gone-target cleanup removes the proven current pin path once")
 			_, getErr := env.st.GetAttachment(env.id)
 			assert.ErrorIs(t, getErr, sql.ErrNoRows)
+		})
+	}
+}
+
+func TestRestoreMissingTargetPreservesUncommittedAndFuturePins(t *testing.T) {
+	tests := []struct {
+		name      string
+		inspect   func(string) (filter.PinnedSchemaState, error)
+		wantCause error
+	}{
+		{
+			name: "uncommitted",
+			inspect: func(string) (filter.PinnedSchemaState, error) {
+				return filter.PinnedSchemaUncommitted, nil
+			},
+		},
+		{
+			name: "future",
+			inspect: func(string) (filter.PinnedSchemaState, error) {
+				return filter.PinnedSchemaUncommitted, fmt.Errorf("%w: future marker", filter.ErrPinnedSchemaIncompatible)
+			},
+			wantCause: filter.ErrPinnedSchemaIncompatible,
+		},
+	}
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := newRestoreEnv(t, 12370+i, apiv1.PolicyMode_POLICY_MODE_ALLOWLIST)
+			stubRestoreWatcher(env.server)
+			env.mkPinDir(t)
+			pinDir := filepath.Join(env.pinRoot, env.id)
+			before, err := env.st.GetAttachment(env.id)
+			require.NoError(t, err)
+			env.server.setTargetIdentityResolver(func(apiv1.AttachmentType, string) (uint64, error) {
+				return 0, os.ErrNotExist
+			})
+			env.server.inspectPinSchema = tt.inspect
+			removeCalls, deleteCalls, newFilterCalls := 0, 0, 0
+			env.server.removePinDir = func(string) error { removeCalls++; return nil }
+			env.server.deleteAttachment = func(string) error { deleteCalls++; return nil }
+			env.server.newFilter = func(_, _ string, _ apiv1.AttachmentType, _ apiv1.PolicyMode, _ apiv1.TcDirection, _ uint32) (filter.Filter, error) {
+				newFilterCalls++
+				return &fakeFilter{}, nil
+			}
+
+			err = env.server.Start()
+			require.ErrorContains(t, err, "preserving pinned state for missing attachment target")
+			if tt.wantCause != nil {
+				assert.ErrorIs(t, err, tt.wantCause)
+			}
+			assert.Zero(t, removeCalls)
+			assert.Zero(t, deleteCalls)
+			assert.Zero(t, newFilterCalls)
+			assertRestoreDurableOwnershipRetained(t, env, before)
+			assert.DirExists(t, pinDir)
 		})
 	}
 }
@@ -856,6 +942,8 @@ func TestRestoreAmbiguousPinnedAdoptionFailureAbortsWithoutRemovingPins(t *testi
 	}{
 		{name: "io", port: 12340, loadErr: syscall.EIO, returnPartial: true, wantCause: syscall.EIO},
 		{name: "permission", port: 12353, loadErr: syscall.EACCES, wantCause: syscall.EACCES},
+		{name: "cgroup_wrong_kind_link_metadata", port: 12359, loadErr: fmt.Errorf("%w: pinned link has no cgroup metadata", filter.ErrPinnedSchemaIncompatible), wantCause: filter.ErrPinnedSchemaIncompatible},
+		{name: "tcx_wrong_kind_link_metadata", port: 12360, loadErr: fmt.Errorf("%w: pinned link has no TCX metadata", filter.ErrPinnedSchemaIncompatible), wantCause: filter.ErrPinnedSchemaIncompatible},
 		{
 			name:             "discardable_primary_with_returned_partial_close_failure",
 			port:             12357,
@@ -1087,6 +1175,35 @@ func TestRestoreOrphanScanFailuresAbortStartup(t *testing.T) {
 			assert.Zero(t, env.adopted.detachCallCount())
 		})
 	}
+}
+
+func TestRestorePreservesUncommittedCrashPartialOrphan(t *testing.T) {
+	env := newRestoreEnv(t, 12352, apiv1.PolicyMode_POLICY_MODE_ALLOWLIST)
+	env.adopted = &fakeFilter{mode: filter.ModeAllowlist}
+	env.mkPinDir(t)
+	env.persistPinIdentity(t, filepath.Join(env.pinRoot, env.id), false)
+	orphan := filepath.Join(env.pinRoot, "crash-partial")
+	require.NoError(t, os.MkdirAll(orphan, 0o700))
+	env.server.inspectPinSchema = func(path string) (filter.PinnedSchemaState, error) {
+		if path == orphan {
+			return filter.PinnedSchemaUncommitted, nil
+		}
+		return filter.PinnedSchemaCurrent, nil
+	}
+	removeCalls := 0
+	env.server.removePinDir = func(path string) error {
+		if path == orphan {
+			removeCalls++
+		}
+		return os.RemoveAll(path)
+	}
+
+	err := env.server.Start()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "uncommitted schema marker")
+	assert.Zero(t, removeCalls, "possible live partial enforcement must never be unpinned")
+	assert.DirExists(t, orphan)
+	assert.Equal(t, 1, env.adopted.closeCallCount(), "startup abort closes adopted handles but retains pins")
 }
 
 func TestRestoreSameIDCurrentRootDirectoryIsOrphanWhenLiveRowOwnsOldRoot(t *testing.T) {

@@ -1,5 +1,8 @@
 //go:build ignore
 
+// Frozen verbatim from bpf/filter_cgroup.c at d4f5151, before the exact DNS
+// tier and pinned schema marker. Keep independent of production BPF sources.
+
 // eBPF program for filtering outbound network connections (cgroup-based)
 // This program attaches to cgroup/connect4 and cgroup/connect6 to filter IPv4 and IPv6
 // connections, and to cgroup/sendmsg4 and cgroup/sendmsg6 to filter unconnected UDP
@@ -52,24 +55,6 @@ struct {
     __uint(map_flags, BPF_F_NO_PREALLOC);
 } allowed_ipv6 SEC(".maps");
 
-// DNS-derived host allows live in separately bounded exact-match maps. They
-// are intentionally plain HASH maps, not kernel LRU maps: userspace owns TTL,
-// ownership, and deterministic expired-first/LRU admission decisions. The
-// authoritative/system CIDR tier above is never displaced by this tier.
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 4096);
-    __type(key, __u8[4]);
-    __type(value, __u8);
-} dns_allowed_ipv4 SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 4096);
-    __type(key, __u8[16]);
-    __type(value, __u8);
-} dns_allowed_ipv6 SEC(".maps");
-
 // Map to store denied IPv6 addresses/CIDRs (LPM trie for prefix matching)
 struct {
     __uint(type, BPF_MAP_TYPE_LPM_TRIE);
@@ -99,16 +84,6 @@ struct {
     __type(value, __u64);
 } stats SEC(".maps");
 
-// Pinned schema commit marker. Userspace leaves this at 0 while migrating a
-// legacy pin set and writes the current schema only after every pinned link
-// has been updated. Programs do not consult it on the packet path.
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, __u32);
-    __type(value, __u32);
-} pin_schema_version SEC(".maps");
-
 static __always_inline void increment_stat(__u32 idx)
 {
     __u64 *count = bpf_map_lookup_elem(&stats, &idx);
@@ -132,7 +107,7 @@ static __always_inline int is_link_local_v4(__u32 addr)
 static __always_inline int is_localhost_v6(__u32 *addr)
 {
     // ::1
-    return addr[0] == 0 && addr[1] == 0 && 
+    return addr[0] == 0 && addr[1] == 0 &&
            addr[2] == 0 && addr[3] == __builtin_bswap32(1);
 }
 
@@ -227,14 +202,8 @@ static __always_inline int filter_dst4(struct bpf_sock_addr *ctx)
     };
 
     if (*mode == 1) {
-        // Authoritative/system CIDRs have first precedence and live in the
-        // protected LPM tier. DNS-derived /32s live in the separately bounded
-        // exact tier and can never evict or replace an authoritative rule.
+        // Allowlist mode: check if in allowed list
         if (bpf_map_lookup_elem(&allowed_ipv4, &lpm_key)) {
-            increment_stat(0); // allowed
-            return 1;
-        }
-		if (bpf_map_lookup_elem(&dns_allowed_ipv4, &dst_ip)) {
             increment_stat(0); // allowed
             return 1;
         }
@@ -300,13 +269,8 @@ static __always_inline int filter_dst6(struct bpf_sock_addr *ctx)
     lpm_key.addr[3] = dst_ip6[3];
 
     if (*mode == 1) {
-        // See the IPv4 path: protected authoritative LPM first, then the
-        // separately bounded DNS exact-host tier.
+        // Allowlist mode: check if in allowed list
         if (bpf_map_lookup_elem(&allowed_ipv6, &lpm_key)) {
-            increment_stat(0); // allowed
-            return 1;
-        }
-		if (bpf_map_lookup_elem(&dns_allowed_ipv6, &dst_ip6)) {
             increment_stat(0); // allowed
             return 1;
         }

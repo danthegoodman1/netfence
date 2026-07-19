@@ -69,6 +69,8 @@ type Server struct {
 	// maxRuleEntries sizes each eBPF rule map at filter load time
 	// (see config filter.max_rule_entries; 0 = compiled-in default).
 	maxRuleEntries uint32
+	// maxDNSRuleEntries independently sizes each exact DNS-derived host map.
+	maxDNSRuleEntries uint32
 
 	// pinRoot is the bpffs directory attachment BPF state is pinned under
 	// (config filter.bpf_pin_dir; "" disables pinning). detachOnStop selects
@@ -120,9 +122,10 @@ type Server struct {
 	// removePinDir is the restart cleanup primitive for durable tombstones.
 	// Removing every bpffs entry drops the persistent kernel references even
 	// though the userspace handles belonged to the previous process.
-	removePinDir    func(string) error
-	readPinRoot     func(string) ([]os.DirEntry, error)
-	validatePinRoot func(string) error
+	removePinDir     func(string) error
+	readPinRoot      func(string) ([]os.DirEntry, error)
+	validatePinRoot  func(string) error
+	inspectPinSchema func(string) (filter.PinnedSchemaState, error)
 }
 
 type attachmentState struct {
@@ -434,6 +437,10 @@ func NewServer(cfg *config.Config, st *store.Store, logger zerolog.Logger, versi
 	if cfg.Filter.MaxRuleEntries > 0 {
 		maxRuleEntries = uint32(cfg.Filter.MaxRuleEntries)
 	}
+	var maxDNSRuleEntries uint32
+	if cfg.Filter.MaxDNSRuleEntries > 0 {
+		maxDNSRuleEntries = uint32(cfg.Filter.MaxDNSRuleEntries)
+	}
 	dnsListenIP, err := resolveConcreteDNSListenIP(cfg.DNS.ListenAddr)
 	if err != nil {
 		return nil, fmt.Errorf("resolving dns.listen_addr: %w", err)
@@ -467,10 +474,15 @@ func NewServer(cfg *config.Config, st *store.Store, logger zerolog.Logger, versi
 		dnsListenIP:        dnsListenIP,
 		defaultDNSUpstream: defaultUpstreams[0],
 		maxRuleEntries:     maxRuleEntries,
+		maxDNSRuleEntries:  maxDNSRuleEntries,
 		pinRoot:            pinRoot,
 		detachOnStop:       cfg.Filter.DetachOnStop,
-		newFilter:          createFilter,
-		loadPinnedFilter:   loadPinnedFilter,
+		newFilter: func(pinDir, target string, attachType apiv1.AttachmentType, mode apiv1.PolicyMode, direction apiv1.TcDirection, maxRules uint32) (filter.Filter, error) {
+			return createFilter(pinDir, target, attachType, mode, direction, maxRules, maxDNSRuleEntries)
+		},
+		loadPinnedFilter: func(pinDir, target string, attachType apiv1.AttachmentType, direction apiv1.TcDirection) (filter.Filter, error) {
+			return loadPinnedFilterWithOptions(pinDir, target, attachType, direction, maxDNSRuleEntries)
+		},
 		ensurePinRoot:      ensureBPFPinRoot,
 		targetPresence:     targetPresent,
 		targetIdentity:     currentTargetIdentity,
@@ -482,6 +494,7 @@ func NewServer(cfg *config.Config, st *store.Store, logger zerolog.Logger, versi
 		removePinDir:       os.RemoveAll,
 		readPinRoot:        os.ReadDir,
 		validatePinRoot:    validateExistingBPFPinRoot,
+		inspectPinSchema:   filter.InspectPinnedSchema,
 	}
 
 	s.watcher = NewTargetWatcher(logger, s.handleTargetRemoved)
@@ -651,6 +664,9 @@ func (s *Server) Start() error {
 				Str("id", id).
 				Str("target", state.info.Target).
 				Msg("failed to resolve target identity on restore")
+			if schemaErr := s.provePinnedStateSafeForStaleCleanup(pinDir); schemaErr != nil {
+				return abortStart(fmt.Errorf("preserving pinned state for missing attachment target %s: %w", id, schemaErr))
+			}
 			toRemove = append(toRemove, id)
 			continue
 		}
@@ -838,8 +854,9 @@ func (s *Server) Start() error {
 
 	// Reconcile orphaned pin dirs: bpffs state with no surviving store row
 	// (e.g. a crash between pinning and the store save, or a row dropped just
-	// above) is unowned — remove it so no stale enforcement or kernel
-	// objects leak.
+	// above) is removable only after the schema inspector proves a complete,
+	// current, coherent set. Uncommitted/future/incompatible state is preserved
+	// and aborts startup rather than being guessed away.
 	if s.pinRoot != "" {
 		entries, err := s.readPinRoot(s.pinRoot)
 		if err != nil {
@@ -859,6 +876,13 @@ func (s *Server) Start() error {
 			}
 			if owned {
 				continue
+			}
+			schemaState, err := s.inspectPinSchema(orphan)
+			if err != nil {
+				return abortStart(fmt.Errorf("classifying orphaned BPF pin dir %s before cleanup: %w", orphan, err))
+			}
+			if schemaState != filter.PinnedSchemaCurrent {
+				return abortStart(fmt.Errorf("orphaned BPF pin dir %s has an uncommitted schema marker; preserving possible live enforcement for retry/inspection", orphan))
 			}
 			if err := s.removePinDir(orphan); err != nil {
 				return abortStart(fmt.Errorf("removing orphaned BPF pin dir %s: %w", orphan, err))
@@ -970,6 +994,31 @@ type restoreAbortError struct{ err error }
 func (e *restoreAbortError) Error() string { return e.err.Error() }
 func (e *restoreAbortError) Unwrap() error { return e.err }
 
+// provePinnedStateSafeForStaleCleanup is the destructive-cleanup gate for a
+// missing target. Target absence alone says nothing about whether a pin
+// directory is a future schema, a crash-partial migration, or a mixed live
+// set. Only a complete current schema whose maps/links and target identities
+// are coherent may be removed automatically.
+func (s *Server) provePinnedStateSafeForStaleCleanup(pinDir string) error {
+	if pinDir == "" {
+		return nil
+	}
+	if _, err := os.Stat(pinDir); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("checking pin dir %s before stale cleanup: %w", pinDir, err)
+	}
+	state, err := s.inspectPinSchema(pinDir)
+	if err != nil {
+		return fmt.Errorf("inspecting pin dir %s before stale cleanup: %w", pinDir, err)
+	}
+	if state != filter.PinnedSchemaCurrent {
+		return fmt.Errorf("pin dir %s is uncommitted; possible live enforcement requires inspection", pinDir)
+	}
+	return nil
+}
+
 // restoreFilter obtains the eBPF filter for a persisted attachment during
 // Start. The keep-enforcing path re-adopts the attachment's pinned BPF state
 // (rules intact, links never re-attached — so no transient allow/block
@@ -995,15 +1044,14 @@ func (s *Server) restoreFilter(id, pinDir, target string, attachType apiv1.Attac
 				return nil, false, &restoreAbortError{err: fmt.Errorf("checking target presence for %s: %w", target, presenceErr)}
 			}
 			if !present {
-				// The target vanished while the daemon was down, so the
-				// pinned links are defunct. Drop the pins and return a typed
-				// not-found result so the caller can authorize stale cleanup
-				// without probing a replacement filter against a gone target.
-				s.logger.Warn().Str("id", id).Str("target", target).
-					Msg("target gone while daemon was down; discarding pinned BPF state")
-				if rmErr := s.removePinDir(pinDir); rmErr != nil {
-					return nil, false, &restoreAbortError{err: fmt.Errorf("removing stale pin dir %s: %w", pinDir, rmErr)}
+				// Target absence never outranks schema safety. A future,
+				// uncommitted, or incoherent pin set is preserved even when the
+				// persisted target name no longer resolves.
+				if schemaErr := s.provePinnedStateSafeForStaleCleanup(pinDir); schemaErr != nil {
+					return nil, false, &restoreAbortError{err: schemaErr}
 				}
+				s.logger.Warn().Str("id", id).Str("target", target).
+					Msg("target gone while daemon was down; current coherent pins are eligible for stale cleanup")
 				return nil, false, fmt.Errorf("target %s disappeared while daemon was down: %w", target, os.ErrNotExist)
 			} else {
 				restored, lerr := s.loadPinnedFilter(pinDir, target, attachType, direction)
@@ -1030,7 +1078,11 @@ func (s *Server) restoreFilter(id, pinDir, target string, attachType apiv1.Attac
 				if isExplicitTargetNotFound(lerr) &&
 					!errors.Is(lerr, filter.ErrPinnedStateInvalid) {
 					// The target vanished during adoption. Let Start route the row
-					// through stale-target cleanup; do not attempt a replacement.
+					// through stale-target cleanup only after independently proving
+					// the complete current pin schema is coherent.
+					if schemaErr := s.provePinnedStateSafeForStaleCleanup(pinDir); schemaErr != nil {
+						return nil, false, &restoreAbortError{err: errors.Join(lerr, schemaErr)}
+					}
 					return nil, false, lerr
 				}
 				if !errors.Is(lerr, filter.ErrPinnedStateInvalid) &&
@@ -1053,6 +1105,14 @@ func (s *Server) restoreFilter(id, pinDir, target string, attachType apiv1.Attac
 
 	f, err := s.newFilter(pinDir, target, attachType, mode, direction, s.maxRuleEntries)
 	if err != nil {
+		if f != nil {
+			if cleanupErr := f.Detach(); cleanupErr != nil {
+				return nil, false, &restoreAbortError{err: errors.Join(
+					fmt.Errorf("creating replacement filter: %w", err),
+					fmt.Errorf("cleaning partially constructed replacement filter: %w", cleanupErr),
+				)}
+			}
+		}
 		return nil, false, err
 	}
 	return f, false, nil

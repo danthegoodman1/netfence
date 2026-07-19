@@ -20,6 +20,24 @@ var (
 	// is otherwise discardable, callers must preserve pins when this marker is
 	// present because userspace no longer knows which references remain live.
 	ErrPinnedStateCloseFailed = errors.New("closing partially loaded pinned filter state failed")
+	// ErrPinnedSchemaUpgradeRequired means a legacy pin set needs a program
+	// migration but the caller did not provide the original load-time
+	// carve-outs. Guessing them could loosen enforcement, so callers must use
+	// LoadPinned*Cgroup/TCFilterWithOptions and supply the known posture.
+	ErrPinnedSchemaUpgradeRequired = errors.New("pinned filter schema upgrade requires explicit original carve-outs")
+	// ErrPinnedSchemaIncompatible marks a pin set written by a newer or
+	// otherwise unsupported schema. It is intentionally not discardable:
+	// callers must preserve the pins and abort rather than replacing live,
+	// potentially newer enforcement.
+	ErrPinnedSchemaIncompatible = errors.New("pinned filter schema is incompatible")
+	// ErrDNSAllowCapacity reports an exact DNS allow batch that cannot fit in
+	// the independently bounded IPv4 or IPv6 exact map. Capacity is checked
+	// before any key is inserted.
+	ErrDNSAllowCapacity = errors.New("DNS exact allow map capacity exceeded")
+	// ErrDNSAllowRollback marks the rare case where a batch mutation failed
+	// and restoring its exact pre-call state also failed. The operation never
+	// hides this ambiguity; callers must fail closed until reconciled.
+	ErrDNSAllowRollback = errors.New("DNS exact allow batch rollback failed")
 )
 
 // PolicyMode defines the filtering behavior
@@ -127,13 +145,21 @@ type Options struct {
 	// bounded by key length, not capacity).
 	MaxRuleEntries uint32
 
+	// MaxDNSRuleEntries sets max_entries for each exact DNS-derived allow map
+	// (IPv4 and IPv6) at program load time. 0 keeps the compiled-in default
+	// (4096). This is intentionally independent from MaxRuleEntries: DNS
+	// entries are regenerable and may later be reclaimed by deterministic
+	// userspace LRU policy, while authoritative CIDRs and denies are protected.
+	MaxDNSRuleEntries uint32
+
 	// PinDir, when non-empty, pins the filter's links and maps to this
 	// directory (which must live on a bpffs mount). Pinned state is held by
 	// the kernel independent of the creating process: enforcement survives
 	// Close() and process death, and LoadPinnedCgroupFilter /
-	// LoadPinnedTCFilter re-adopt it without re-attaching. Any stale
-	// directory at this path is removed before pinning. Empty disables
-	// pinning (state dies with the process, the pre-pinning behavior).
+	// LoadPinnedTCFilter re-adopt it without re-attaching. The directory must
+	// not already exist: collisions fail before any BPF load or attachment and
+	// existing state is never removed. Empty disables pinning (state dies with
+	// the process, the pre-pinning behavior).
 	PinDir string
 }
 
@@ -142,6 +168,27 @@ type Stats struct {
 	Allowed uint64
 	Blocked uint64
 }
+
+// DNSAllowOccupancy reports independent usage and hard capacity for the two
+// exact DNS-derived allow maps. The authoritative LPM maps are intentionally
+// not included.
+type DNSAllowOccupancy struct {
+	IPv4Entries  uint32
+	IPv4Capacity uint32
+	IPv6Entries  uint32
+	IPv6Capacity uint32
+}
+
+// PinnedSchemaState is the read-only classification used by startup orphan
+// handling. An absent/zero marker is an uncommitted create/migration and must
+// be preserved; current means the commit-last marker and required exact pins
+// are present.
+type PinnedSchemaState uint8
+
+const (
+	PinnedSchemaUncommitted PinnedSchemaState = iota
+	PinnedSchemaCurrent
+)
 
 // ParseCIDR is a helper that parses a CIDR string (or single IP)
 func ParseCIDR(s string) (*net.IPNet, error) {

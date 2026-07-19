@@ -616,6 +616,105 @@ func TestCgroupUnconnectedUDP(t *testing.T) {
 	t.Logf("Stats: allowed=%d, blocked=%d", stats.Allowed, stats.Blocked)
 }
 
+// TestCgroupDNSExactTierTraffic proves the exact DNS host tier participates
+// only in ALLOWLIST verdicts, after protected LPM rules, for both address
+// families and both unconnected-sendmsg hooks. Documentation IPv6 needs no
+// route: EPERM vs a routing error still distinguishes the BPF verdict.
+func TestCgroupDNSExactTierTraffic(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("test requires root")
+	}
+	cgroupPath, cgroupCleanup := setupTestCgroup(t, "netfence-dns-exact-tier-test")
+	defer cgroupCleanup()
+	localIP := nonLoopbackIPv4(t)
+	destV4, receivedV4, cleanupV4 := startUDPReceiver(t, "udp4", net.JoinHostPort(localIP.String(), "0"))
+	defer cleanupV4()
+	destV4Addr, err := net.ResolveUDPAddr("udp4", destV4)
+	require.NoError(t, err)
+	destV6IP := net.ParseIP("2001:db8:102:304::506:708")
+	destV6Addr, err := net.ResolveUDPAddr("udp6", net.JoinHostPort(destV6IP.String(), "53"))
+	require.NoError(t, err)
+
+	f, err := filter.NewCgroupFilterWithOptions(cgroupPath, filter.ModeAllowlist, filter.DefaultCarveouts(), filter.Options{MaxDNSRuleEntries: 2})
+	require.NoError(t, err)
+	defer f.Close()
+	restore := moveSelfToCgroup(t, cgroupPath)
+	defer restore()
+	senderV4, err := net.ListenPacket("udp4", ":0")
+	require.NoError(t, err)
+	defer senderV4.Close()
+	senderV6, err := net.ListenPacket("udp6", "[::]:0")
+	require.NoError(t, err, "Docker Linux gate must provide an IPv6 socket for exact-key byte-order coverage")
+	defer senderV6.Close()
+
+	expectV4Blocked := func(label string) {
+		t.Helper()
+		_, err := senderV4.WriteTo([]byte(label), destV4Addr)
+		require.ErrorIs(t, err, syscall.EPERM, label)
+		select {
+		case got := <-receivedV4:
+			t.Fatalf("%s unexpectedly delivered %q", label, got)
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
+	expectV4Allowed := func(label string) {
+		t.Helper()
+		_, err := senderV4.WriteTo([]byte(label), destV4Addr)
+		require.NoError(t, err, label)
+		select {
+		case got := <-receivedV4:
+			require.Equal(t, label, got)
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s was not delivered", label)
+		}
+	}
+	expectV6PolicyBlocked := func(label string) {
+		t.Helper()
+		_, err := senderV6.WriteTo([]byte(label), destV6Addr)
+		require.ErrorIs(t, err, syscall.EPERM, label)
+	}
+	expectV6PolicyAllowed := func(label string) {
+		t.Helper()
+		_, err := senderV6.WriteTo([]byte(label), destV6Addr)
+		require.NotErrorIs(t, err, syscall.EPERM, label)
+	}
+
+	expectV4Blocked("allowlist-empty-v4")
+	expectV6PolicyBlocked("allowlist-empty-v6")
+	require.NoError(t, f.AddDNSAllowedIPs([]net.IP{localIP, destV6IP}))
+	expectV4Allowed("exact-only-v4")
+	expectV6PolicyAllowed("exact-only-v6")
+
+	cidr4, err := filter.ParseCIDR(localIP.String() + "/32")
+	require.NoError(t, err)
+	cidr6, err := filter.ParseCIDR(destV6IP.String() + "/128")
+	require.NoError(t, err)
+	require.NoError(t, f.AllowIP(cidr4))
+	require.NoError(t, f.AllowIP(cidr6))
+	require.NoError(t, f.RemoveDNSAllowedIPs([]net.IP{localIP, destV6IP}))
+	expectV4Allowed("authoritative-lpm-v4")
+	expectV6PolicyAllowed("authoritative-lpm-v6")
+
+	require.NoError(t, f.AddDNSAllowedIPs([]net.IP{localIP, destV6IP}))
+	require.NoError(t, f.RemoveAllowedIP(cidr4))
+	require.NoError(t, f.RemoveAllowedIP(cidr6))
+	expectV4Allowed("exact-after-lpm-v4")
+	expectV6PolicyAllowed("exact-after-lpm-v6")
+
+	require.NoError(t, f.DenyIP(cidr4))
+	require.NoError(t, f.DenyIP(cidr6))
+	require.NoError(t, f.SetMode(filter.ModeDenylist))
+	expectV4Blocked("denylist-ignores-exact-v4")
+	expectV6PolicyBlocked("denylist-ignores-exact-v6")
+
+	require.NoError(t, f.SetMode(filter.ModeDisabled))
+	expectV4Allowed("disabled-unchanged-v4")
+	expectV6PolicyAllowed("disabled-unchanged-v6")
+	require.NoError(t, f.SetMode(filter.ModeBlockAll))
+	expectV4Blocked("block-all-unchanged-v4")
+	expectV6PolicyBlocked("block-all-unchanged-v6")
+}
+
 // TestCgroupMetadataServiceBlockable proves the 1D headline fix: IPv4
 // link-local (169.254.0.0/16) is no longer unconditionally carved out, so in
 // allowlist mode the cloud metadata service address (169.254.169.254) is

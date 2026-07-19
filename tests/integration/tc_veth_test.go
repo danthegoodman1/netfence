@@ -37,6 +37,11 @@ const (
 	vethNsIP      = "10.199.0.2"
 	vethAllowedIP = "10.199.0.3"
 	vethBlockedIP = "10.199.0.5"
+
+	vethHostIPv6    = "2001:db8:199::1"
+	vethNsIPv6      = "2001:db8:199::2"
+	vethAllowedIPv6 = "2001:db8:199::3"
+	vethBlockedIPv6 = "2001:db8:199::5"
 )
 
 func ipCmd(args ...string) error {
@@ -77,6 +82,14 @@ func setupVethNetns(t *testing.T) func() {
 	return cleanupVethNetns
 }
 
+func setupVethIPv6(t *testing.T) {
+	t.Helper()
+	for _, addr := range []string{vethHostIPv6, vethAllowedIPv6, vethBlockedIPv6} {
+		require.NoError(t, ipCmd("-6", "addr", "add", addr+"/64", "dev", vethHostIf, "nodad"))
+	}
+	require.NoError(t, ipCmd("-n", vethNetns, "-6", "addr", "add", vethNsIPv6+"/64", "dev", vethNsIf, "nodad"))
+}
+
 // flushNeighbors clears the neighbor (ARP) caches inside the workload netns
 // and on the given host-side devices. Called AFTER a filter is attached, it
 // forces the next connect to perform a real ARP exchange across the filter —
@@ -110,8 +123,12 @@ func nsSendUDP(t *testing.T, payload, host, port string) {
 // listenTCP starts a TCP listener bound to a specific host address and
 // accepts (and immediately discards) connections until closed.
 func listenTCP(t *testing.T, addr string) (port string, cleanup func()) {
+	return listenTCPNetwork(t, "tcp4", addr)
+}
+
+func listenTCPNetwork(t *testing.T, network, addr string) (port string, cleanup func()) {
 	t.Helper()
-	ln, err := net.Listen("tcp4", net.JoinHostPort(addr, "0"))
+	ln, err := net.Listen(network, net.JoinHostPort(addr, "0"))
 	require.NoError(t, err)
 	go func() {
 		for {
@@ -447,4 +464,71 @@ func TestTCVethDirection(t *testing.T) {
 		case <-time.After(700 * time.Millisecond):
 		}
 	})
+}
+
+// TestTCVethDNSExactTierTraffic is the packet-level TC proof for the bounded
+// DNS host tier. It exercises exact-only admission, authoritative LPM
+// independence, denylist isolation, and the unchanged global modes on the
+// actual host-peer ingress topology.
+func TestTCVethDNSExactTierTraffic(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("test requires root")
+	}
+	cleanup := setupVethNetns(t)
+	defer cleanup()
+	setupVethIPv6(t)
+	allowedPort, closeAllowed := listenTCP(t, vethAllowedIP)
+	defer closeAllowed()
+	blockedPort, closeBlocked := listenTCP(t, vethBlockedIP)
+	defer closeBlocked()
+	allowedPort6, closeAllowed6 := listenTCPNetwork(t, "tcp6", vethAllowedIPv6)
+	defer closeAllowed6()
+	blockedPort6, closeBlocked6 := listenTCPNetwork(t, "tcp6", vethBlockedIPv6)
+	defer closeBlocked6()
+	require.True(t, nsConnectTCP(vethAllowedIP, allowedPort), "veth exact-tier topology is broken")
+	require.True(t, nsConnectTCP(vethBlockedIP, blockedPort), "veth exact-tier control topology is broken")
+	require.True(t, nsConnectTCP(vethAllowedIPv6, allowedPort6), "veth IPv6 exact-tier topology is broken")
+	require.True(t, nsConnectTCP(vethBlockedIPv6, blockedPort6), "veth IPv6 exact-tier control topology is broken")
+
+	f, err := filter.NewTCFilterWithOptions(vethHostIf, filter.ModeAllowlist, filter.DirectionIngress, filter.DefaultCarveouts(), filter.Options{MaxDNSRuleEntries: 2})
+	require.NoError(t, err)
+	defer f.Close()
+	flushNeighbors(t, vethHostIf)
+	assert.False(t, nsConnectTCP(vethAllowedIP, allowedPort), "empty allowlist must block before exact admission")
+	assert.False(t, nsConnectTCP(vethAllowedIPv6, allowedPort6), "empty IPv6 allowlist must block before exact admission")
+
+	allowedIP := net.ParseIP(vethAllowedIP)
+	allowedIP6 := net.ParseIP(vethAllowedIPv6)
+	require.NoError(t, f.AddDNSAllowedIPs([]net.IP{allowedIP, allowedIP6}))
+	assert.True(t, nsConnectTCP(vethAllowedIP, allowedPort), "exact-only TC allow must admit the destination")
+	assert.True(t, nsConnectTCP(vethAllowedIPv6, allowedPort6), "exact-only TC IPv6 allow must admit the destination")
+	assert.False(t, nsConnectTCP(vethBlockedIP, blockedPort), "exact admission must not open unrelated destinations")
+	assert.False(t, nsConnectTCP(vethBlockedIPv6, blockedPort6), "exact IPv6 admission must not open unrelated destinations")
+
+	cidr, err := filter.ParseCIDR(vethAllowedIP + "/32")
+	require.NoError(t, err)
+	cidr6, err := filter.ParseCIDR(vethAllowedIPv6 + "/128")
+	require.NoError(t, err)
+	require.NoError(t, f.AllowIP(cidr))
+	require.NoError(t, f.AllowIP(cidr6))
+	require.NoError(t, f.RemoveDNSAllowedIPs([]net.IP{allowedIP, allowedIP6}))
+	assert.True(t, nsConnectTCP(vethAllowedIP, allowedPort), "protected LPM allow must survive exact removal")
+	assert.True(t, nsConnectTCP(vethAllowedIPv6, allowedPort6), "protected IPv6 LPM allow must survive exact removal")
+	require.NoError(t, f.AddDNSAllowedIPs([]net.IP{allowedIP, allowedIP6}))
+	require.NoError(t, f.RemoveAllowedIP(cidr))
+	require.NoError(t, f.RemoveAllowedIP(cidr6))
+	assert.True(t, nsConnectTCP(vethAllowedIP, allowedPort), "exact second tier must admit after LPM removal")
+	assert.True(t, nsConnectTCP(vethAllowedIPv6, allowedPort6), "IPv6 exact second tier must admit after LPM removal")
+
+	require.NoError(t, f.DenyIP(cidr))
+	require.NoError(t, f.DenyIP(cidr6))
+	require.NoError(t, f.SetMode(filter.ModeDenylist))
+	assert.False(t, nsConnectTCP(vethAllowedIP, allowedPort), "denylist must ignore exact allows")
+	assert.False(t, nsConnectTCP(vethAllowedIPv6, allowedPort6), "denylist must ignore IPv6 exact allows")
+	require.NoError(t, f.SetMode(filter.ModeDisabled))
+	assert.True(t, nsConnectTCP(vethAllowedIP, allowedPort), "disabled mode must remain allow-all")
+	assert.True(t, nsConnectTCP(vethAllowedIPv6, allowedPort6), "disabled mode must remain IPv6 allow-all")
+	require.NoError(t, f.SetMode(filter.ModeBlockAll))
+	assert.False(t, nsConnectTCP(vethAllowedIP, allowedPort), "block-all must override exact and authoritative allows")
+	assert.False(t, nsConnectTCP(vethAllowedIPv6, allowedPort6), "block-all must override IPv6 exact and authoritative allows")
 }

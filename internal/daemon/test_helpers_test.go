@@ -23,6 +23,7 @@ type fakeFilter struct {
 	mode                filter.PolicyMode
 	allowed             []string
 	denied              []string
+	dnsAllowed          []string
 	clearCalls          int
 	stats               filter.Stats
 	setModeCalls        int
@@ -176,6 +177,50 @@ func (f *fakeFilter) RemoveDeniedIP(cidr *net.IPNet) error {
 	return nil
 }
 
+func (f *fakeFilter) AddDNSAllowedIPs(ips []net.IP) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, ip := range ips {
+		f.dnsAllowed = appendUnique(f.dnsAllowed, ip.String())
+	}
+	return nil
+}
+
+func (f *fakeFilter) RemoveDNSAllowedIPs(ips []net.IP) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, ip := range ips {
+		f.dnsAllowed = removeString(f.dnsAllowed, ip.String())
+	}
+	return nil
+}
+
+func (f *fakeFilter) DNSAllowedIPs() ([]net.IP, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]net.IP, 0, len(f.dnsAllowed))
+	for _, raw := range f.dnsAllowed {
+		out = append(out, net.ParseIP(raw))
+	}
+	return out, nil
+}
+
+func (f *fakeFilter) DNSAllowOccupancy() (filter.DNSAllowOccupancy, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out filter.DNSAllowOccupancy
+	for _, raw := range f.dnsAllowed {
+		if net.ParseIP(raw).To4() != nil {
+			out.IPv4Entries++
+		} else {
+			out.IPv6Entries++
+		}
+	}
+	out.IPv4Capacity = ^uint32(0)
+	out.IPv6Capacity = ^uint32(0)
+	return out, nil
+}
+
 func (f *fakeFilter) setRemoveAllowedErr(err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -204,6 +249,7 @@ func (f *fakeFilter) ClearRules() error {
 	f.events = append(f.events, "clear")
 	f.allowed = nil
 	f.denied = nil
+	f.dnsAllowed = nil
 	f.clearCalls++
 	return nil
 }

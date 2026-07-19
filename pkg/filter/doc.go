@@ -66,6 +66,11 @@ import "net"
 //   - Detach removes the bpffs pin directory and closes everything, dropping
 //     the last kernel references: enforcement stops and no state survives.
 //     For an unpinned filter Detach is equivalent to Close.
+//
+// New*FilterWithOptions may return a non-nil Filter together with an error
+// only when construction cleanup is ambiguous. Callers must treat that value
+// as owned live state and retain target ownership while retrying or otherwise
+// resolving cleanup rather than discarding it.
 type Filter interface {
 	SetMode(PolicyMode) error
 	GetMode() (PolicyMode, error)
@@ -73,6 +78,18 @@ type Filter interface {
 	DenyIP(cidr *net.IPNet) error
 	RemoveAllowedIP(cidr *net.IPNet) error
 	RemoveDeniedIP(cidr *net.IPNet) error
+	// AddDNSAllowedIPs atomically-at-the-API-boundary adds canonical host
+	// addresses to the separately bounded DNS exact tier. Inputs are fully
+	// validated and per-family capacity is preflighted before mutation. On a
+	// kernel mutation failure the implementation restores the exact pre-call
+	// state or returns an error wrapping ErrDNSAllowRollback.
+	AddDNSAllowedIPs(ips []net.IP) error
+	// RemoveDNSAllowedIPs is the inverse transactional batch operation.
+	RemoveDNSAllowedIPs(ips []net.IP) error
+	// DNSAllowedIPs lists canonical, sorted exact-tier host addresses.
+	DNSAllowedIPs() ([]net.IP, error)
+	// DNSAllowOccupancy reports exact-tier per-family occupancy and capacity.
+	DNSAllowOccupancy() (DNSAllowOccupancy, error)
 	ClearRules() error
 	GetStats() (Stats, error)
 	Close() error

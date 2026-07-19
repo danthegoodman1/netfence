@@ -1,5 +1,8 @@
 //go:build ignore
 
+// Frozen verbatim from bpf/filter_tc.c at d4f5151, before the exact DNS tier
+// and pinned schema marker. Keep independent of production BPF sources.
+
 // eBPF program for filtering outbound network connections (TC-based)
 // This program attaches to TC egress on specific network interfaces
 // Use this for per-interface filtering (e.g., VM tap interfaces like fcr-*)
@@ -53,23 +56,6 @@ struct {
     __uint(map_flags, BPF_F_NO_PREALLOC);
 } allowed_ipv6 SEC(".maps");
 
-// Separately bounded DNS-derived host allows. These are deliberately HASH,
-// not kernel LRU maps: userspace makes deterministic TTL/ownership/LRU
-// decisions while authoritative/system CIDRs remain protected in LPM maps.
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 4096);
-    __type(key, __u8[4]);
-    __type(value, __u8);
-} dns_allowed_ipv4 SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 4096);
-    __type(key, __u8[16]);
-    __type(value, __u8);
-} dns_allowed_ipv6 SEC(".maps");
-
 // Map to store denied IPv6 addresses/CIDRs (LPM trie for prefix matching)
 struct {
     __uint(type, BPF_MAP_TYPE_LPM_TRIE);
@@ -99,14 +85,6 @@ struct {
     __type(value, __u64);
 } stats SEC(".maps");
 
-// Commit-last pinned schema marker; not read on the packet path.
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, __u32);
-    __type(value, __u32);
-} pin_schema_version SEC(".maps");
-
 static __always_inline void increment_stat(__u32 idx)
 {
     __u64 *count = bpf_map_lookup_elem(&stats, &idx);
@@ -131,9 +109,9 @@ static __always_inline int is_link_local_v4(__be32 addr)
 static __always_inline int is_localhost_v6(struct in6_addr *addr)
 {
     // ::1
-    return addr->in6_u.u6_addr32[0] == 0 && 
+    return addr->in6_u.u6_addr32[0] == 0 &&
            addr->in6_u.u6_addr32[1] == 0 &&
-           addr->in6_u.u6_addr32[2] == 0 && 
+           addr->in6_u.u6_addr32[2] == 0 &&
            addr->in6_u.u6_addr32[3] == bpf_htonl(1);
 }
 
@@ -207,13 +185,8 @@ static __always_inline int filter_ipv4(__be32 dst_addr, __u8 mode)
     };
 
     if (mode == 1) {
-        // Protected authoritative/system CIDRs win first. DNS-derived exact
-        // hosts are a second, independently bounded allow tier.
+        // Allowlist mode
         if (bpf_map_lookup_elem(&allowed_ipv4, &lpm_key)) {
-            increment_stat(0);
-            return TC_ACT_OK;
-        }
-		if (bpf_map_lookup_elem(&dns_allowed_ipv4, &dst_addr)) {
             increment_stat(0);
             return TC_ACT_OK;
         }
@@ -253,12 +226,8 @@ static __always_inline int filter_ipv6(struct in6_addr *dst_addr, __u8 mode)
     lpm_key.addr[3] = dst_addr->in6_u.u6_addr32[3];
 
     if (mode == 1) {
-        // Protected authoritative LPM first, then DNS exact host.
+        // Allowlist mode
         if (bpf_map_lookup_elem(&allowed_ipv6, &lpm_key)) {
-            increment_stat(0);
-            return TC_ACT_OK;
-        }
-		if (bpf_map_lookup_elem(&dns_allowed_ipv6, &dst_addr->in6_u.u6_addr32)) {
             increment_stat(0);
             return TC_ACT_OK;
         }

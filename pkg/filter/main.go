@@ -60,18 +60,141 @@ func ipv6CIDRToKey(cidr *net.IPNet) IPv6LPMKey {
 // bpf/filter_cgroup.c.
 var ruleMapNames = []string{"allowed_ipv4", "denied_ipv4", "allowed_ipv6", "denied_ipv6"}
 
+// dnsRuleMapNames are deliberately separate from ruleMapNames: exact
+// DNS-derived host allows are regenerable and independently capacity-managed.
+var dnsRuleMapNames = []string{"dns_allowed_ipv4", "dns_allowed_ipv6"}
+
 // applyOptions applies load-time tuning to a BPF collection spec before load.
 // It only resizes maps; program instructions are never modified.
 func applyOptions(spec *ebpf.CollectionSpec, opts Options) error {
-	if opts.MaxRuleEntries == 0 {
-		return nil
-	}
-	for _, name := range ruleMapNames {
-		m, ok := spec.Maps[name]
-		if !ok {
-			return fmt.Errorf("BPF spec missing rule map %s", name)
+	if opts.MaxRuleEntries != 0 {
+		for _, name := range ruleMapNames {
+			m, ok := spec.Maps[name]
+			if !ok {
+				return fmt.Errorf("BPF spec missing rule map %s", name)
+			}
+			m.MaxEntries = opts.MaxRuleEntries
 		}
-		m.MaxEntries = opts.MaxRuleEntries
+	}
+	if opts.MaxDNSRuleEntries != 0 {
+		for _, name := range dnsRuleMapNames {
+			m, ok := spec.Maps[name]
+			if !ok {
+				return fmt.Errorf("BPF spec missing DNS exact rule map %s", name)
+			}
+			m.MaxEntries = opts.MaxDNSRuleEntries
+		}
+	}
+	return nil
+}
+
+type bpfExactDNSBackend struct {
+	ipv4 *ebpf.Map
+	ipv6 *ebpf.Map
+}
+
+func (b bpfExactDNSBackend) mapFor(family exactIPFamily) (*ebpf.Map, error) {
+	var m *ebpf.Map
+	switch family {
+	case exactIPv4:
+		m = b.ipv4
+	case exactIPv6:
+		m = b.ipv6
+	default:
+		return nil, fmt.Errorf("unsupported exact IP family %d", family)
+	}
+	if m == nil {
+		return nil, fmt.Errorf("DNS exact IPv%d map handle is closed", family)
+	}
+	return m, nil
+}
+
+func (b bpfExactDNSBackend) keys(family exactIPFamily) ([]exactIPKey, error) {
+	m, err := b.mapFor(family)
+	if err != nil {
+		return nil, err
+	}
+	var value uint8
+	var out []exactIPKey
+	if family == exactIPv4 {
+		var raw [4]byte
+		iter := m.Iterate()
+		for iter.Next(&raw, &value) {
+			var key exactIPKey
+			key.family = exactIPv4
+			copy(key.addr[:4], raw[:])
+			out = append(out, key)
+		}
+		if err := iter.Err(); err != nil {
+			return nil, err
+		}
+	} else {
+		var raw [16]byte
+		iter := m.Iterate()
+		for iter.Next(&raw, &value) {
+			var key exactIPKey
+			key.family = exactIPv6
+			copy(key.addr[:], raw[:])
+			out = append(out, key)
+		}
+		if err := iter.Err(); err != nil {
+			return nil, err
+		}
+	}
+	sortExactIPKeys(out)
+	return out, nil
+}
+
+func (b bpfExactDNSBackend) capacity(family exactIPFamily) (uint32, error) {
+	m, err := b.mapFor(family)
+	if err != nil {
+		return 0, err
+	}
+	info, err := m.Info()
+	if err != nil {
+		return 0, err
+	}
+	return info.MaxEntries, nil
+}
+
+func exactIPKeyForBPF(key exactIPKey) (any, error) {
+	switch key.family {
+	case exactIPv4:
+		var raw [4]byte
+		copy(raw[:], key.addr[:4])
+		return raw, nil
+	case exactIPv6:
+		var raw [16]byte
+		copy(raw[:], key.addr[:])
+		return raw, nil
+	default:
+		return nil, fmt.Errorf("unsupported exact IP family %d", key.family)
+	}
+}
+
+func (b bpfExactDNSBackend) put(key exactIPKey) error {
+	m, err := b.mapFor(key.family)
+	if err != nil {
+		return err
+	}
+	raw, err := exactIPKeyForBPF(key)
+	if err != nil {
+		return err
+	}
+	return m.Put(raw, uint8(1))
+}
+
+func (b bpfExactDNSBackend) delete(key exactIPKey) error {
+	m, err := b.mapFor(key.family)
+	if err != nil {
+		return err
+	}
+	raw, err := exactIPKeyForBPF(key)
+	if err != nil {
+		return err
+	}
+	if err := m.Delete(raw); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+		return err
 	}
 	return nil
 }

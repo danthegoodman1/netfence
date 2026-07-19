@@ -1,9 +1,29 @@
 package config
 
 import (
+	"math"
 	"strings"
 	"testing"
 )
+
+func TestValidateIndependentDNSExactMapCapacity(t *testing.T) {
+	cfg := validBase()
+	cfg.Filter.MaxRuleEntries = 17
+	cfg.Filter.MaxDNSRuleEntries = 3
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("independent capacities should validate: %v", err)
+	}
+	cfg.Filter.MaxDNSRuleEntries = -1
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "filter.max_dns_rule_entries") {
+		t.Fatalf("negative DNS exact capacity should name its knob, got %v", err)
+	}
+	if int64(math.MaxUint32) < int64(^uint(0)>>1) {
+		cfg.Filter.MaxDNSRuleEntries = int(math.MaxUint32) + 1
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "filter.max_dns_rule_entries") {
+			t.Fatalf("overflowing DNS exact capacity should be rejected, got %v", err)
+		}
+	}
+}
 
 // validBase returns a Config that passes every non-control-plane Validate
 // check, so control-plane cases only exercise the invariant under test.

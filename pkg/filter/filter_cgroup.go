@@ -41,11 +41,29 @@ func NewCgroupFilter(cgroupPath string, mode PolicyMode, carveouts Carveouts) (*
 }
 
 // NewCgroupFilterWithOptions is NewCgroupFilter with load-time tuning (see
-// Options).
-func NewCgroupFilterWithOptions(cgroupPath string, mode PolicyMode, carveouts Carveouts, opts Options) (*CgroupFilter, error) {
+// Options). On an ordinary construction failure it returns (nil, err). If
+// cleanup itself is ambiguous, it instead returns a non-nil partial filter
+// with the error: the caller owns that partial attachment and must retain its
+// target ownership/quarantine until cleanup is explicitly resolved.
+func NewCgroupFilterWithOptions(cgroupPath string, mode PolicyMode, carveouts Carveouts, opts Options) (_ *CgroupFilter, retErr error) {
 	// Verify cgroup path exists
 	if _, err := os.Stat(cgroupPath); os.IsNotExist(err) {
 		return nil, fmt.Errorf("cgroup path does not exist: %s", cgroupPath)
+	}
+	pinClaimed := false
+	if opts.PinDir != "" {
+		if err := claimPinDir(opts.PinDir); err != nil {
+			return nil, err
+		}
+		pinClaimed = true
+		defer func() {
+			if retErr == nil || !pinClaimed {
+				return
+			}
+			if err := os.RemoveAll(opts.PinDir); err != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("cleaning claimed cgroup pin dir %s: %w", opts.PinDir, err))
+			}
+		}()
 	}
 
 	// Load the eBPF spec and bake the carve-out flags in before load: the
@@ -70,11 +88,27 @@ func NewCgroupFilterWithOptions(cgroupPath string, mode PolicyMode, carveouts Ca
 	if err := spec.LoadAndAssign(objs, nil); err != nil {
 		return nil, fmt.Errorf("loading cgroup BPF objects: %w", err)
 	}
+	fail := func(primary error, partial *CgroupFilter) (*CgroupFilter, error) {
+		if pinClaimed {
+			if unpinErr := os.RemoveAll(opts.PinDir); unpinErr != nil {
+				// Pins may have reached bpffs despite the primary error. Keep
+				// handles and directory ownership together for caller Detach.
+				pinClaimed = false
+				return partial, errors.Join(primary, fmt.Errorf("unpinning partially constructed cgroup filter: %w", unpinErr))
+			}
+			pinClaimed = false
+		}
+		if closeErr := partial.Close(); closeErr != nil {
+			// Unpin is proven, but a still-live handle may remain attached.
+			// Return it so caller Detach/tombstone retains exact ownership.
+			return partial, errors.Join(primary, fmt.Errorf("closing partially constructed cgroup filter: %w", closeErr))
+		}
+		return nil, primary
+	}
 
 	// Set the policy mode
 	if err := objs.PolicyMode.Put(uint32(0), uint8(mode)); err != nil {
-		objs.Close()
-		return nil, fmt.Errorf("setting policy mode: %w", err)
+		return fail(fmt.Errorf("setting policy mode: %w", err), &CgroupFilter{objs: objs, pinDir: opts.PinDir, removePinDir: os.RemoveAll})
 	}
 
 	// Attach IPv4 filter to the cgroup
@@ -84,8 +118,7 @@ func NewCgroupFilterWithOptions(cgroupPath string, mode PolicyMode, carveouts Ca
 		Attach:  ebpf.AttachCGroupInet4Connect,
 	})
 	if err != nil {
-		objs.Close()
-		return nil, fmt.Errorf("attaching IPv4 filter to cgroup: %w", err)
+		return fail(fmt.Errorf("attaching IPv4 filter to cgroup: %w", err), &CgroupFilter{objs: objs, pinDir: opts.PinDir, removePinDir: os.RemoveAll})
 	}
 
 	// Attach IPv6 filter to the cgroup
@@ -95,9 +128,7 @@ func NewCgroupFilterWithOptions(cgroupPath string, mode PolicyMode, carveouts Ca
 		Attach:  ebpf.AttachCGroupInet6Connect,
 	})
 	if err != nil {
-		link4.Close()
-		objs.Close()
-		return nil, fmt.Errorf("attaching IPv6 filter to cgroup: %w", err)
+		return fail(fmt.Errorf("attaching IPv6 filter to cgroup: %w", err), &CgroupFilter{objs: objs, pinDir: opts.PinDir, cgroupLink4: link4, removePinDir: os.RemoveAll})
 	}
 
 	// Attach IPv4 unconnected-UDP sendmsg filter to the cgroup. Unconnected
@@ -109,10 +140,7 @@ func NewCgroupFilterWithOptions(cgroupPath string, mode PolicyMode, carveouts Ca
 		Attach:  ebpf.AttachCGroupUDP4Sendmsg,
 	})
 	if err != nil {
-		link6.Close()
-		link4.Close()
-		objs.Close()
-		return nil, fmt.Errorf("attaching IPv4 sendmsg filter to cgroup: %w", err)
+		return fail(fmt.Errorf("attaching IPv4 sendmsg filter to cgroup: %w", err), &CgroupFilter{objs: objs, pinDir: opts.PinDir, cgroupLink4: link4, cgroupLink6: link6, removePinDir: os.RemoveAll})
 	}
 
 	// Attach IPv6 unconnected-UDP sendmsg filter to the cgroup
@@ -122,11 +150,7 @@ func NewCgroupFilterWithOptions(cgroupPath string, mode PolicyMode, carveouts Ca
 		Attach:  ebpf.AttachCGroupUDP6Sendmsg,
 	})
 	if err != nil {
-		sendmsg4.Close()
-		link6.Close()
-		link4.Close()
-		objs.Close()
-		return nil, fmt.Errorf("attaching IPv6 sendmsg filter to cgroup: %w", err)
+		return fail(fmt.Errorf("attaching IPv6 sendmsg filter to cgroup: %w", err), &CgroupFilter{objs: objs, pinDir: opts.PinDir, cgroupLink4: link4, cgroupLink6: link6, sendmsgLink4: sendmsg4, removePinDir: os.RemoveAll})
 	}
 
 	f := &CgroupFilter{
@@ -139,16 +163,18 @@ func NewCgroupFilterWithOptions(cgroupPath string, mode PolicyMode, carveouts Ca
 		sendmsgLink6: sendmsg6,
 		removePinDir: os.RemoveAll,
 	}
+	if err := writePinSchemaVersion(f.objs.PinSchemaVersion, currentPinSchemaVersion); err != nil {
+		return fail(fmt.Errorf("initializing cgroup pin schema: %w", err), f)
+	}
 
 	// Pin links + maps last, once everything is attached: a crash before this
 	// point leaves nothing pinned (state dies with the process, as before),
 	// while a successful pin means the full set is adoptable after a restart.
 	if opts.PinDir != "" {
 		if err := pinAll(opts.PinDir, f.pinnables()); err != nil {
-			_ = os.RemoveAll(opts.PinDir)
-			_ = f.Close()
-			return nil, fmt.Errorf("pinning cgroup filter state: %w", err)
+			return fail(fmt.Errorf("pinning cgroup filter state: %w", err), f)
 		}
+		pinClaimed = false
 	}
 
 	return f, nil
@@ -163,7 +189,20 @@ func NewCgroupFilterWithOptions(cgroupPath string, mode PolicyMode, carveouts Ca
 //
 // On error the partially-loaded handles are closed and the pins are left in
 // place for the caller to inspect or remove.
-func LoadPinnedCgroupFilter(cgroupPath, pinDir string) (_ *CgroupFilter, retErr error) {
+func LoadPinnedCgroupFilter(cgroupPath, pinDir string) (*CgroupFilter, error) {
+	return loadPinnedCgroupFilter(cgroupPath, pinDir, nil, Options{}, pinMigrationOps{})
+}
+
+// LoadPinnedCgroupFilterWithOptions is the explicit legacy-schema upgrade
+// entry point. originalCarveouts MUST match the posture used to load the old
+// pinned program; guessing could loosen enforcement. Existing map capacities
+// are always adopted from the pins, while opts.MaxDNSRuleEntries sizes only a
+// missing exact map created during migration.
+func LoadPinnedCgroupFilterWithOptions(cgroupPath, pinDir string, originalCarveouts Carveouts, opts Options) (*CgroupFilter, error) {
+	return loadPinnedCgroupFilter(cgroupPath, pinDir, &originalCarveouts, opts, pinMigrationOps{})
+}
+
+func loadPinnedCgroupFilter(cgroupPath, pinDir string, originalCarveouts *Carveouts, opts Options, migrationOps pinMigrationOps) (_ *CgroupFilter, retErr error) {
 	f := &CgroupFilter{
 		objs:         &cgroupObjects{},
 		cgroupPath:   cgroupPath,
@@ -172,15 +211,80 @@ func LoadPinnedCgroupFilter(cgroupPath, pinDir string) (_ *CgroupFilter, retErr 
 	}
 	defer closePinnedLoadOnError(&retErr, f.closeHandles)
 
-	if err := loadPinnedMaps(pinDir, map[string]**ebpf.Map{
+	// Inspect the version marker before loading any version-specific path. A
+	// newer schema may have renamed those paths; treating that as a missing
+	// legacy object would wrongly authorize removal of live future pins.
+	marker, markerPresent, err := loadOptionalPinnedMap(pinDir, pinSchemaVersion)
+	if err != nil {
+		return nil, err
+	}
+	f.objs.PinSchemaVersion = marker
+	committed, err := classifyPinnedSchema(marker, markerPresent)
+	if err != nil {
+		return nil, err
+	}
+	legacyRequired := []string{
+		pinAllowedIPv4, pinAllowedIPv6, pinDeniedIPv4, pinDeniedIPv6, pinPolicyMode, pinStats,
+		pinLinkConnect4, pinLinkConnect6, pinLinkSendmsg4, pinLinkSendmsg6,
+	}
+	if committed {
+		if err := validatePinnedDirectorySet(pinDir,
+			append(append([]string{}, legacyRequired...), pinDNSAllowedIPv4, pinDNSAllowedIPv6, pinSchemaVersion), nil); err != nil {
+			return nil, err
+		}
+	} else if err := validatePinnedDirectorySet(pinDir, legacyRequired,
+		[]string{pinDNSAllowedIPv4, pinDNSAllowedIPv6, pinSchemaVersion}); err != nil {
+		return nil, err
+	}
+
+	requiredMaps := map[string]**ebpf.Map{
 		pinAllowedIPv4: &f.objs.AllowedIpv4,
 		pinAllowedIPv6: &f.objs.AllowedIpv6,
 		pinDeniedIPv4:  &f.objs.DeniedIpv4,
 		pinDeniedIPv6:  &f.objs.DeniedIpv6,
 		pinPolicyMode:  &f.objs.PolicyMode,
 		pinStats:       &f.objs.Stats,
-	}); err != nil {
+	}
+	if committed {
+		requiredMaps[pinDNSAllowedIPv4] = &f.objs.DnsAllowedIpv4
+		requiredMaps[pinDNSAllowedIPv6] = &f.objs.DnsAllowedIpv6
+		err = loadCommittedPinnedMaps(pinDir, requiredMaps)
+	} else {
+		err = loadUncommittedRequiredPinnedMaps(pinDir, requiredMaps)
+	}
+	if err != nil {
 		return nil, err
+	}
+
+	exact4Present, exact6Present := committed, committed
+	if !committed {
+		f.objs.DnsAllowedIpv4, exact4Present, err = loadOptionalPinnedMap(pinDir, pinDNSAllowedIPv4)
+		if err != nil {
+			return nil, err
+		}
+		f.objs.DnsAllowedIpv6, exact6Present, err = loadOptionalPinnedMap(pinDir, pinDNSAllowedIPv6)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if committed {
+		spec, err := loadCgroup()
+		if err != nil {
+			return nil, fmt.Errorf("loading current cgroup spec to validate committed pins: %w", err)
+		}
+		if err := validatePinnedMapsAgainstSpec(spec, map[string]*ebpf.Map{
+			pinAllowedIPv4:    f.objs.AllowedIpv4,
+			pinAllowedIPv6:    f.objs.AllowedIpv6,
+			pinDeniedIPv4:     f.objs.DeniedIpv4,
+			pinDeniedIPv6:     f.objs.DeniedIpv6,
+			pinDNSAllowedIPv4: f.objs.DnsAllowedIpv4,
+			pinDNSAllowedIPv6: f.objs.DnsAllowedIpv6,
+			pinPolicyMode:     f.objs.PolicyMode,
+			pinStats:          f.objs.Stats,
+			pinSchemaVersion:  f.objs.PinSchemaVersion,
+		}); err != nil {
+			return nil, err
+		}
 	}
 
 	// The links must be validated against the cgroup CURRENTLY at the path:
@@ -192,39 +296,203 @@ func LoadPinnedCgroupFilter(cgroupPath, pinDir string) (_ *CgroupFilter, retErr 
 	if err != nil {
 		return nil, err
 	}
-	for name, dst := range map[string]*link.Link{
-		pinLinkConnect4: &f.cgroupLink4,
-		pinLinkConnect6: &f.cgroupLink6,
-		pinLinkSendmsg4: &f.sendmsgLink4,
-		pinLinkSendmsg6: &f.sendmsgLink6,
+	if cgroupID == 0 {
+		return nil, fmt.Errorf("%w: current cgroup target exposes no identity", ErrPinnedSchemaIncompatible)
+	}
+	var pinnedCgroupID uint64
+	for _, item := range []struct {
+		name string
+		dst  *link.Link
+	}{
+		{pinLinkConnect4, &f.cgroupLink4},
+		{pinLinkConnect6, &f.cgroupLink6},
+		{pinLinkSendmsg4, &f.sendmsgLink4},
+		{pinLinkSendmsg6, &f.sendmsgLink6},
 	} {
+		name, dst := item.name, item.dst
 		l, err := link.LoadPinnedLink(filepath.Join(pinDir, name), nil)
 		if err != nil {
+			if committed {
+				return nil, pinnedCommittedObjectLoadError("link", name, err)
+			}
+			if errors.Is(err, os.ErrNotExist) {
+				return nil, fmt.Errorf("%w: uncommitted/legacy pin set is missing required link %s; preserving possible partial enforcement", ErrPinnedSchemaIncompatible, name)
+			}
 			return nil, pinnedObjectLoadError("link", name, err)
 		}
 		*dst = l
-		if err := validateCgroupLinkTarget(l, name, cgroupID); err != nil {
+		linkCgroupID, err := cgroupLinkTargetID(l, name)
+		if err != nil {
 			return nil, err
 		}
+		if pinnedCgroupID == 0 {
+			pinnedCgroupID = linkCgroupID
+		} else if linkCgroupID != pinnedCgroupID {
+			return nil, fmt.Errorf("%w: pinned cgroup links identify mixed targets (%d and %d)", ErrPinnedSchemaIncompatible, pinnedCgroupID, linkCgroupID)
+		}
+		familyMaps := map[string]*ebpf.Map{
+			pinPolicyMode: f.objs.PolicyMode,
+			pinStats:      f.objs.Stats,
+		}
+		switch name {
+		case pinLinkConnect4, pinLinkSendmsg4:
+			familyMaps[pinAllowedIPv4] = f.objs.AllowedIpv4
+			familyMaps[pinDeniedIPv4] = f.objs.DeniedIpv4
+			if committed {
+				familyMaps[pinDNSAllowedIPv4] = f.objs.DnsAllowedIpv4
+			}
+		case pinLinkConnect6, pinLinkSendmsg6:
+			familyMaps[pinAllowedIPv6] = f.objs.AllowedIpv6
+			familyMaps[pinDeniedIPv6] = f.objs.DeniedIpv6
+			if committed {
+				familyMaps[pinDNSAllowedIPv6] = f.objs.DnsAllowedIpv6
+			}
+		}
+		if err := verifyPinnedLinkUsesMaps(l, familyMaps); err != nil {
+			return nil, fmt.Errorf("verifying cgroup link %s map identity before adoption/migration: %w", name, err)
+		}
+	}
+	// Target mismatch is intentionally last: only a complete link set with
+	// coherent old target IDs, attach types, and map identities is safe to
+	// classify as a discardable reincarnation.
+	if pinnedCgroupID != cgroupID {
+		return nil, fmt.Errorf("%w: pinned cgroup links are attached to cgroup id %d but the target path is now cgroup id %d", ErrPinnedTargetMismatch, pinnedCgroupID, cgroupID)
+	}
+
+	if committed {
+		return f, nil
+	}
+	if originalCarveouts == nil {
+		return nil, fmt.Errorf("%w: cgroup pin set %s has no committed current schema marker", ErrPinnedSchemaUpgradeRequired, pinDir)
+	}
+	if err := f.migratePinnedSchema(*originalCarveouts, opts, markerPresent, exact4Present, exact6Present, migrationOps); err != nil {
+		return nil, err
 	}
 
 	return f, nil
+}
+
+func (f *CgroupFilter) migratePinnedSchema(carveouts Carveouts, opts Options, markerPresent, exact4Present, exact6Present bool, migrationOps pinMigrationOps) (retErr error) {
+	ops := migrationOps.withDefaults()
+	spec, err := loadCgroup()
+	if err != nil {
+		return fmt.Errorf("loading current cgroup BPF spec for pinned migration: %w", err)
+	}
+	if err := applyOptions(spec, opts); err != nil {
+		return fmt.Errorf("applying cgroup migration options: %w", err)
+	}
+	carveoutVar, ok := spec.Variables["carveout_flags"]
+	if !ok {
+		return fmt.Errorf("current cgroup BPF spec missing carveout_flags variable")
+	}
+	if err := carveoutVar.Set(carveouts.flags()); err != nil {
+		return fmt.Errorf("setting migration carve-out flags: %w", err)
+	}
+	replacements := map[string]*ebpf.Map{
+		pinAllowedIPv4: f.objs.AllowedIpv4,
+		pinAllowedIPv6: f.objs.AllowedIpv6,
+		pinDeniedIPv4:  f.objs.DeniedIpv4,
+		pinDeniedIPv6:  f.objs.DeniedIpv6,
+		pinPolicyMode:  f.objs.PolicyMode,
+		pinStats:       f.objs.Stats,
+	}
+	if exact4Present {
+		replacements[pinDNSAllowedIPv4] = f.objs.DnsAllowedIpv4
+	}
+	if exact6Present {
+		replacements[pinDNSAllowedIPv6] = f.objs.DnsAllowedIpv6
+	}
+	if markerPresent {
+		replacements[pinSchemaVersion] = f.objs.PinSchemaVersion
+	}
+	if err := replacementMapOptions(spec, replacements); err != nil {
+		return err
+	}
+
+	upgraded := &cgroupObjects{}
+	if err := spec.LoadAndAssign(upgraded, &ebpf.CollectionOptions{MapReplacements: replacements}); err != nil {
+		return fmt.Errorf("loading current cgroup programs over pinned maps: %w", err)
+	}
+	defer func() {
+		if upgraded != nil {
+			if err := upgraded.Close(); err != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("closing cgroup migration objects: %w", err))
+			}
+		}
+	}()
+
+	// Zero is durable in-progress. Pin missing exact maps first and marker last;
+	// until link updates begin the legacy programs continue enforcing unchanged.
+	if err := ops.writeSchema(upgraded.PinSchemaVersion, 0); err != nil {
+		return err
+	}
+	if err := pinMigrationMapIfMissing(ops, f.pinDir, pinDNSAllowedIPv4, exact4Present, upgraded.DnsAllowedIpv4); err != nil {
+		return err
+	}
+	if err := pinMigrationMapIfMissing(ops, f.pinDir, pinDNSAllowedIPv6, exact6Present, upgraded.DnsAllowedIpv6); err != nil {
+		return err
+	}
+	if err := pinMigrationMapIfMissing(ops, f.pinDir, pinSchemaVersion, markerPresent, upgraded.PinSchemaVersion); err != nil {
+		return err
+	}
+
+	updates := []struct {
+		name   string
+		link   link.Link
+		prog   *ebpf.Program
+		attach ebpf.AttachType
+	}{
+		{pinLinkConnect4, f.cgroupLink4, upgraded.RestrictConnect4, ebpf.AttachCGroupInet4Connect},
+		{pinLinkConnect6, f.cgroupLink6, upgraded.RestrictConnect6, ebpf.AttachCGroupInet6Connect},
+		{pinLinkSendmsg4, f.sendmsgLink4, upgraded.RestrictSendmsg4, ebpf.AttachCGroupUDP4Sendmsg},
+		{pinLinkSendmsg6, f.sendmsgLink6, upgraded.RestrictSendmsg6, ebpf.AttachCGroupUDP6Sendmsg},
+	}
+	for _, update := range updates {
+		if err := ops.updateLink(update.link, update.prog); err != nil {
+			return fmt.Errorf("updating pinned cgroup link %s (schema marker remains in-progress): %w", update.name, err)
+		}
+	}
+	for _, update := range updates {
+		if err := verifyUpdatedLinkProgram(update.link, update.prog, update.attach); err != nil {
+			return fmt.Errorf("verifying pinned cgroup link %s before schema commit: %w", update.name, err)
+		}
+	}
+	if err := ops.writeSchema(upgraded.PinSchemaVersion, currentPinSchemaVersion); err != nil {
+		return fmt.Errorf("committing migrated cgroup pin schema: %w", err)
+	}
+
+	// Links now own the programs. Close their userspace fds, retain the cloned
+	// replacement/new map handles as the adopted filter object.
+	if err := upgraded.cgroupPrograms.Close(); err != nil {
+		return fmt.Errorf("closing migrated cgroup program handles: %w", err)
+	}
+	upgraded.cgroupPrograms = cgroupPrograms{}
+	old := f.objs
+	f.objs = upgraded
+	upgraded = nil
+	if err := old.Close(); err != nil {
+		return fmt.Errorf("closing pre-migration cgroup map handles: %w", err)
+	}
+	return nil
 }
 
 // pinnables returns every object that must be pinned for the filter to
 // survive the process, keyed by pin file name.
 func (f *CgroupFilter) pinnables() map[string]pinner {
 	return map[string]pinner{
-		pinAllowedIPv4:  f.objs.AllowedIpv4,
-		pinAllowedIPv6:  f.objs.AllowedIpv6,
-		pinDeniedIPv4:   f.objs.DeniedIpv4,
-		pinDeniedIPv6:   f.objs.DeniedIpv6,
-		pinPolicyMode:   f.objs.PolicyMode,
-		pinStats:        f.objs.Stats,
-		pinLinkConnect4: f.cgroupLink4,
-		pinLinkConnect6: f.cgroupLink6,
-		pinLinkSendmsg4: f.sendmsgLink4,
-		pinLinkSendmsg6: f.sendmsgLink6,
+		pinAllowedIPv4:    f.objs.AllowedIpv4,
+		pinAllowedIPv6:    f.objs.AllowedIpv6,
+		pinDeniedIPv4:     f.objs.DeniedIpv4,
+		pinDeniedIPv6:     f.objs.DeniedIpv6,
+		pinDNSAllowedIPv4: f.objs.DnsAllowedIpv4,
+		pinDNSAllowedIPv6: f.objs.DnsAllowedIpv6,
+		pinPolicyMode:     f.objs.PolicyMode,
+		pinStats:          f.objs.Stats,
+		pinSchemaVersion:  f.objs.PinSchemaVersion,
+		pinLinkConnect4:   f.cgroupLink4,
+		pinLinkConnect6:   f.cgroupLink6,
+		pinLinkSendmsg4:   f.sendmsgLink4,
+		pinLinkSendmsg6:   f.sendmsgLink6,
 	}
 }
 
@@ -413,6 +681,55 @@ func (f *CgroupFilter) RemoveDeniedIP(cidr *net.IPNet) error {
 	return nil
 }
 
+func (f *CgroupFilter) exactDNSBackendLocked() (exactDNSBackend, error) {
+	if f.objs == nil || f.objs.DnsAllowedIpv4 == nil || f.objs.DnsAllowedIpv6 == nil {
+		return nil, fmt.Errorf("filter handles are closed")
+	}
+	return bpfExactDNSBackend{ipv4: f.objs.DnsAllowedIpv4, ipv6: f.objs.DnsAllowedIpv6}, nil
+}
+
+// AddDNSAllowedIPs adds a validated all-or-rollback batch to the exact DNS
+// allow tier. See Filter for the rollback-ambiguity contract.
+func (f *CgroupFilter) AddDNSAllowedIPs(ips []net.IP) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	b, err := f.exactDNSBackendLocked()
+	if err != nil {
+		return err
+	}
+	return addExactDNSIPs(b, ips)
+}
+
+func (f *CgroupFilter) RemoveDNSAllowedIPs(ips []net.IP) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	b, err := f.exactDNSBackendLocked()
+	if err != nil {
+		return err
+	}
+	return removeExactDNSIPs(b, ips)
+}
+
+func (f *CgroupFilter) DNSAllowedIPs() ([]net.IP, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	b, err := f.exactDNSBackendLocked()
+	if err != nil {
+		return nil, err
+	}
+	return listExactDNSIPs(b)
+}
+
+func (f *CgroupFilter) DNSAllowOccupancy() (DNSAllowOccupancy, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	b, err := f.exactDNSBackendLocked()
+	if err != nil {
+		return DNSAllowOccupancy{}, err
+	}
+	return exactDNSOccupancy(b)
+}
+
 // ClearRules removes all configured allowlist and denylist entries.
 func (f *CgroupFilter) ClearRules() error {
 	f.mu.Lock()
@@ -429,6 +746,12 @@ func (f *CgroupFilter) ClearRules() error {
 	}
 	if err := clearMap[IPv6LPMKey](f.objs.DeniedIpv6); err != nil {
 		return fmt.Errorf("clearing denied IPv6 rules: %w", err)
+	}
+	if err := clearMap[[4]byte](f.objs.DnsAllowedIpv4); err != nil {
+		return fmt.Errorf("clearing DNS exact IPv4 rules: %w", err)
+	}
+	if err := clearMap[[16]byte](f.objs.DnsAllowedIpv6); err != nil {
+		return fmt.Errorf("clearing DNS exact IPv6 rules: %w", err)
 	}
 	return nil
 }

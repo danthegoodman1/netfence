@@ -43,6 +43,11 @@ type FilterConfig struct {
 	// Zero (or unset) keeps the compiled-in default of 4096. This is
 	// load-time map sizing only; it has no per-packet cost.
 	MaxRuleEntries int `mapstructure:"max_rule_entries"`
+	// MaxDNSRuleEntries sets the capacity of each exact DNS-derived host
+	// allow map (IPv4 and IPv6) per attachment. It is deliberately independent
+	// from MaxRuleEntries so regenerable DNS entries can never consume or evict
+	// authoritative CIDR/deny capacity. Zero keeps the compiled default 4096.
+	MaxDNSRuleEntries int `mapstructure:"max_dns_rule_entries"`
 	// BPFPinDir is the bpffs directory the daemon pins each attachment's BPF
 	// links and maps under (one subdirectory per attachment ID). Pinned state
 	// is held by the kernel independent of the daemon process: enforcement
@@ -127,6 +132,7 @@ func Load(configPath string) (*Config, error) {
 	v.SetDefault("socket", "/var/run/netfence.sock")
 	v.SetDefault("dns.min_filter_ttl", 60*time.Second)
 	v.SetDefault("filter.max_rule_entries", 4096)
+	v.SetDefault("filter.max_dns_rule_entries", 4096)
 	v.SetDefault("filter.bpf_pin_dir", "/sys/fs/bpf/netfence")
 	v.SetDefault("filter.detach_on_stop", false)
 	v.SetDefault("control_plane.subscribe_ack_timeout", 5*time.Second)
@@ -175,6 +181,9 @@ func (c *Config) Validate() error {
 	// the kernel's u32 max_entries without truncation.
 	if c.Filter.MaxRuleEntries < 0 || int64(c.Filter.MaxRuleEntries) > math.MaxUint32 {
 		return fmt.Errorf("filter.max_rule_entries must be between 0 (default) and %d", uint32(math.MaxUint32))
+	}
+	if c.Filter.MaxDNSRuleEntries < 0 || int64(c.Filter.MaxDNSRuleEntries) > math.MaxUint32 {
+		return fmt.Errorf("filter.max_dns_rule_entries must be between 0 (default) and %d", uint32(math.MaxUint32))
 	}
 	return c.ControlPlane.validate()
 }

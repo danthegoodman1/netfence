@@ -58,7 +58,7 @@ However, this does have a bit more overhead than something like [httpjail](https
 ## Performance snapshot
 
 These numbers were measured in the privileged Docker Linux gate on `linux/arm64`
-using `docker compose run --build --rm bench ...`.
+using `make bench-docker`. Current values are medians of five samples.
 
 ### Warm socket path
 
@@ -67,12 +67,13 @@ The warm socket benchmark uses connected UDP sockets to isolate the
 already resolved the domain, the IP is still within TTL, and the IP/CIDR is
 already present in the eBPF map.
 
-| Path | Mean latency |
+| Path | Median latency |
 | --- | ---: |
-| Normal socket connect, no eBPF | ~3.037 us |
-| Warm allowlist, IP already in eBPF map | ~3.042 us |
-| Measured overhead | ~4 ns, effectively noise |
-| Allowlist miss, local block | ~1.803 us |
+| Normal socket connect, no eBPF | ~2.956 us |
+| Warm allowlist, protected LPM hit | ~2.978 us |
+| Warm allowlist, DNS exact-host hit | ~3.005 us |
+| DNS exact overhead | ~49 ns vs baseline (+1.7%); ~27 ns vs LPM (+0.9%), within sample noise |
+| Allowlist miss, local block | ~1.849 us |
 
 There is no "kernel miss asks parent process" path today. A cgroup allowlist
 miss is decided locally by eBPF and is blocked immediately.
@@ -80,14 +81,16 @@ miss is decided locally by eBPF and is blocked immediately.
 ### DNS query path
 
 These numbers measure the DNS server path, not the warmed socket connect path.
+The reference column is the prior README snapshot used as the ±20% acceptance
+threshold; every current five-sample median remains inside that threshold.
 
-| Path | Mean latency |
-| --- | ---: |
-| Proxy query cold, in-process policy function | ~26.7 us |
-| Proxy query warm | ~25.3 us |
-| Allowlist query cold with local upstream | ~68.0 us |
-| Allowlist query warm with local upstream | ~67.4 us |
-| Cached "already added to filter" check (also refreshes the entry's TTL deadline) | ~0.2 us |
+| Path | Reference | Current median | Delta |
+| --- | ---: | ---: | ---: |
+| Proxy query cold, in-process policy function | ~26.7 us | ~28.297 us | +6.0% |
+| Proxy query warm | ~25.3 us | ~23.945 us | -5.4% |
+| Allowlist query cold with local upstream | ~68.0 us | ~59.448 us | -12.6% |
+| Allowlist query warm with local upstream | ~67.4 us | ~61.840 us | -8.2% |
+| Cached "already added to filter" check (also refreshes the entry's TTL deadline) | ~0.2 us | ~0.232 us | +16.0% |
 
 # Design
 
@@ -293,10 +296,29 @@ filter:
   # mounts bpffs at /sys/fs/bpf if needed (privileged). An explicit "" turns
   # pinning off entirely (BPF state then dies with the process).
   bpf_pin_dir: /sys/fs/bpf/netfence
+  # Capacity of each authoritative/system LPM map (allowed/denied per family).
+  max_rule_entries: 4096
+  # Independent capacity of each DNS-derived exact-host HASH map (IPv4/IPv6).
+  # These entries can never consume or evict authoritative/deny capacity.
+  max_dns_rule_entries: 4096
 ```
 
-An explicit `Detach` (RPC/CLI) or a removed target always destroys the
-pinned state along with the attachment.
+An explicit `Detach` (RPC/CLI), or removal of a live coherently-owned target,
+destroys the pinned state along with the attachment. On restart, target
+absence does not authorize guessing: future, uncommitted, mixed, or otherwise
+unverifiable persisted pins are preserved and startup aborts for inspection.
+
+Pin directories are a versioned persistence format. The schema marker is
+pinned last, only after every required map and link exists. Upgrading a
+pre-exact-tier attachment pins the two new empty exact maps with an
+in-progress marker, atomically replaces each link's program while reusing the
+live authoritative maps, verifies program/map identity, and commits the
+marker last. A crash or ambiguous update leaves the marker uncommitted; the
+next start re-updates every link using the same maps. Old and new program
+generations enforce the same authoritative LPM policy during that bounded
+mixed state, so migration never unpins or recreates a viable filter. Unknown,
+incomplete, or unverifiable pin sets are preserved and abort startup for
+inspection instead of being guessed away.
 
 Notes on re-adopted state:
 - Every successfully restored attachment is marked for authoritative
@@ -466,4 +488,4 @@ idempotently:
 - CIDR entries (`AllowCIDR`/`DenyCIDR` commands, and the CIDR lists in `SubscribedAck`/`BulkUpdate`) carry an optional TTL. TTL'd rules are removed by a daemon janitor once they expire (scan interval `ttl_janitor_interval`, default 1s); rules without a TTL are permanent.
 - Incremental `AllowCIDR`/`DenyCIDR` re-adds extend a CIDR to the later deadline — they never shorten one — and an incremental re-add without a TTL makes it permanent. In contrast, the complete state in `SubscribedAck`/`BulkUpdate` replaces each control-plane lifetime exactly, so authoritative reconciliation can shorten a TTL or change permanent to finite without removing/re-adding the live map entry. Use `RemoveCIDR` to drop an incremental rule early.
 - DNS-resolved IPs enter the filter with the record TTL floored by `dns.min_filter_ttl` (default 60s; zero/unset means the default, not "no floor") and expire the same way. A permanent (or longer-lived) CIDR rule covering the same address is never removed by DNS expiry.
-- Each rule map holds `filter.max_rule_entries` entries per attachment (default 4096, load-time sizing with no per-packet cost). When a map is full, new adds fail loudly and are counted in the `map_full_drops` heartbeat stat instead of being silently dropped.
+- Authoritative/system allow CIDRs and deny CIDRs remain in four protected LPM maps sized by `filter.max_rule_entries` per attachment (default 4096 each). The filter now also exposes separate exact-match HASH maps sized by `filter.max_dns_rule_entries` (default 4096 per IP family) as the foundation for bounded DNS-derived host admission; entries placed there cannot consume or evict authoritative or deny capacity. Exact-tier batch admission validates every IP and preflights both family capacities before mutation. A kernel error restores the exact pre-call snapshot; an unprovable rollback is surfaced explicitly and requires the caller to quarantine/fail closed. The production resolver still admits resolved IPs through the existing `AllowIP`/LPM path; the remaining Phase 5F/5G ownership, LRU, and admission work will cut it over to this exact tier.

@@ -88,6 +88,23 @@ func newAttachTestEnv(t *testing.T, port int) *attachTestEnv {
 	return env
 }
 
+func TestAttachConstructorErrorDetachesReturnedPartialOwnership(t *testing.T) {
+	env := newAttachTestEnv(t, 12180)
+	partial := &fakeFilter{mode: filter.ModeBlockAll}
+	env.server.newFilter = func(_, _ string, _ apiv1.AttachmentType, _ apiv1.PolicyMode, _ apiv1.TcDirection, _ uint32) (filter.Filter, error) {
+		return partial, syscall.EIO
+	}
+
+	resp, err := env.server.Attach(context.Background(), attachInterfaceReq("partial-constructor-if0"))
+	require.ErrorIs(t, err, syscall.EIO)
+	assert.Nil(t, resp)
+	assert.Equal(t, 1, partial.detachCallCount(), "Attach must clean constructor-returned partial ownership")
+	rows, storeErr := env.st.GetAllAttachments()
+	require.NoError(t, storeErr)
+	assert.Empty(t, rows)
+	assert.False(t, env.portInUse())
+}
+
 func (e *attachTestEnv) createdFilters() []*fakeFilter {
 	e.mu.Lock()
 	defer e.mu.Unlock()
