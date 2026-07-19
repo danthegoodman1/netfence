@@ -534,17 +534,13 @@ func verifyUpdatedLinkProgram(l link.Link, program *ebpf.Program, expectedAttach
 
 // keyToIPv4CIDR inverts ipv4CIDRToKey.
 func keyToIPv4CIDR(k IPv4LPMKey) *net.IPNet {
-	ip := make(net.IP, net.IPv4len)
-	binary.LittleEndian.PutUint32(ip, k.Addr)
+	ip := append(net.IP(nil), k.Addr[:]...)
 	return &net.IPNet{IP: ip, Mask: net.CIDRMask(int(k.Prefixlen), 32)}
 }
 
 // keyToIPv6CIDR inverts ipv6CIDRToKey.
 func keyToIPv6CIDR(k IPv6LPMKey) *net.IPNet {
-	ip := make(net.IP, net.IPv6len)
-	for i, word := range k.Addr {
-		binary.LittleEndian.PutUint32(ip[i*4:], word)
-	}
+	ip := append(net.IP(nil), k.Addr[:]...)
 	return &net.IPNet{IP: ip, Mask: net.CIDRMask(int(k.Prefixlen), 128)}
 }
 

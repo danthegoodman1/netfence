@@ -8,7 +8,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"sync"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -44,9 +43,8 @@ func (d TCDirection) String() string {
 
 // TCFilter manages the TC-based BPF filter
 type TCFilter struct {
-	mu           sync.Mutex
+	ruleMapCore
 	objs         *tcObjects
-	ifaceName    string
 	direction    TCDirection
 	pinDir       string
 	tcLink       link.Link
@@ -55,6 +53,23 @@ type TCFilter struct {
 	closeHandlesForTest   func() error
 	handlesCloseAttempted bool
 	handlesCloseErr       error
+}
+
+func (f *TCFilter) syncRuleMaps() {
+	if f.objs == nil {
+		f.setRuleMaps(ruleMapHandles{})
+		return
+	}
+	f.setRuleMaps(ruleMapHandles{
+		allowed4: f.objs.AllowedIpv4,
+		allowed6: f.objs.AllowedIpv6,
+		denied4:  f.objs.DeniedIpv4,
+		denied6:  f.objs.DeniedIpv6,
+		exact4:   f.objs.DnsAllowedIpv4,
+		exact6:   f.objs.DnsAllowedIpv6,
+		mode:     f.objs.PolicyMode,
+		stats:    f.objs.Stats,
+	})
 }
 
 // NewTCFilter creates a new TC-based filter attached to the specified
@@ -149,12 +164,12 @@ func NewTCFilterWithOptions(ifaceName string, mode PolicyMode, direction TCDirec
 
 	f := &TCFilter{
 		objs:         objs,
-		ifaceName:    ifaceName,
 		direction:    direction,
 		pinDir:       opts.PinDir,
 		tcLink:       tcLink,
 		removePinDir: os.RemoveAll,
 	}
+	f.syncRuleMaps()
 	if err := writePinSchemaVersion(f.objs.PinSchemaVersion, currentPinSchemaVersion); err != nil {
 		return fail(fmt.Errorf("initializing TC pin schema: %w", err), f)
 	}
@@ -194,7 +209,6 @@ func LoadPinnedTCFilterWithOptions(ifaceName string, direction TCDirection, pinD
 func loadPinnedTCFilter(ifaceName string, direction TCDirection, pinDir string, originalCarveouts *Carveouts, opts Options, migrationOps pinMigrationOps) (_ *TCFilter, retErr error) {
 	f := &TCFilter{
 		objs:         &tcObjects{},
-		ifaceName:    ifaceName,
 		direction:    direction,
 		pinDir:       pinDir,
 		removePinDir: os.RemoveAll,
@@ -327,6 +341,7 @@ func loadPinnedTCFilter(ifaceName string, direction TCDirection, pinDir string, 
 	}
 
 	if committed {
+		f.syncRuleMaps()
 		return f, nil
 	}
 	if originalCarveouts == nil {
@@ -419,6 +434,7 @@ func (f *TCFilter) migratePinnedSchema(carveouts Carveouts, opts Options, marker
 	upgraded.tcPrograms = tcPrograms{}
 	old := f.objs
 	f.objs = upgraded
+	f.syncRuleMaps()
 	upgraded = nil
 	if err := old.Close(); err != nil {
 		return fmt.Errorf("closing pre-migration TC map handles: %w", err)
@@ -508,6 +524,7 @@ func (f *TCFilter) closeHandles() (retErr error) {
 	if f.objs != nil {
 		objs := f.objs
 		f.objs = nil
+		f.syncRuleMaps()
 		if err := objs.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("closing eBPF objects: %w", err))
 		}
@@ -519,255 +536,7 @@ func (f *TCFilter) closeHandles() (retErr error) {
 	return nil
 }
 
-// SetMode sets the policy mode
-func (f *TCFilter) SetMode(mode PolicyMode) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.objs == nil || f.objs.PolicyMode == nil {
-		return fmt.Errorf("filter handles are closed")
-	}
-	return f.objs.PolicyMode.Put(uint32(0), uint8(mode))
-}
-
-// GetMode gets the current policy mode
-func (f *TCFilter) GetMode() (PolicyMode, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	var mode uint8
-	if err := f.objs.PolicyMode.Lookup(uint32(0), &mode); err != nil {
-		return ModeDisabled, err
-	}
-	return PolicyMode(mode), nil
-}
-
-// AllowIP adds an IP address or CIDR to the allowlist
-func (f *TCFilter) AllowIP(cidr *net.IPNet) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	if cidr.IP.To4() != nil {
-		key := ipv4CIDRToKey(cidr)
-		return f.objs.AllowedIpv4.Put(key, uint8(1))
-	}
-	key := ipv6CIDRToKey(cidr)
-	return f.objs.AllowedIpv6.Put(key, uint8(1))
-}
-
-// DenyIP adds an IP address or CIDR to the denylist
-func (f *TCFilter) DenyIP(cidr *net.IPNet) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	if cidr.IP.To4() != nil {
-		key := ipv4CIDRToKey(cidr)
-		return f.objs.DeniedIpv4.Put(key, uint8(1))
-	}
-	key := ipv6CIDRToKey(cidr)
-	return f.objs.DeniedIpv6.Put(key, uint8(1))
-}
-
-// RemoveAllowedIP removes an IP address or CIDR from the allowlist
-func (f *TCFilter) RemoveAllowedIP(cidr *net.IPNet) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	if cidr.IP.To4() != nil {
-		key := ipv4CIDRToKey(cidr)
-		if err := f.objs.AllowedIpv4.Delete(key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
-			return err
-		}
-		return nil
-	}
-	key := ipv6CIDRToKey(cidr)
-	if err := f.objs.AllowedIpv6.Delete(key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
-		return err
-	}
-	return nil
-}
-
-// RemoveDeniedIP removes an IP address or CIDR from the denylist
-func (f *TCFilter) RemoveDeniedIP(cidr *net.IPNet) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	if cidr.IP.To4() != nil {
-		key := ipv4CIDRToKey(cidr)
-		if err := f.objs.DeniedIpv4.Delete(key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
-			return err
-		}
-		return nil
-	}
-	key := ipv6CIDRToKey(cidr)
-	if err := f.objs.DeniedIpv6.Delete(key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
-		return err
-	}
-	return nil
-}
-
-func (f *TCFilter) protectedRuleBackendLocked() (protectedRuleBackend, error) {
-	if f.objs == nil || f.objs.AllowedIpv4 == nil || f.objs.AllowedIpv6 == nil ||
-		f.objs.DeniedIpv4 == nil || f.objs.DeniedIpv6 == nil || f.objs.PolicyMode == nil {
-		return nil, fmt.Errorf("filter handles are closed")
-	}
-	return bpfProtectedRuleBackend{
-		allowedIPv4: f.objs.AllowedIpv4,
-		allowedIPv6: f.objs.AllowedIpv6,
-		deniedIPv4:  f.objs.DeniedIpv4,
-		deniedIPv6:  f.objs.DeniedIpv6,
-		policyMode:  f.objs.PolicyMode,
-	}, nil
-}
-
-func (f *TCFilter) ReplaceProtectedRules(allowed, denied []*net.IPNet, mode PolicyMode) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	b, err := f.protectedRuleBackendLocked()
-	if err != nil {
-		return err
-	}
-	return replaceProtectedRules(b, allowed, denied, mode)
-}
-
-func (f *TCFilter) ProtectedRuleOccupancy() (ProtectedRuleOccupancy, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	b, err := f.protectedRuleBackendLocked()
-	if err != nil {
-		return ProtectedRuleOccupancy{}, err
-	}
-	return protectedRuleOccupancy(b)
-}
-
-func (f *TCFilter) exactDNSBackendLocked() (exactDNSBackend, error) {
-	if f.objs == nil || f.objs.DnsAllowedIpv4 == nil || f.objs.DnsAllowedIpv6 == nil {
-		return nil, fmt.Errorf("filter handles are closed")
-	}
-	return bpfExactDNSBackend{ipv4: f.objs.DnsAllowedIpv4, ipv6: f.objs.DnsAllowedIpv6}, nil
-}
-
-// AddDNSAllowedIPs adds a validated all-or-rollback batch to the exact DNS
-// allow tier. See Filter for the rollback-ambiguity contract.
-func (f *TCFilter) AddDNSAllowedIPs(ips []net.IP) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	b, err := f.exactDNSBackendLocked()
-	if err != nil {
-		return err
-	}
-	return addExactDNSIPs(b, ips)
-}
-
-func (f *TCFilter) RemoveDNSAllowedIPs(ips []net.IP) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	b, err := f.exactDNSBackendLocked()
-	if err != nil {
-		return err
-	}
-	return removeExactDNSIPs(b, ips)
-}
-
-func (f *TCFilter) ReplaceDNSAllowedIPs(remove, add []net.IP) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	b, err := f.exactDNSBackendLocked()
-	if err != nil {
-		return err
-	}
-	return replaceExactDNSIPs(b, remove, add)
-}
-
-func (f *TCFilter) DNSAllowedIPs() ([]net.IP, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	b, err := f.exactDNSBackendLocked()
-	if err != nil {
-		return nil, err
-	}
-	return listExactDNSIPs(b)
-}
-
-func (f *TCFilter) DNSAllowOccupancy() (DNSAllowOccupancy, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	b, err := f.exactDNSBackendLocked()
-	if err != nil {
-		return DNSAllowOccupancy{}, err
-	}
-	return exactDNSOccupancy(b)
-}
-
-// ClearRules removes all configured allowlist and denylist entries.
-func (f *TCFilter) ClearRules() error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	if err := clearMap[IPv4LPMKey](f.objs.AllowedIpv4); err != nil {
-		return fmt.Errorf("clearing allowed IPv4 rules: %w", err)
-	}
-	if err := clearMap[IPv6LPMKey](f.objs.AllowedIpv6); err != nil {
-		return fmt.Errorf("clearing allowed IPv6 rules: %w", err)
-	}
-	if err := clearMap[IPv4LPMKey](f.objs.DeniedIpv4); err != nil {
-		return fmt.Errorf("clearing denied IPv4 rules: %w", err)
-	}
-	if err := clearMap[IPv6LPMKey](f.objs.DeniedIpv6); err != nil {
-		return fmt.Errorf("clearing denied IPv6 rules: %w", err)
-	}
-	if err := clearMap[[4]byte](f.objs.DnsAllowedIpv4); err != nil {
-		return fmt.Errorf("clearing DNS exact IPv4 rules: %w", err)
-	}
-	if err := clearMap[[16]byte](f.objs.DnsAllowedIpv6); err != nil {
-		return fmt.Errorf("clearing DNS exact IPv6 rules: %w", err)
-	}
-	return nil
-}
-
-// GetStats returns the current filter statistics
-func (f *TCFilter) GetStats() (Stats, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	var stats Stats
-	if f.objs == nil || f.objs.Stats == nil {
-		return stats, fmt.Errorf("filter handles are closed")
-	}
-	allowed, err := sumPerCPUCounter(f.objs.Stats, 0)
-	if err != nil {
-		return stats, fmt.Errorf("reading allowed count: %w", err)
-	}
-	blocked, err := sumPerCPUCounter(f.objs.Stats, 1)
-	if err != nil {
-		return stats, fmt.Errorf("reading blocked count: %w", err)
-	}
-	stats.Allowed = allowed
-	stats.Blocked = blocked
-	return stats, nil
-}
-
-// InterfaceName returns the interface name this filter is attached to
-func (f *TCFilter) InterfaceName() string {
-	return f.ifaceName
-}
-
 // Direction returns the direction this filter is attached in
 func (f *TCFilter) Direction() TCDirection {
 	return f.direction
-}
-
-// Rules lists every CIDR currently present in the allow and deny maps. Used
-// to re-adopt rule bookkeeping from pinned maps after a daemon restart.
-func (f *TCFilter) Rules() (allowed, denied []*net.IPNet, err error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	allowed, err = dumpRuleMaps(f.objs.AllowedIpv4, f.objs.AllowedIpv6)
-	if err != nil {
-		return nil, nil, fmt.Errorf("dumping allowed rules: %w", err)
-	}
-	denied, err = dumpRuleMaps(f.objs.DeniedIpv4, f.objs.DeniedIpv6)
-	if err != nil {
-		return nil, nil, fmt.Errorf("dumping denied rules: %w", err)
-	}
-	return allowed, denied, nil
 }

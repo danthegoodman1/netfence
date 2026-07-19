@@ -17,6 +17,7 @@ func BenchmarkCgroupGetStats(b *testing.B) {
 	defer objs.Close()
 
 	f := &CgroupFilter{objs: objs}
+	f.syncRuleMaps()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -36,6 +37,7 @@ func BenchmarkTCGetStats(b *testing.B) {
 	defer objs.Close()
 
 	f := &TCFilter{objs: objs}
+	f.syncRuleMaps()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {

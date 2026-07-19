@@ -266,71 +266,6 @@ func (r *ttlRegistry) addSourceLocked(f filter.Filter, cidr *net.IPNet, list rul
 	return nil
 }
 
-// reconcileCP applies a declared control-plane rule set for one list as a
-// delta against the entries with a live CP source (which ARE the current
-// CP-declared set):
-//   - declared CIDRs replace the CP source lifetime exactly (a full desired
-//     state may shorten a TTL or demote a previously-permanent restored rule)
-//     while a CIDR in both old and new sets is NEVER removed/re-added in the
-//     kernel map — no transient allow/block window;
-//   - entries whose CP source is no longer declared are removed unless a
-//     daemon-system owner pins them.
-//
-// The whole reconcile holds r.mu, so concurrent CP adds and janitor sweeps
-// serialize around it and can never observe a half-applied update.
-func (r *ttlRegistry) reconcileCP(f filter.Filter, list ruleList, desired []parsedCIDR, now time.Time) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	var errs []error
-	desiredSet := make(map[string]struct{}, len(desired))
-	for _, d := range desired {
-		desiredSet[d.cidr.String()] = struct{}{}
-		if err := r.replaceCPSourceLocked(f, d.cidr, list, d.ttl, now); err != nil {
-			errs = append(errs, fmt.Errorf("adding %s: %w", d.cidr, err))
-		}
-	}
-
-	for key, entry := range r.entries {
-		if key.list != list {
-			continue
-		}
-		if _, ok := desiredSet[key.cidr]; ok {
-			continue
-		}
-		// Clear a formerly-declared CP source. If a prior authoritative
-		// reconcile already cleared it but its filter Remove failed, cpLive is
-		// already false; continue into the same removal path so every retry keeps
-		// reporting failure until the stale kernel rule is actually gone.
-		entry.cpLive, entry.cpDeadline, entry.provisional = false, time.Time{}, false
-		if entry.systemLive {
-			r.entries[key] = entry
-			continue
-		}
-		var err error
-		if f != nil {
-			if list == listAllow {
-				err = f.RemoveAllowedIP(entry.cidr)
-			} else {
-				err = f.RemoveDeniedIP(entry.cidr)
-			}
-		}
-		if err != nil {
-			// Keep the source-less entry so the janitor retries the removal
-			// (mirrors expire()'s fail-safe).
-			errs = append(errs, fmt.Errorf("removing %s: %w", key.cidr, err))
-			r.entries[key] = entry
-			continue
-		}
-		if entry.inFilter {
-			r.decrementProtectedCurrentLocked(entry.cidr, list)
-		}
-		delete(r.entries, key)
-	}
-
-	return errors.Join(errs...)
-}
-
 // seedAdopted records a complete physical inventory read from pinned maps as
 // provisional permanent control-plane ownership. The inventory is already the
 // kernel truth, so restore must not upsert every key back into the same maps.
@@ -580,53 +515,6 @@ func (r *ttlRegistry) protectedStatsWarningAllowed(now time.Time) bool {
 	}
 	r.lastProtectedStatsWarn = now
 	return true
-}
-
-// replaceCPSourceLocked applies one entry from an authoritative full desired
-// state. Unlike incremental addCP's monotonic max-deadline semantics, this
-// replaces the CP lifetime exactly: permanent may become finite and a longer
-// deadline may become shorter. An already-installed survivor is bookkeeping
-// only (no filter Remove/Add).
-func (r *ttlRegistry) replaceCPSourceLocked(f filter.Filter, cidr *net.IPNet, list ruleList, ttl time.Duration, now time.Time) error {
-	key := ttlKey{cidr: cidr.String(), list: list}
-	entry, exists := r.entries[key]
-	if !exists {
-		entry = ttlEntry{cidr: cidr}
-	}
-
-	entry.cpLive = true
-	entry.provisional = false
-	if ttl <= 0 {
-		entry.cpDeadline = time.Time{}
-	} else {
-		entry.cpDeadline = now.Add(ttl)
-	}
-
-	becamePhysical := false
-	if f != nil && !entry.inFilter {
-		var err error
-		if list == listAllow {
-			err = f.AllowIP(cidr)
-		} else {
-			err = f.DenyIP(cidr)
-		}
-		if err != nil {
-			if isMapFull(err) {
-				r.mapFullDrops.Add(1)
-			}
-			// Match addSourceLocked: never record desired state that did not
-			// reach the kernel; an existing entry retains its prior lifetime.
-			return err
-		}
-		entry.inFilter = true
-		becamePhysical = true
-	}
-
-	r.entries[key] = entry
-	if becamePhysical {
-		r.incrementProtectedCurrentLocked(cidr, list)
-	}
-	return nil
 }
 
 // remove deletes control-plane ownership for the CIDR. A protected

@@ -6,13 +6,9 @@
 package filter
 
 import (
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
-	"os"
-	"path/filepath"
-	"strings"
 
 	"github.com/cilium/ebpf"
 )
@@ -20,25 +16,21 @@ import (
 // IPv4LPMKey is the key structure for IPv4 LPM trie lookups
 type IPv4LPMKey struct {
 	Prefixlen uint32
-	Addr      uint32
+	Addr      [4]byte
 }
 
 // IPv6LPMKey is the key structure for IPv6 LPM trie lookups
 type IPv6LPMKey struct {
 	Prefixlen uint32
-	Addr      [4]uint32
+	Addr      [16]byte
 }
 
 func ipv4CIDRToKey(cidr *net.IPNet) IPv4LPMKey {
 	ones, _ := cidr.Mask.Size()
 	ip := cidr.IP.To4()
-	// Use LittleEndian so the bytes end up in network order when cilium/ebpf
-	// marshals the uint32 in native (little) endian on x86/arm64.
-	// This ensures the LPM trie prefix matching works correctly.
-	return IPv4LPMKey{
-		Prefixlen: uint32(ones),
-		Addr:      binary.LittleEndian.Uint32(ip),
-	}
+	key := IPv4LPMKey{Prefixlen: uint32(ones)}
+	copy(key.Addr[:], ip)
+	return key
 }
 
 func ipv6CIDRToKey(cidr *net.IPNet) IPv6LPMKey {
@@ -47,11 +39,7 @@ func ipv6CIDRToKey(cidr *net.IPNet) IPv6LPMKey {
 	key := IPv6LPMKey{
 		Prefixlen: uint32(ones),
 	}
-	// Use LittleEndian for the same reason as IPv4
-	key.Addr[0] = binary.LittleEndian.Uint32(ip[0:4])
-	key.Addr[1] = binary.LittleEndian.Uint32(ip[4:8])
-	key.Addr[2] = binary.LittleEndian.Uint32(ip[8:12])
-	key.Addr[3] = binary.LittleEndian.Uint32(ip[12:16])
+	copy(key.Addr[:], ip)
 	return key
 }
 
@@ -133,7 +121,7 @@ func (b bpfProtectedRuleBackend) keys(bucket protectedRuleBucket) ([]protectedRu
 		iter := m.Iterate()
 		for iter.Next(&raw, &value) {
 			key := protectedRuleKey{bucket: bucket, prefixLen: raw.Prefixlen}
-			binary.LittleEndian.PutUint32(key.addr[:4], raw.Addr)
+			copy(key.addr[:4], raw.Addr[:])
 			out = append(out, key)
 		}
 		if err := iter.Err(); err != nil {
@@ -144,9 +132,7 @@ func (b bpfProtectedRuleBackend) keys(bucket protectedRuleBucket) ([]protectedRu
 		iter := m.Iterate()
 		for iter.Next(&raw, &value) {
 			key := protectedRuleKey{bucket: bucket, prefixLen: raw.Prefixlen}
-			for i := range raw.Addr {
-				binary.LittleEndian.PutUint32(key.addr[i*4:(i+1)*4], raw.Addr[i])
-			}
+			copy(key.addr[:], raw.Addr[:])
 			out = append(out, key)
 		}
 		if err := iter.Err(); err != nil {
@@ -353,25 +339,6 @@ func (b bpfExactDNSBackend) delete(key exactIPKey) error {
 	return nil
 }
 
-func clearMap[K any](m *ebpf.Map) error {
-	var keys []K
-	var value uint8
-	var key K
-	iter := m.Iterate()
-	for iter.Next(&key, &value) {
-		keys = append(keys, key)
-	}
-	if err := iter.Err(); err != nil {
-		return err
-	}
-	for _, key := range keys {
-		if err := m.Delete(key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
-			return err
-		}
-	}
-	return nil
-}
-
 func sumPerCPUCounter(m *ebpf.Map, key uint32) (uint64, error) {
 	var values []uint64
 	if err := m.Lookup(key, &values); err != nil {
@@ -382,62 +349,4 @@ func sumPerCPUCounter(m *ebpf.Map, key uint32) (uint64, error) {
 		total += value
 	}
 	return total, nil
-}
-
-// GetCgroupPath returns the container's cgroup path based on its ID
-// This works for containerd containers using the systemd cgroup driver
-func GetCgroupPath(containerID string) (string, error) {
-	// Try common cgroup v2 paths
-	paths := []string{
-		// Containerd with systemd cgroup driver
-		filepath.Join("/sys/fs/cgroup/system.slice", fmt.Sprintf("containerd-%s.scope", containerID)),
-		// Containerd default
-		filepath.Join("/sys/fs/cgroup/default", containerID),
-		// Docker-style
-		filepath.Join("/sys/fs/cgroup/docker", containerID),
-	}
-
-	for _, p := range paths {
-		if _, err := os.Stat(p); err == nil {
-			return p, nil
-		}
-	}
-
-	return "", fmt.Errorf("cgroup path not found for container %s", containerID)
-}
-
-// FindCgroupByPID finds the cgroup path for a process ID
-func FindCgroupByPID(pid int) (string, error) {
-	cgroupFile := fmt.Sprintf("/proc/%d/cgroup", pid)
-	data, err := os.ReadFile(cgroupFile)
-	if err != nil {
-		return "", fmt.Errorf("reading cgroup file: %w", err)
-	}
-
-	// Parse cgroup file - each line is "hierarchy-ID:controller-list:cgroup-path"
-	// For cgroup v2 unified hierarchy: "0::/path"
-	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-	for _, line := range lines {
-		parts := strings.SplitN(line, ":", 3)
-		if len(parts) == 3 {
-			// cgroup v2 unified hierarchy has hierarchy-ID=0 and empty controller-list
-			if parts[0] == "0" && parts[1] == "" {
-				cgroupPath := parts[2]
-				if cgroupPath != "" && cgroupPath != "/" {
-					fullPath := filepath.Join("/sys/fs/cgroup", cgroupPath)
-					if _, err := os.Stat(fullPath); err == nil {
-						return fullPath, nil
-					}
-				}
-			}
-		}
-	}
-
-	// Fallback: try the root cgroup for the process
-	rootCgroup := "/sys/fs/cgroup"
-	if _, err := os.Stat(rootCgroup); err == nil {
-		return rootCgroup, nil
-	}
-
-	return "", fmt.Errorf("cgroup path not found for PID %d", pid)
 }

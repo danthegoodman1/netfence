@@ -733,6 +733,51 @@ func (s dnsQuerySnapshot) canonicalAdmission(records []dnsAdmissionRecord) dnsCa
 	}
 }
 
+type dnsPolicyDecision struct {
+	mode          apiv1.DnsMode
+	owner         dnsPolicyOwner
+	shouldResolve bool
+	shouldAdmit   bool
+	blocked       bool
+}
+
+// queryDecisionLocked is the single DNS policy decision table. Snapshot and
+// response-time revalidation both call it while holding s.mu, so a new mode
+// cannot accidentally update one branch without the other.
+func (s *DNSServer) queryDecisionLocked(domain string) (dnsPolicyDecision, error) {
+	decision := dnsPolicyDecision{mode: s.mode}
+	switch s.mode {
+	case apiv1.DnsMode_DNS_MODE_DISABLED:
+		decision.shouldResolve = true
+	case apiv1.DnsMode_DNS_MODE_ALLOWLIST:
+		match, owner := evaluateCanonicalDomainRules(domain, s.allowedDomains, s.deniedDomains)
+		if match != domainDecisionAllow {
+			decision.blocked = true
+			break
+		}
+		decision.owner = dnsPolicyOwner{kind: dnsOwnerRule, domain: owner}
+		decision.shouldResolve, decision.shouldAdmit = true, true
+	case apiv1.DnsMode_DNS_MODE_DENYLIST:
+		match, owner := evaluateCanonicalDomainRules(domain, s.allowedDomains, s.deniedDomains)
+		if match == domainDecisionDeny {
+			decision.blocked = true
+			break
+		}
+		if match == domainDecisionAllow {
+			decision.owner = dnsPolicyOwner{kind: dnsOwnerRule, domain: owner}
+		} else {
+			decision.owner = dnsPolicyOwner{kind: dnsOwnerDenylistDefault, domain: domain}
+		}
+		decision.shouldResolve, decision.shouldAdmit = true, true
+	case apiv1.DnsMode_DNS_MODE_PROXY:
+		decision.owner = dnsPolicyOwner{kind: dnsOwnerProxy, domain: domain}
+		decision.shouldResolve = true
+	default:
+		return dnsPolicyDecision{}, fmt.Errorf("invalid DNS mode %d", s.mode)
+	}
+	return decision, nil
+}
+
 func (s *DNSServer) snapshotQuery(domain string) (dnsQuerySnapshot, bool, error) {
 	normalized, err := validateAndNormalizeDomain(domain)
 	if err != nil {
@@ -740,44 +785,21 @@ func (s *DNSServer) snapshotQuery(domain string) (dnsQuerySnapshot, bool, error)
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	decision, err := s.queryDecisionLocked(normalized)
+	if err != nil {
+		return dnsQuerySnapshot{}, false, err
+	}
 	snapshot := dnsQuerySnapshot{
 		generation:  s.generation,
-		mode:        s.mode,
+		mode:        decision.mode,
 		queryDomain: normalized,
+		owner:       decision.owner,
 		upstreams:   append([]string(nil), s.upstreams...),
+		shouldAdmit: decision.shouldAdmit,
 		proxyFunc:   s.proxyFunc,
+		blocked:     decision.blocked,
 	}
-	switch s.mode {
-	case apiv1.DnsMode_DNS_MODE_DISABLED:
-		return snapshot, true, nil
-	case apiv1.DnsMode_DNS_MODE_ALLOWLIST:
-		decision, owner := evaluateCanonicalDomainRules(normalized, s.allowedDomains, s.deniedDomains)
-		if decision != domainDecisionAllow {
-			snapshot.blocked = true
-			return snapshot, false, nil
-		}
-		snapshot.owner = dnsPolicyOwner{kind: dnsOwnerRule, domain: owner}
-		snapshot.shouldAdmit = true
-		return snapshot, true, nil
-	case apiv1.DnsMode_DNS_MODE_DENYLIST:
-		decision, owner := evaluateCanonicalDomainRules(normalized, s.allowedDomains, s.deniedDomains)
-		if decision == domainDecisionDeny {
-			snapshot.blocked = true
-			return snapshot, false, nil
-		}
-		if decision == domainDecisionAllow {
-			snapshot.owner = dnsPolicyOwner{kind: dnsOwnerRule, domain: owner}
-		} else {
-			snapshot.owner = dnsPolicyOwner{kind: dnsOwnerDenylistDefault, domain: normalized}
-		}
-		snapshot.shouldAdmit = true
-		return snapshot, true, nil
-	case apiv1.DnsMode_DNS_MODE_PROXY:
-		snapshot.owner = dnsPolicyOwner{kind: dnsOwnerProxy, domain: normalized}
-		return snapshot, true, nil
-	default:
-		return snapshot, false, fmt.Errorf("invalid DNS mode %d", s.mode)
-	}
+	return snapshot, decision.shouldResolve, nil
 }
 
 func (s *DNSServer) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
@@ -873,35 +895,17 @@ func (s *DNSServer) queryStillCurrentLocked(snapshot dnsQuerySnapshot) bool {
 	if s.generation != snapshot.generation || s.mode != snapshot.mode {
 		return false
 	}
-	switch snapshot.mode {
-	case apiv1.DnsMode_DNS_MODE_DISABLED:
-		return true
-	case apiv1.DnsMode_DNS_MODE_ALLOWLIST:
-		decision, owner := evaluateCanonicalDomainRules(snapshot.queryDomain, s.allowedDomains, s.deniedDomains)
-		if snapshot.blocked {
-			return decision != domainDecisionAllow
-		}
-		return decision == domainDecisionAllow && snapshot.owner == (dnsPolicyOwner{kind: dnsOwnerRule, domain: owner})
-	case apiv1.DnsMode_DNS_MODE_DENYLIST:
-		decision, owner := evaluateCanonicalDomainRules(snapshot.queryDomain, s.allowedDomains, s.deniedDomains)
-		if snapshot.blocked {
-			return decision == domainDecisionDeny
-		}
-		if decision == domainDecisionDeny {
-			return false
-		}
-		if decision == domainDecisionAllow {
-			return snapshot.owner == (dnsPolicyOwner{kind: dnsOwnerRule, domain: owner})
-		}
-		return snapshot.owner == (dnsPolicyOwner{kind: dnsOwnerDenylistDefault, domain: snapshot.queryDomain})
-	case apiv1.DnsMode_DNS_MODE_PROXY:
-		if snapshot.blocked {
-			return true
-		}
-		return snapshot.owner == (dnsPolicyOwner{kind: dnsOwnerProxy, domain: snapshot.queryDomain})
-	default:
+	decision, err := s.queryDecisionLocked(snapshot.queryDomain)
+	if err != nil {
 		return false
 	}
+	// Proxy allow/deny is external to the local policy generation. Revalidate
+	// only that the query still belongs to the same proxy owner.
+	if snapshot.mode == apiv1.DnsMode_DNS_MODE_PROXY {
+		return snapshot.owner == decision.owner
+	}
+	return snapshot.owner == decision.owner && snapshot.blocked == decision.blocked &&
+		snapshot.shouldAdmit == decision.shouldAdmit
 }
 
 // admitAndWrite is the linearization point for a filtered DNS response. The

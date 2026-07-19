@@ -432,13 +432,9 @@ func TestAttachRollbackOnFilterCreateError(t *testing.T) {
 
 func TestAttachRollbackOnDNSStartError(t *testing.T) {
 	env := newAttachTestEnv(t, 12150)
+	env.server.bindDNSServer = func(*DNSServer) error { return errors.New("injected DNS bind failure") }
 
-	// Occupy the only pool port so the DNS server cannot bind.
-	blocker, err := net.ListenPacket("udp", net.JoinHostPort("127.0.0.1", strconv.Itoa(env.port)))
-	require.NoError(t, err)
-	defer blocker.Close()
-
-	_, err = env.server.Attach(context.Background(), attachInterfaceReq("dnsfail-if0"))
+	_, err := env.server.Attach(context.Background(), attachInterfaceReq("dnsfail-if0"))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "binding DNS server")
 

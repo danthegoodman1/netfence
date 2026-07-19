@@ -94,10 +94,10 @@ func TestProtectedCurrentCountersTrackPhysicalTransitionsAndFailures(t *testing.
 	assertProtectedCurrent(t, reg, 1, 1, 1, 1)
 
 	ff.removeDenyErr = errors.New("injected remove failure")
-	require.Error(t, reg.reconcileCP(ff, listDeny, []parsedCIDR{{cidr: deny6}}, now))
+	require.Error(t, reg.remove(ff, deny4, listDeny))
 	assertProtectedCurrent(t, reg, 1, 1, 1, 1)
 	ff.removeDenyErr = nil
-	require.NoError(t, reg.reconcileCP(ff, listDeny, []parsedCIDR{{cidr: deny6}}, now))
+	require.NoError(t, reg.remove(ff, deny4, listDeny))
 	assertProtectedCurrent(t, reg, 1, 1, 0, 1)
 
 	ff.removeAllowErr = errors.New("injected clear failure")
@@ -184,7 +184,7 @@ func TestSystemOwnedDNSBootstrapSurvivesAuthoritativeStateTTLRemoveAndClear(t *t
 
 	require.NoError(t, reg.addSystem(ff, bootstrap, listAllow))
 	require.NoError(t, reg.addCP(ff, bootstrap, listAllow, time.Second, clock.Now()))
-	require.NoError(t, reg.reconcileCP(ff, listAllow, nil, clock.Now()))
+	require.NoError(t, reg.remove(ff, bootstrap, listAllow))
 
 	clock.Advance(time.Hour)
 	assert.Empty(t, reg.expire(ff, clock.Now()))

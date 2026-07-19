@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -433,4 +434,51 @@ func netIP(t *testing.T, value string) net.IP {
 	ip := net.ParseIP(value)
 	require.NotNil(t, ip)
 	return ip
+}
+
+func TestAllocatePortSkipsExternallyOccupiedTCPAndUDP(t *testing.T) {
+	for _, network := range []string{"tcp", "udp"} {
+		t.Run(network, func(t *testing.T) {
+			var occupiedPort int
+			var closeOccupied func() error
+			if network == "tcp" {
+				occupied, err := net.Listen(network, "127.0.0.1:0")
+				require.NoError(t, err)
+				occupiedPort = occupied.Addr().(*net.TCPAddr).Port
+				closeOccupied = occupied.Close
+			} else {
+				occupied, err := net.ListenPacket(network, "127.0.0.1:0")
+				require.NoError(t, err)
+				occupiedPort = occupied.LocalAddr().(*net.UDPAddr).Port
+				closeOccupied = occupied.Close
+			}
+			defer closeOccupied()
+
+			var freePort int
+			for freePort == 0 {
+				freeTCP, listenErr := net.Listen("tcp", "127.0.0.1:0")
+				require.NoError(t, listenErr)
+				candidate := freeTCP.Addr().(*net.TCPAddr).Port
+				freeUDP, packetErr := net.ListenPacket("udp", net.JoinHostPort("127.0.0.1", strconv.Itoa(candidate)))
+				if packetErr == nil && candidate != occupiedPort {
+					freePort = candidate
+					require.NoError(t, freeUDP.Close())
+				} else if freeUDP != nil {
+					require.NoError(t, freeUDP.Close())
+				}
+				require.NoError(t, freeTCP.Close())
+			}
+
+			server := &Server{
+				cfg:         &config.Config{DNS: config.DNSConfig{PortMin: occupiedPort, PortMax: freePort}},
+				dnsListenIP: "127.0.0.1",
+				portPool:    map[int]bool{occupiedPort: false, freePort: false},
+			}
+			got, err := server.allocatePort()
+			require.NoError(t, err)
+			assert.Equal(t, freePort, got)
+			assert.False(t, server.portPool[occupiedPort])
+			assert.True(t, server.portPool[freePort])
+		})
+	}
 }

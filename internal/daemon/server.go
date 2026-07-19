@@ -3314,12 +3314,31 @@ func (s *Server) filterAndRegistry(id string) (*attachmentState, filter.Filter, 
 
 func (s *Server) allocatePort() (int, error) {
 	for port, inUse := range s.portPool {
-		if !inUse {
+		if !inUse && dnsPortAvailable(s.dnsListenIP, port) {
 			s.portPool[port] = true
 			return port, nil
 		}
 	}
 	return 0, fmt.Errorf("no available DNS ports in range %d-%d", s.cfg.DNS.PortMin, s.cfg.DNS.PortMax)
+}
+
+// dnsPortAvailable probes both transports used by DNSServer. The listeners
+// are deliberately closed immediately: allocation remains an in-process
+// reservation, but candidates already owned by another process are skipped.
+func dnsPortAvailable(host string, port int) bool {
+	addr := net.JoinHostPort(host, strconv.Itoa(port))
+	udp, err := net.ListenPacket("udp", addr)
+	if err != nil {
+		return false
+	}
+	tcp, err := net.Listen("tcp", addr)
+	if err != nil {
+		_ = udp.Close()
+		return false
+	}
+	_ = tcp.Close()
+	_ = udp.Close()
+	return true
 }
 
 func (s *Server) releasePort(port int) {
