@@ -60,7 +60,7 @@ However, this does have a bit more overhead than something like [httpjail](https
 ## Performance snapshot
 
 These numbers were measured in the privileged Docker Linux gate on `linux/arm64`
-using `make bench-docker`. Current values are medians of five samples.
+using `make bench-docker`. Values are medians of five samples.
 
 ### Warm socket path
 
@@ -74,8 +74,10 @@ already present in the eBPF map.
 | Normal socket connect, no eBPF | ~2.647 us |
 | Warm allowlist, protected LPM hit | ~2.691 us |
 | Warm allowlist, DNS exact-host hit | ~2.741 us |
-| DNS exact overhead | ~94 ns vs baseline (+3.6%); ~50 ns vs LPM (+1.9%), within sample noise |
 | Allowlist miss, local block | ~1.652 us |
+
+The measured spread between the normal, protected-LPM, and DNS exact-host
+connect paths is within sample noise.
 
 There is no "kernel miss asks parent process" path today. A cgroup allowlist
 miss is decided locally by eBPF and is blocked immediately.
@@ -83,16 +85,13 @@ miss is decided locally by eBPF and is blocked immediately.
 ### DNS query path
 
 These numbers measure the DNS server path, not the warmed socket connect path.
-The reference column is the prior README snapshot used as the regression gate:
-an end-to-end query-path latency increase above 20% is rejected. Lower latency
-is an improvement, not a regression.
 
-| Path | Reference | Current median | Delta |
-| --- | ---: | ---: | ---: |
-| Proxy query cold, in-process policy function | ~26.7 us | ~31.336 us | +17.4% |
-| Proxy query warm | ~25.3 us | ~27.964 us | +10.5% |
-| Allowlist query cold with local upstream | ~68.0 us | ~53.510 us | -21.3% |
-| Allowlist query warm with local upstream | ~67.4 us | ~53.432 us | -20.7% |
+| Path | Median latency |
+| --- | ---: |
+| Proxy query cold, in-process policy function | ~31.336 us |
+| Proxy query warm | ~27.964 us |
+| Allowlist query cold with local upstream | ~53.510 us |
+| Allowlist query warm with local upstream | ~53.432 us |
 
 Cold rows synchronize through the real attachment mutation barrier and clear
 the benchmark ownership graph and fake exact-map snapshot between queries.
