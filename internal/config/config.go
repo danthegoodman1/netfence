@@ -35,6 +35,27 @@ type DNSConfig struct {
 	// from churning the rule maps. Zero (or unset) falls back to the default
 	// of 60s — it does NOT disable the floor.
 	MinFilterTTL time.Duration `mapstructure:"min_filter_ttl"`
+	// MaxIPsPerFamily is the default and hard ceiling for one attachment's
+	// logical DNS-derived IPv4 and IPv6 working sets. Zero derives the ceiling
+	// from filter.max_dns_rule_entries (4096 when that setting is also zero).
+	// A new address-bearing response beyond any DNS ownership ceiling is
+	// rejected as SERVFAIL without evicting the current working set.
+	MaxIPsPerFamily int `mapstructure:"max_ips_per_family"`
+	// MaxIPsPerResponse bounds unique A/AAAA addresses admitted for one DNS
+	// response. Zero uses the safe default (64).
+	MaxIPsPerResponse int `mapstructure:"max_ips_per_response"`
+	// MaxIPsPerPolicyDomain bounds the unique addresses owned by one matched
+	// authorization owner (an explicit allow domain, implicit DENYLIST query
+	// owner, or proxy query owner). Zero uses the safe default (1024, capped by
+	// the aggregate exact-tier capacity).
+	MaxIPsPerPolicyDomain int `mapstructure:"max_ips_per_policy_domain"`
+	// MaxTrackedDomains bounds the union of normalized configured policy-rule
+	// domains and live query-domain ownership metadata per attachment. Zero uses
+	// the safe default (1024).
+	MaxTrackedDomains int `mapstructure:"max_tracked_domains"`
+	// MaxOwnershipEdges bounds (query domain, policy owner, IP) TTL records.
+	// Zero uses the safe default (8192).
+	MaxOwnershipEdges int `mapstructure:"max_ownership_edges"`
 }
 
 type FilterConfig struct {
@@ -47,6 +68,7 @@ type FilterConfig struct {
 	// allow map (IPv4 and IPv6) per attachment. It is deliberately independent
 	// from MaxRuleEntries so regenerable DNS entries can never consume or evict
 	// authoritative CIDR/deny capacity. Zero keeps the compiled default 4096.
+	// This is load-time sizing; existing pinned maps cannot be resized in place.
 	MaxDNSRuleEntries int `mapstructure:"max_dns_rule_entries"`
 	// BPFPinDir is the bpffs directory the daemon pins each attachment's BPF
 	// links and maps under (one subdirectory per attachment ID). Pinned state
@@ -177,6 +199,21 @@ func (c *Config) Validate() error {
 	if c.DNS.MinFilterTTL < 0 {
 		return fmt.Errorf("dns.min_filter_ttl must not be negative")
 	}
+	for _, field := range []struct {
+		name  string
+		value int
+	}{
+		{"dns.max_ips_per_family", c.DNS.MaxIPsPerFamily},
+		{"dns.max_ips_per_response", c.DNS.MaxIPsPerResponse},
+		{"dns.max_ips_per_policy_domain", c.DNS.MaxIPsPerPolicyDomain},
+		{"dns.max_tracked_domains", c.DNS.MaxTrackedDomains},
+		{"dns.max_ownership_edges", c.DNS.MaxOwnershipEdges},
+	} {
+		name, value := field.name, field.value
+		if value < 0 || int64(value) > math.MaxUint32 {
+			return fmt.Errorf("%s must be between 0 (default) and %d", name, uint32(math.MaxUint32))
+		}
+	}
 	// 0 means "use the compiled-in default" (4096); anything else must fit
 	// the kernel's u32 max_entries without truncation.
 	if c.Filter.MaxRuleEntries < 0 || int64(c.Filter.MaxRuleEntries) > math.MaxUint32 {
@@ -184,6 +221,31 @@ func (c *Config) Validate() error {
 	}
 	if c.Filter.MaxDNSRuleEntries < 0 || int64(c.Filter.MaxDNSRuleEntries) > math.MaxUint32 {
 		return fmt.Errorf("filter.max_dns_rule_entries must be between 0 (default) and %d", uint32(math.MaxUint32))
+	}
+	exactCapacity := c.Filter.MaxDNSRuleEntries
+	if exactCapacity == 0 {
+		exactCapacity = 4096
+	}
+	logicalPerFamily := c.DNS.MaxIPsPerFamily
+	if logicalPerFamily == 0 {
+		logicalPerFamily = exactCapacity
+	}
+	if logicalPerFamily > exactCapacity {
+		return fmt.Errorf("dns.max_ips_per_family (%d) must not exceed the effective filter.max_dns_rule_entries capacity (%d)", logicalPerFamily, exactCapacity)
+	}
+	aggregate := int64(logicalPerFamily) * 2
+	if c.DNS.MaxIPsPerResponse > 0 && int64(c.DNS.MaxIPsPerResponse) > aggregate {
+		return fmt.Errorf("dns.max_ips_per_response (%d) must not exceed the aggregate logical exact-tier capacity (%d)", c.DNS.MaxIPsPerResponse, aggregate)
+	}
+	if c.DNS.MaxIPsPerPolicyDomain > 0 && int64(c.DNS.MaxIPsPerPolicyDomain) > aggregate {
+		return fmt.Errorf("dns.max_ips_per_policy_domain (%d) must not exceed the aggregate logical exact-tier capacity (%d)", c.DNS.MaxIPsPerPolicyDomain, aggregate)
+	}
+	effectiveEdges := c.DNS.MaxOwnershipEdges
+	if effectiveEdges == 0 {
+		effectiveEdges = 8192
+	}
+	if c.DNS.MaxIPsPerResponse > 0 && c.DNS.MaxIPsPerResponse > effectiveEdges {
+		return fmt.Errorf("dns.max_ips_per_response (%d) must not exceed dns.max_ownership_edges (%d)", c.DNS.MaxIPsPerResponse, effectiveEdges)
 	}
 	return c.ControlPlane.validate()
 }

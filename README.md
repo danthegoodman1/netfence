@@ -81,16 +81,40 @@ miss is decided locally by eBPF and is blocked immediately.
 ### DNS query path
 
 These numbers measure the DNS server path, not the warmed socket connect path.
-The reference column is the prior README snapshot used as the ±20% acceptance
-threshold; every current five-sample median remains inside that threshold.
+The reference column is the prior README snapshot used as the regression gate:
+an end-to-end query-path latency increase above 20% is rejected. Lower latency
+is an improvement, not a regression.
 
 | Path | Reference | Current median | Delta |
 | --- | ---: | ---: | ---: |
-| Proxy query cold, in-process policy function | ~26.7 us | ~28.297 us | +6.0% |
-| Proxy query warm | ~25.3 us | ~23.945 us | -5.4% |
-| Allowlist query cold with local upstream | ~68.0 us | ~59.448 us | -12.6% |
-| Allowlist query warm with local upstream | ~67.4 us | ~61.840 us | -8.2% |
-| Cached "already added to filter" check (also refreshes the entry's TTL deadline) | ~0.2 us | ~0.232 us | +16.0% |
+| Proxy query cold, in-process policy function | ~26.7 us | ~30.472 us | +14.1% |
+| Proxy query warm | ~25.3 us | ~29.039 us | +14.8% |
+| Allowlist query cold with local upstream | ~68.0 us | ~53.851 us | -20.8% |
+| Allowlist query warm with local upstream | ~67.4 us | ~52.772 us | -21.7% |
+
+Cold rows synchronize through the real attachment mutation barrier and clear
+the benchmark ownership graph and fake exact-map snapshot between queries.
+The timer runs continuously to preserve UDP scheduler locality, while `ns/op`
+subtracts the separately reported `fixture-reset-ns/op` wall time (including
+any tail of the prior handler after the client received its packet) and thus
+measures the current client Exchange. `raw-total-ns/op` reports both together.
+The reset preserves configured policy domains and backing storage, and the
+benchmark asserts one physical exact-map add per query. Warm rows prime
+ownership once and assert one physical add across the run.
+
+The internal ownership microbenchmarks below are scalability diagnostics, not
+end-to-end DNS query-path acceptance rows. The cached helper is retained only
+for tests and benchmarks; it wraps one record at a time and repeats domain
+validation. Both it and normal resolver traffic traverse the attachment
+mutation barrier, while normal resolver traffic admits each complete response
+as one transaction.
+
+| Internal operation | Current median | Allocations |
+| --- | ---: | ---: |
+| Cached single-record test-helper admission | ~0.366 us | 80 B, 4 allocs/op |
+| Cold ownership admission | ~0.344 us | 40 B, 2 allocs/op |
+| Warm ownership refresh with 4,095 unrelated entries | ~0.144 us | 0 B, 0 allocs/op |
+| No-op expiry scan across 4,095 entries | ~62.472 us/scan | 0 B, 0 allocs/op |
 
 # Design
 
@@ -132,6 +156,14 @@ dns:
   port_max: 11500
   # Daemon-global fallback when DnsConfig.upstream_servers is empty.
   upstream: 1.1.1.1:53
+  # Hard daemon ceilings for each attachment's bounded DNS exact ownership.
+  # Zero/unset uses these defaults (max_ips_per_family instead derives from
+  # filter.max_dns_rule_entries).
+  max_ips_per_family: 4096
+  max_ips_per_response: 64
+  max_ips_per_policy_domain: 1024
+  max_tracked_domains: 1024
+  max_ownership_edges: 8192
 ```
 
 Attach returns the concrete `dns_address`; configure that exact address as the
@@ -165,6 +197,39 @@ successfully answered policy-allowed queries (including NXDOMAIN),
 `dns_queries_blocked` counts policy `REFUSED` responses, and
 `dns_queries_errors` counts resolver, proxy, filter-admission, response-write,
 and other error paths. A query increments exactly one bucket.
+
+Every address-bearing response in a filtering DNS mode is admitted to the
+attachment's exact IPv4/IPv6 HASH tier as one transaction before any A/AAAA
+address from its answer, authority, or additional sections is returned. If
+the complete response cannot be represented, the resolver returns `SERVFAIL`
+with no address and preserves the previously admitted working set. PROXY
+decisions that return addresses must set `add_to_filter`; otherwise they also
+fail closed as `SERVFAIL`. Disabled DNS mode is the explicit pass-through
+exception.
+
+Exact entries carry TTL edges from the normalized query to the matched policy
+owner. Removing or denying a domain promptly removes its last DNS-only exact
+addresses, while a shared address survives another live query owner and an
+overlapping control-plane CIDR continues independently in the protected LPM
+tier. DNS DENYLIST default-allow and explicit-allow answers are tracked too,
+even while packet DENYLIST ignores exact allows, so a later packet-mode switch
+to ALLOWLIST can use already-returned cached addresses without a requery.
+
+All normal/live userspace ownership state is bounded by the five `dns.*`
+settings above. Restored synthetic provisional edges are exempt from those
+logical limits so they cannot be forgotten before reconciliation, but remain
+bounded by the physical IPv4/IPv6 exact maps. `DnsConfig` may only lower limits
+per attachment; zero inherits the daemon ceiling.
+Configured policy domains and live query domains share
+`max_tracked_domains`, and each `(query, matched owner, IP)` TTL record consumes
+one `max_ownership_edges` slot. In this conservative bounded-admission stage,
+capacity pressure does not evict the live working set: Netfence increments
+`map_full_drops`, emits a rate-limited warning, and returns `SERVFAIL` for new
+address-bearing admissions. Capacity becomes available after TTL expiry or
+prompt policy removal. Raising a daemon `dns.*` ceiling requires a config
+change and daemon restart; per-attachment `DnsConfig` cannot raise it. Raising
+physical `filter.max_dns_rule_entries` is load-time sizing and also requires
+recreating the attachment/map (pinned maps cannot be resized in place).
 
 ## Per host
 
@@ -337,7 +402,12 @@ Notes on re-adopted state:
   provisionally treated as permanent until the fresh `SubscribedAck` lands;
   that authoritative ack replaces their lifetimes exactly, including
   shortening a deadline or turning a provisionally permanent rule back into
-  a finite-TTL rule.
+  a finite-TTL rule. Restored exact DNS keys are inventoried and represented
+  by bounded provisional owners (the actual pinned map capacities are the
+  bound); the first authoritative DNS config discards every synthetic claim,
+  removes keys left ownerless, and preserves a key only when it separately has
+  a normal live owner. A non-canonical/colliding inventory aborts restore
+  without guessing or partially publishing ownership metadata.
 - If no control plane is configured or reachable, no automatic rule changes
   occur: an adopted pinned map continues enforcing its last-known contents. A
   restore that cannot adopt valid pins recreates the attachment in its
@@ -351,8 +421,10 @@ Notes on re-adopted state:
   If either committed UDP/TCP listener later dies unexpectedly, the attachment
   is quarantined in IP `BLOCK_ALL` and reported as an error unsubscribe.
 - The per-attachment DNS server is a userspace component and stops with the
-  daemon; while the daemon is down, already-resolved (still unexpired) IPs
-  keep working but new names cannot be resolved through it.
+  daemon; while the daemon is down, pinned already-resolved exact IPs keep
+  working under the last-known packet policy, but new names cannot be resolved
+  through it. Their lost userspace deadlines are treated provisionally rather
+  than guessed until authoritative reconciliation.
 
 ## Per attachment
 
@@ -487,5 +559,5 @@ idempotently:
 
 - CIDR entries (`AllowCIDR`/`DenyCIDR` commands, and the CIDR lists in `SubscribedAck`/`BulkUpdate`) carry an optional TTL. TTL'd rules are removed by a daemon janitor once they expire (scan interval `ttl_janitor_interval`, default 1s); rules without a TTL are permanent.
 - Incremental `AllowCIDR`/`DenyCIDR` re-adds extend a CIDR to the later deadline — they never shorten one — and an incremental re-add without a TTL makes it permanent. In contrast, the complete state in `SubscribedAck`/`BulkUpdate` replaces each control-plane lifetime exactly, so authoritative reconciliation can shorten a TTL or change permanent to finite without removing/re-adding the live map entry. Use `RemoveCIDR` to drop an incremental rule early.
-- DNS-resolved IPs enter the filter with the record TTL floored by `dns.min_filter_ttl` (default 60s; zero/unset means the default, not "no floor") and expire the same way. A permanent (or longer-lived) CIDR rule covering the same address is never removed by DNS expiry.
-- Authoritative/system allow CIDRs and deny CIDRs remain in four protected LPM maps sized by `filter.max_rule_entries` per attachment (default 4096 each). The filter now also exposes separate exact-match HASH maps sized by `filter.max_dns_rule_entries` (default 4096 per IP family) as the foundation for bounded DNS-derived host admission; entries placed there cannot consume or evict authoritative or deny capacity. Exact-tier batch admission validates every IP and preflights both family capacities before mutation. A kernel error restores the exact pre-call snapshot; an unprovable rollback is surfaced explicitly and requires the caller to quarantine/fail closed. The production resolver still admits resolved IPs through the existing `AllowIP`/LPM path; the remaining Phase 5F/5G ownership, LRU, and admission work will cut it over to this exact tier.
+- DNS-resolved IPs enter only the exact tier with the record TTL floored by `dns.min_filter_ttl` (default 60s; zero/unset means the default, not "no floor"). An upstream TTL of zero therefore lives for the floor; an omitted PROXY TTL is explicitly defaulted to 300s before the floor is applied. A permanent or longer-lived CIDR rule covering the same address remains independently installed in the protected LPM tier when exact DNS ownership expires.
+- Authoritative/system allow CIDRs and deny CIDRs remain in four protected LPM maps sized by `filter.max_rule_entries` per attachment (default 4096 each). DNS-derived host addresses use separate exact-match HASH maps sized by `filter.max_dns_rule_entries` (default 4096 per IP family), so they cannot consume or evict authoritative or deny capacity. Complete-response admission validates/canonicalizes every address and preflights physical and logical capacity before mutation. A kernel error restores the exact pre-call snapshot; if rollback cannot prove that snapshot, the resolver suppresses the answer and quarantines the attachment in durable IP `BLOCK_ALL` before accepting another mutation.

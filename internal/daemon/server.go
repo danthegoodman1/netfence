@@ -71,6 +71,9 @@ type Server struct {
 	maxRuleEntries uint32
 	// maxDNSRuleEntries independently sizes each exact DNS-derived host map.
 	maxDNSRuleEntries uint32
+	// dnsAdmissionCeilings are both the zero-value per-attachment defaults and
+	// hard daemon ceilings for bounded resolver ownership metadata.
+	dnsAdmissionCeilings dnsAdmissionLimits
 
 	// pinRoot is the bpffs directory attachment BPF state is pinned under
 	// (config filter.bpf_pin_dir; "" disables pinning). detachOnStop selects
@@ -126,6 +129,9 @@ type Server struct {
 	readPinRoot      func(string) ([]os.DirEntry, error)
 	validatePinRoot  func(string) error
 	inspectPinSchema func(string) (filter.PinnedSchemaState, error)
+	// mutationAdmissionHook is a test-only seam invoked after the drain RLock
+	// is held but before the serialized mutation section is acquired.
+	mutationAdmissionHook func(string, *attachmentState)
 }
 
 type attachmentState struct {
@@ -133,12 +139,19 @@ type attachmentState struct {
 	// DNS, TTL, and stats work holds it for reading after revalidating live
 	// ownership. Teardown first closes admission under Server.mu, then takes it
 	// for writing to drain all earlier work before closing filter handles.
-	mutationMu      sync.RWMutex
-	mutationsClosed bool // guarded by Server.mu
+	mutationMu sync.RWMutex
+	// mutationSerialMu makes the admitted mutation section single-writer even
+	// though mutationMu remains an admission/drain RW barrier. This is required
+	// for rollback quarantine: once one operation stages BLOCK_ALL and closes
+	// admission, no previously admitted mode write can run afterward and reopen
+	// policy before the writer-side quarantine drain.
+	mutationSerialMu sync.Mutex
+	mutationsClosed  bool // guarded by Server.mu
 
-	info   *store.Attachment
-	dns    *DNSServer
-	filter filter.Filter
+	info    *store.Attachment
+	dns     *DNSServer
+	dnsSink *dnsFilterSink
+	filter  filter.Filter
 	// reconcileMu serializes an authoritative SubscribedAck apply against
 	// teardown of this exact state. Server.mu is never held while waiting for
 	// it: teardown uses lookup -> lock -> revalidate, while ack uses lock ->
@@ -206,14 +219,22 @@ func (s *Server) beginAttachmentMutation(id string) (*attachmentState, func(), e
 	s.mu.RUnlock()
 
 	state.mutationMu.RLock()
+	if s.mutationAdmissionHook != nil {
+		s.mutationAdmissionHook(id, state)
+	}
+	state.mutationSerialMu.Lock()
 	s.mu.RLock()
 	live := (!s.stopping || attachmentSetupApplyInProgress(state)) && s.attachments[id] == state && !state.cleanupNeeded && !state.mutationsClosed
 	s.mu.RUnlock()
 	if !live {
+		state.mutationSerialMu.Unlock()
 		state.mutationMu.RUnlock()
 		return nil, nil, fmt.Errorf("attachment %s is not accepting mutations", id)
 	}
-	return state, state.mutationMu.RUnlock, nil
+	return state, func() {
+		state.mutationSerialMu.Unlock()
+		state.mutationMu.RUnlock()
+	}, nil
 }
 
 func (s *Server) beginControlCommand(_ string) (func(), bool) {
@@ -441,6 +462,13 @@ func NewServer(cfg *config.Config, st *store.Store, logger zerolog.Logger, versi
 	if cfg.Filter.MaxDNSRuleEntries > 0 {
 		maxDNSRuleEntries = uint32(cfg.Filter.MaxDNSRuleEntries)
 	}
+	dnsAdmissionCeilings := resolveDNSAdmissionCeilings(maxDNSRuleEntries, dnsAdmissionLimitOverrides{
+		maxIPsPerFamily:       uint32(cfg.DNS.MaxIPsPerFamily),
+		maxIPsPerResponse:     uint32(cfg.DNS.MaxIPsPerResponse),
+		maxIPsPerPolicyDomain: uint32(cfg.DNS.MaxIPsPerPolicyDomain),
+		maxTrackedDomains:     uint32(cfg.DNS.MaxTrackedDomains),
+		maxOwnershipEdges:     uint32(cfg.DNS.MaxOwnershipEdges),
+	})
 	dnsListenIP, err := resolveConcreteDNSListenIP(cfg.DNS.ListenAddr)
 	if err != nil {
 		return nil, fmt.Errorf("resolving dns.listen_addr: %w", err)
@@ -458,25 +486,26 @@ func NewServer(cfg *config.Config, st *store.Store, logger zerolog.Logger, versi
 	}
 
 	s := &Server{
-		cfg:                cfg,
-		store:              st,
-		logger:             logger.With().Str("component", "daemon").Logger(),
-		daemonID:           daemonID,
-		hostname:           hostname,
-		version:            version,
-		portPool:           make(map[int]bool),
-		attachments:        make(map[string]*attachmentState),
-		targetIndex:        make(map[string]string),
-		now:                time.Now,
-		ttlJanitorInterval: janitorInterval,
-		janitorStop:        make(chan struct{}),
-		dnsMinFilterTTL:    dnsMinFilterTTL,
-		dnsListenIP:        dnsListenIP,
-		defaultDNSUpstream: defaultUpstreams[0],
-		maxRuleEntries:     maxRuleEntries,
-		maxDNSRuleEntries:  maxDNSRuleEntries,
-		pinRoot:            pinRoot,
-		detachOnStop:       cfg.Filter.DetachOnStop,
+		cfg:                  cfg,
+		store:                st,
+		logger:               logger.With().Str("component", "daemon").Logger(),
+		daemonID:             daemonID,
+		hostname:             hostname,
+		version:              version,
+		portPool:             make(map[int]bool),
+		attachments:          make(map[string]*attachmentState),
+		targetIndex:          make(map[string]string),
+		now:                  time.Now,
+		ttlJanitorInterval:   janitorInterval,
+		janitorStop:          make(chan struct{}),
+		dnsMinFilterTTL:      dnsMinFilterTTL,
+		dnsListenIP:          dnsListenIP,
+		defaultDNSUpstream:   defaultUpstreams[0],
+		maxRuleEntries:       maxRuleEntries,
+		maxDNSRuleEntries:    maxDNSRuleEntries,
+		dnsAdmissionCeilings: dnsAdmissionCeilings,
+		pinRoot:              pinRoot,
+		detachOnStop:         cfg.Filter.DetachOnStop,
 		newFilter: func(pinDir, target string, attachType apiv1.AttachmentType, mode apiv1.PolicyMode, direction apiv1.TcDirection, maxRules uint32) (filter.Filter, error) {
 			return createFilter(pinDir, target, attachType, mode, direction, maxRules, maxDNSRuleEntries)
 		},
@@ -698,6 +727,11 @@ func (s *Server) Start() error {
 			pinIdentityChanged:   pinIdentityChanged,
 		}
 		resources = append(resources, resource)
+		dnsSink, sinkErr := s.newDNSFilterSink(id, ebpfFilter)
+		if sinkErr != nil {
+			return abortStart(fmt.Errorf("initializing DNS exact-tier ownership for attachment %s: %w", id, sinkErr))
+		}
+		state.dnsSink = dnsSink
 		if adopted {
 			if err := s.seedAdoptedState(id, state, ebpfFilter); err != nil {
 				// Inventory is required for an authoritative delta reconcile: if a
@@ -714,14 +748,14 @@ func (s *Server) Start() error {
 			proxyFunc = cpClient.MakeProxyFunc(id)
 		}
 		dnsServer := NewDNSServer(id, canonicalDNSAddress, s.defaultDNSUpstream, s.logger,
-			s.newDNSFilterSink(id, ebpfFilter, state.ttls), proxyFunc)
+			dnsSink, proxyFunc, dnsSink.LimitCeilings())
 		// Domain rules and per-attachment upstream overrides are authoritative
 		// CP state and are not persisted. Restoring ALLOWLIST/DENYLIST/PROXY as
 		// constructor-default DISABLED would forward everything during an
 		// outage. Preserve explicit DISABLED, but hold every filtering mode in
 		// an empty ALLOWLIST (REFUSED) until the full SubscribedAck arrives.
 		if persistedDNSMode := parseDnsMode(state.info.DnsMode); persistedDNSMode != apiv1.DnsMode_DNS_MODE_DISABLED {
-			dnsServer.SetMode(apiv1.DnsMode_DNS_MODE_ALLOWLIST)
+			dnsServer.setModeForRestore(apiv1.DnsMode_DNS_MODE_ALLOWLIST)
 		}
 		resource.dns = dnsServer
 		if setupErr == nil {
@@ -1129,6 +1163,11 @@ func (s *Server) restoreFilter(id, pinDir, target string, attachType apiv1.Attac
 // Called with s.mu held during Start (no concurrent rule traffic yet).
 func (s *Server) seedAdoptedState(id string, state *attachmentState, f filter.Filter) error {
 	var seedErr error
+	if state.dnsSink == nil {
+		seedErr = errors.Join(seedErr, fmt.Errorf("DNS exact-tier ownership sink is unavailable"))
+	} else if err := state.dnsSink.SeedPinned(); err != nil {
+		seedErr = errors.Join(seedErr, fmt.Errorf("seeding restored DNS exact-tier ownership: %w", err))
+	}
 	if liveMode, err := f.GetMode(); err != nil {
 		s.logger.Warn().Err(err).Str("id", id).Msg("failed to read mode from re-adopted filter")
 		seedErr = errors.Join(seedErr, fmt.Errorf("reading adopted mode: %w", err))
@@ -1353,7 +1392,16 @@ func (s *Server) sweepExpiredTTLs(now time.Time) {
 				Str("list", swept.list.String()).
 				Msg("removed expired CIDR")
 		}
-		done()
+		var dnsExpiryErr error
+		if state.dnsSink != nil {
+			dnsExpiryErr = state.dnsSink.Expire(now)
+			if dnsExpiryErr != nil {
+				dnsExpiryErr = errors.Join(dnsExpiryErr, state.dnsSink.FailClosedIfAmbiguous(dnsExpiryErr))
+			}
+		}
+		if finishErr := s.finishDNSMutation(state, done, dnsExpiryErr); finishErr != nil {
+			s.logger.Warn().Err(finishErr).Str("id", id).Msg("failed to expire DNS exact-tier ownership; will retry or remain quarantined")
+		}
 	}
 }
 
@@ -1493,6 +1541,7 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (resp *ap
 	var (
 		ebpfFilter filter.Filter
 		dnsServer  *DNSServer
+		dnsSink    *dnsFilterSink
 		ttls       = newTTLRegistry()
 		rowSaved   bool
 		registered *attachmentState
@@ -1552,12 +1601,13 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (resp *ap
 		retainDegraded := func(retainedFilter filter.Filter) {
 			s.mu.Lock()
 			if ownedState == nil {
-				ownedState = &attachmentState{info: attachment, dns: dnsServer, filter: retainedFilter, ttls: ttls, mutationsClosed: true}
+				ownedState = &attachmentState{info: attachment, dns: dnsServer, dnsSink: dnsSink, filter: retainedFilter, ttls: ttls, mutationsClosed: true}
 				s.attachments[id] = ownedState
 			} else {
 				ownedState.info.Mode = attachment.Mode
 				ownedState.info.CleanupNeeded = true
 				ownedState.dns = dnsServer
+				ownedState.dnsSink = dnsSink
 				ownedState.filter = retainedFilter
 			}
 			ownedState.cleanupNeeded = true
@@ -1727,8 +1777,11 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (resp *ap
 	if cpClient := s.cpClient.Load(); cpClient != nil {
 		proxyFunc = cpClient.MakeProxyFunc(id)
 	}
-	sink := s.newDNSFilterSink(id, ebpfFilter, ttls)
-	dnsServer = NewDNSServer(id, dnsAddr, s.defaultDNSUpstream, s.logger, sink, proxyFunc)
+	dnsSink, err = s.newDNSFilterSink(id, ebpfFilter)
+	if err != nil {
+		return nil, fmt.Errorf("initializing DNS exact-tier ownership: %w", err)
+	}
+	dnsServer = NewDNSServer(id, dnsAddr, s.defaultDNSUpstream, s.logger, dnsSink, proxyFunc, dnsSink.LimitCeilings())
 	if err := s.bindDNSServer(dnsServer); err != nil {
 		return nil, fmt.Errorf("binding DNS server: %w", err)
 	}
@@ -1751,7 +1804,7 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (resp *ap
 	}
 	rowSaved = true
 
-	state := &attachmentState{info: attachment, dns: dnsServer, filter: ebpfFilter, ttls: ttls, setupDone: make(chan struct{})}
+	state := &attachmentState{info: attachment, dns: dnsServer, dnsSink: dnsSink, filter: ebpfFilter, ttls: ttls, setupDone: make(chan struct{})}
 	s.mu.Lock()
 	if s.stopping {
 		s.mu.Unlock()
@@ -2292,6 +2345,9 @@ func (s *Server) readAttachmentStats(id string) (attachmentStatsSnapshot, bool) 
 	if state.ttls != nil {
 		snapshot.mapFullDrops = state.ttls.mapFullCount()
 	}
+	if state.dnsSink != nil {
+		snapshot.mapFullDrops += state.dnsSink.CapacityDropCount()
+	}
 	return snapshot, true
 }
 
@@ -2311,13 +2367,15 @@ func (s *Server) SetDnsMode(id string, mode apiv1.DnsMode) error {
 	if err != nil {
 		return err
 	}
-	defer done()
-	return s.setDNSModeAdmitted(id, state, mode)
+	err = s.setDNSModeAdmitted(id, state, mode)
+	return s.finishDNSMutation(state, done, err)
 }
 
 func (s *Server) setDNSModeAdmitted(id string, state *attachmentState, mode apiv1.DnsMode) error {
 	if state.dns != nil {
-		state.dns.SetMode(mode)
+		if err := state.dns.SetMode(mode); err != nil {
+			return err
+		}
 	}
 
 	s.mu.Lock()
@@ -2340,11 +2398,11 @@ func (s *Server) AllowDomain(id string, domain string, includeSubdomains bool) e
 	if err != nil {
 		return err
 	}
-	defer done()
+	var mutationErr error
 	if state.dns != nil {
-		state.dns.AllowDomain(domain, includeSubdomains)
+		mutationErr = state.dns.AllowDomain(domain, includeSubdomains)
 	}
-	return nil
+	return s.finishDNSMutation(state, done, mutationErr)
 }
 
 func (s *Server) DenyDomain(id string, domain string, includeSubdomains bool) error {
@@ -2352,11 +2410,11 @@ func (s *Server) DenyDomain(id string, domain string, includeSubdomains bool) er
 	if err != nil {
 		return err
 	}
-	defer done()
+	var mutationErr error
 	if state.dns != nil {
-		state.dns.DenyDomain(domain, includeSubdomains)
+		mutationErr = state.dns.DenyDomain(domain, includeSubdomains)
 	}
-	return nil
+	return s.finishDNSMutation(state, done, mutationErr)
 }
 
 func (s *Server) RemoveDomain(id string, domain string) error {
@@ -2364,11 +2422,11 @@ func (s *Server) RemoveDomain(id string, domain string) error {
 	if err != nil {
 		return err
 	}
-	defer done()
+	var mutationErr error
 	if state.dns != nil {
-		state.dns.RemoveDomain(domain)
+		mutationErr = state.dns.RemoveDomain(domain)
 	}
-	return nil
+	return s.finishDNSMutation(state, done, mutationErr)
 }
 
 func (s *Server) ReplaceDNSRules(id string, mode apiv1.DnsMode, allowDomains, denyDomains []*apiv1.DomainEntry, upstreamOverride ...[]string) error {
@@ -2382,17 +2440,52 @@ func (s *Server) ReplaceDNSRules(id string, mode apiv1.DnsMode, allowDomains, de
 	if len(upstreamOverride) == 1 {
 		upstreamServers = upstreamOverride[0]
 	}
+	ceilings, err := s.dnsLimitCeilingsForAttachment(id)
+	if err != nil {
+		return err
+	}
+	prepared, err := prepareDNSRules(mode, allowDomains, denyDomains, upstreamServers,
+		s.defaultDNSUpstream, ceilings, dnsAdmissionLimitOverrides{})
+	if err != nil {
+		return err
+	}
 	state, done, err := s.beginAttachmentMutation(id)
 	if err != nil {
 		return err
 	}
-	defer done()
-	return s.replaceDNSRulesAdmitted(id, state, mode, allowDomains, denyDomains, upstreamServers)
+	err = s.replaceDNSPreparedAdmitted(id, state, prepared)
+	return s.finishDNSMutation(state, done, err)
 }
 
 func (s *Server) replaceDNSRulesAdmitted(id string, state *attachmentState, mode apiv1.DnsMode, allowDomains, denyDomains []*apiv1.DomainEntry, upstreamServers []string) error {
+	ceilings := s.dnsAdmissionCeilings
+	if state != nil && state.dns != nil {
+		ceilings = state.dns.limitCeilings
+	}
+	prepared, err := prepareDNSRules(mode, allowDomains, denyDomains, upstreamServers,
+		s.defaultDNSUpstream, ceilings, dnsAdmissionLimitOverrides{})
+	if err != nil {
+		return err
+	}
+	return s.replaceDNSPreparedAdmitted(id, state, prepared)
+}
+
+func (s *Server) dnsLimitCeilingsForAttachment(id string) (dnsAdmissionLimits, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	state := s.attachments[id]
+	if state == nil || state.cleanupNeeded || state.mutationsClosed {
+		return dnsAdmissionLimits{}, fmt.Errorf("attachment not found or unavailable: %s", id)
+	}
+	if state.dns == nil {
+		return s.dnsAdmissionCeilings, nil
+	}
+	return state.dns.limitCeilings, nil
+}
+
+func (s *Server) replaceDNSPreparedAdmitted(id string, state *attachmentState, prepared *preparedDNSRules) error {
 	if state.dns != nil {
-		if err := state.dns.ReplaceRules(mode, allowDomains, denyDomains, upstreamServers); err != nil {
+		if err := state.dns.applyPreparedRules(prepared); err != nil {
 			return err
 		}
 	}
@@ -2402,7 +2495,7 @@ func (s *Server) replaceDNSRulesAdmitted(id string, state *attachmentState, mode
 		s.mu.Unlock()
 		return fmt.Errorf("attachment changed while replacing DNS rules: %s", id)
 	}
-	state.info.DnsMode = mode.String()
+	state.info.DnsMode = prepared.mode.String()
 	attachment := cloneAttachment(state.info)
 	s.mu.Unlock()
 
@@ -2410,6 +2503,14 @@ func (s *Server) replaceDNSRulesAdmitted(id string, state *attachmentState, mode
 		return fmt.Errorf("saving DNS rules: %w", err)
 	}
 	return nil
+}
+
+func (s *Server) finishDNSMutation(state *attachmentState, done func(), mutationErr error) error {
+	done()
+	if mutationErr == nil || !errors.Is(mutationErr, filter.ErrDNSAllowRollback) || state == nil || state.dnsSink == nil {
+		return mutationErr
+	}
+	return errors.Join(mutationErr, state.dnsSink.QuarantineAmbiguity(mutationErr))
 }
 
 func (s *Server) ClearRules(id string) error {
@@ -2420,9 +2521,10 @@ func (s *Server) ClearRules(id string) error {
 	defer done()
 
 	// Clearing goes through the TTL registry and delta-removes every ordinary
-	// CP/DNS-owned entry. It deliberately never invokes Filter.ClearRules:
+	// control-plane LPM entry. It deliberately never invokes Filter.ClearRules:
 	// the system-owned DNS bootstrap route must remain reachable, while failed
-	// removals stay tracked for a later retry instead of being forgotten.
+	// removals stay tracked for a later retry instead of being forgotten. DNS
+	// exact ownership is independent and changes only with DNS policy/TTL.
 	return reg.clear(ebpfFilter)
 }
 
@@ -2521,9 +2623,11 @@ func (s *Server) RemoveDeniedCIDR(id string, cidr *net.IPNet) error {
 //     churn (e.g. stale allow entries that would otherwise sit live at a
 //     later flip back) is harmless.
 //
-// DNS-populated entries absent from the declared set stay in the filter
-// until their own DNS TTL lapses. Per-CIDR failures (e.g. map-full) are
-// aggregated, not aborting the rest of the reconcile.
+// This CIDR-only operation does not mutate DNS exact ownership. A full
+// BulkUpdate follows it with authoritative DNS reconciliation, which remaps
+// still-authorized owners and promptly removes blocked/provisional exact keys.
+// Per-CIDR failures (e.g. map-full) are aggregated, not aborting the rest of
+// the reconcile.
 func (s *Server) ReconcileCIDRs(id string, mode apiv1.PolicyMode, allow, deny []parsedCIDR) error {
 	if err := validatePolicyMode(mode); err != nil {
 		return err

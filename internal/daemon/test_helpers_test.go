@@ -19,30 +19,41 @@ import (
 const testDNSBootstrapCIDR = "127.0.0.1/32"
 
 type fakeFilter struct {
-	mu                  sync.Mutex
-	mode                filter.PolicyMode
-	allowed             []string
-	denied              []string
-	dnsAllowed          []string
-	clearCalls          int
-	stats               filter.Stats
-	setModeCalls        int
-	allowCalls          int
-	closeCalls          int
-	detachCalls         int
-	setModeErr          error
-	closeErr            error
-	detachErr           error
-	detachErrs          []error
-	allowErr            error // when set, AllowIP fails with this error
-	denyErr             error
-	rulesErr            error // when set, adopted-map inventory fails
-	removeAllowErr      error
-	removeDenyErr       error
-	setModeEntered      chan struct{}
-	setModeRelease      <-chan struct{}
-	setModeOnce         sync.Once
-	mutationsAfterClose int
+	mu                   sync.Mutex
+	mode                 filter.PolicyMode
+	allowed              []string
+	denied               []string
+	dnsAllowed           []string
+	dnsAddCalls          int
+	dnsRemoveCalls       int
+	dnsAddErr            error
+	dnsRemoveErr         error
+	dnsCapacity4         uint32
+	dnsCapacity6         uint32
+	dnsListOverride      []net.IP
+	dnsOccupancyOverride *filter.DNSAllowOccupancy
+	dnsAddEntered        chan struct{}
+	dnsAddRelease        <-chan struct{}
+	dnsAddOnce           sync.Once
+	clearCalls           int
+	stats                filter.Stats
+	setModeCalls         int
+	allowCalls           int
+	closeCalls           int
+	detachCalls          int
+	setModeErr           error
+	closeErr             error
+	detachErr            error
+	detachErrs           []error
+	allowErr             error // when set, AllowIP fails with this error
+	denyErr              error
+	rulesErr             error // when set, adopted-map inventory fails
+	removeAllowErr       error
+	removeDenyErr        error
+	setModeEntered       chan struct{}
+	setModeRelease       <-chan struct{}
+	setModeOnce          sync.Once
+	mutationsAfterClose  int
 	// removedAllowed/removedDenied record every Remove call (even for CIDRs
 	// not present, mirroring the real filter's idempotent removes), so tests
 	// can prove a surviving rule was NEVER removed during a transition.
@@ -179,25 +190,71 @@ func (f *fakeFilter) RemoveDeniedIP(cidr *net.IPNet) error {
 
 func (f *fakeFilter) AddDNSAllowedIPs(ips []net.IP) error {
 	f.mu.Lock()
+	entered, release := f.dnsAddEntered, f.dnsAddRelease
+	f.mu.Unlock()
+	if entered != nil {
+		f.dnsAddOnce.Do(func() { close(entered) })
+	}
+	if release != nil {
+		<-release
+	}
+	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.dnsAddCalls++
+	if f.dnsAddErr != nil {
+		return f.dnsAddErr
+	}
 	for _, ip := range ips {
 		f.dnsAllowed = appendUnique(f.dnsAllowed, ip.String())
 	}
 	return nil
 }
 
+func (f *fakeFilter) dnsSnapshot() ([]string, int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.dnsAllowed...), f.dnsAddCalls
+}
+
+// resetDNSAllowedForBenchmark clears only the fake kernel exact-map snapshot.
+// It intentionally retains the backing allocation and cumulative call counts
+// so cold-query benchmarks can reset physical state without measuring fixture
+// reconstruction or weakening their one-add-per-query postcondition.
+func (f *fakeFilter) resetDNSAllowedForBenchmark() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.dnsAllowed = f.dnsAllowed[:0]
+}
+
 func (f *fakeFilter) RemoveDNSAllowedIPs(ips []net.IP) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.dnsRemoveCalls++
+	if f.dnsRemoveErr != nil {
+		return f.dnsRemoveErr
+	}
 	for _, ip := range ips {
 		f.dnsAllowed = removeString(f.dnsAllowed, ip.String())
 	}
 	return nil
 }
 
+func (f *fakeFilter) dnsRemoveCallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.dnsRemoveCalls
+}
+
 func (f *fakeFilter) DNSAllowedIPs() ([]net.IP, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.dnsListOverride != nil {
+		out := make([]net.IP, len(f.dnsListOverride))
+		for i := range f.dnsListOverride {
+			out[i] = append(net.IP(nil), f.dnsListOverride[i]...)
+		}
+		return out, nil
+	}
 	out := make([]net.IP, 0, len(f.dnsAllowed))
 	for _, raw := range f.dnsAllowed {
 		out = append(out, net.ParseIP(raw))
@@ -208,6 +265,9 @@ func (f *fakeFilter) DNSAllowedIPs() ([]net.IP, error) {
 func (f *fakeFilter) DNSAllowOccupancy() (filter.DNSAllowOccupancy, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.dnsOccupancyOverride != nil {
+		return *f.dnsOccupancyOverride, nil
+	}
 	var out filter.DNSAllowOccupancy
 	for _, raw := range f.dnsAllowed {
 		if net.ParseIP(raw).To4() != nil {
@@ -216,8 +276,14 @@ func (f *fakeFilter) DNSAllowOccupancy() (filter.DNSAllowOccupancy, error) {
 			out.IPv6Entries++
 		}
 	}
-	out.IPv4Capacity = ^uint32(0)
-	out.IPv6Capacity = ^uint32(0)
+	out.IPv4Capacity = f.dnsCapacity4
+	if out.IPv4Capacity == 0 {
+		out.IPv4Capacity = ^uint32(0)
+	}
+	out.IPv6Capacity = f.dnsCapacity6
+	if out.IPv6Capacity == 0 {
+		out.IPv6Capacity = ^uint32(0)
+	}
 	return out, nil
 }
 
@@ -416,10 +482,11 @@ func newTestServerWithAttachment(t testing.TB) (*Server, *store.Store, string, *
 
 	ff := &fakeFilter{}
 	reg := newTTLRegistry()
-	sink := server.newDNSFilterSink(id, ff, reg)
-	dnsServer := NewDNSServer(id, attachment.DnsAddress, cfg.DNS.Upstream, zerolog.Nop(), sink, nil)
+	sink, err := server.newDNSFilterSink(id, ff)
+	require.NoError(t, err)
+	dnsServer := NewDNSServer(id, attachment.DnsAddress, cfg.DNS.Upstream, zerolog.Nop(), sink, nil, sink.LimitCeilings())
 	server.mu.Lock()
-	server.attachments[id] = &attachmentState{info: attachment, dns: dnsServer, filter: ff, ttls: reg}
+	server.attachments[id] = &attachmentState{info: attachment, dns: dnsServer, dnsSink: sink, filter: ff, ttls: reg}
 	server.targetIndex[attachment.Target] = id
 	server.portPool[12000] = true
 	server.mu.Unlock()

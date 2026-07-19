@@ -16,6 +16,7 @@ import (
 	"github.com/miekg/dns"
 	"github.com/rs/zerolog"
 
+	"github.com/danthegoodman1/netfence/pkg/filter"
 	apiv1 "github.com/danthegoodman1/netfence/v1"
 )
 
@@ -25,6 +26,12 @@ type DnsProxyFunc func(ctx context.Context, domain, queryType string) (DnsProxyD
 const defaultDNSTTLSeconds uint32 = 300
 
 const dnsExchangeTimeout = 5 * time.Second
+
+// A query holds the policy generation read lease through WriteMsg so a rule
+// replacement cannot remove its exact admission before the answer is handed
+// to the workload. Bound TCP reads/writes so a stalled local client cannot
+// indefinitely delay policy reconciliation or attachment teardown.
+const dnsClientIOTimeout = 5 * time.Second
 
 const maxDNSUpstreams = 8
 
@@ -56,6 +63,9 @@ type DNSServer struct {
 	allowedDomains map[string]bool // domain -> includeSubdomains
 	deniedDomains  map[string]bool // domain -> includeSubdomains
 	upstreams      []string
+	generation     uint64
+	limits         dnsAdmissionLimits
+	limitCeilings  dnsAdmissionLimits
 
 	serverMu      sync.Mutex
 	udp           *dns.Server
@@ -79,14 +89,18 @@ type DNSServer struct {
 	queriesErrors  atomic.Uint64
 }
 
-func NewDNSServer(attachmentID, listenAddr, upstream string, logger zerolog.Logger, sink DNSFilterSink, proxyFunc DnsProxyFunc) *DNSServer {
+func NewDNSServer(attachmentID, listenAddr, upstream string, logger zerolog.Logger, sink DNSFilterSink, proxyFunc DnsProxyFunc, limitCeilings ...dnsAdmissionLimits) *DNSServer {
 	upstreams, err := normalizeUpstreamServers(nil, upstream)
 	if err != nil {
 		// Production validates the daemon-global fallback before constructing
 		// attachments. Keep invalid direct-test values fail-closed at query time.
 		upstreams = []string{upstream}
 	}
-	return &DNSServer{
+	ceilings := resolveDNSAdmissionCeilings(0, dnsAdmissionLimitOverrides{})
+	if len(limitCeilings) != 0 {
+		ceilings = limitCeilings[0]
+	}
+	server := &DNSServer{
 		attachmentID:    attachmentID,
 		listenAddr:      listenAddr,
 		defaultUpstream: upstream,
@@ -97,7 +111,14 @@ func NewDNSServer(attachmentID, listenAddr, upstream string, logger zerolog.Logg
 		allowedDomains:  make(map[string]bool),
 		deniedDomains:   make(map[string]bool),
 		upstreams:       upstreams,
+		generation:      1,
+		limits:          ceilings,
+		limitCeilings:   ceilings,
 	}
+	if concrete, ok := sink.(*dnsFilterSink); ok {
+		concrete.bindDNS(server)
+	}
+	return server
 }
 
 // Bind reserves both UDP and TCP on the same concrete address without serving
@@ -165,15 +186,19 @@ func (s *DNSServer) Serve() error {
 	s.running = true
 	s.queryCtx, s.cancelQueries = context.WithCancel(context.Background())
 	s.udp = &dns.Server{
-		PacketConn: s.udpConn,
-		Handler:    dns.HandlerFunc(s.handleDNS),
+		PacketConn:   &dnsWriteDeadlinePacketConn{PacketConn: s.udpConn, timeout: dnsClientIOTimeout},
+		Handler:      dns.HandlerFunc(s.handleDNS),
+		ReadTimeout:  dnsClientIOTimeout,
+		WriteTimeout: dnsClientIOTimeout,
 		NotifyStartedFunc: func() {
 			events <- dnsServeEvent{network: "udp", started: true}
 		},
 	}
 	s.tcp = &dns.Server{
-		Listener: s.tcpLn,
-		Handler:  dns.HandlerFunc(s.handleDNS),
+		Listener:     &dnsWriteDeadlineListener{Listener: s.tcpLn, timeout: dnsClientIOTimeout},
+		Handler:      dns.HandlerFunc(s.handleDNS),
+		ReadTimeout:  dnsClientIOTimeout,
+		WriteTimeout: dnsClientIOTimeout,
 		NotifyStartedFunc: func() {
 			events <- dnsServeEvent{network: "tcp", started: true}
 		},
@@ -199,6 +224,49 @@ func (s *DNSServer) Serve() error {
 	}
 	s.logger.Info().Str("udp", udpAddr).Str("tcp", tcpAddr).Msg("started DNS server")
 	return nil
+}
+
+type dnsWriteDeadlinePacketConn struct {
+	net.PacketConn
+	timeout time.Duration
+	mu      sync.Mutex
+}
+
+func (c *dnsWriteDeadlinePacketConn) WriteTo(payload []byte, addr net.Addr) (int, error) {
+	// UDP handlers share one PacketConn. Serialize the connection-wide
+	// deadline with its write so another response cannot extend or clear the
+	// bound while this response holds a DNS policy read lease.
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.SetWriteDeadline(time.Now().Add(c.timeout)); err != nil {
+		return 0, err
+	}
+	return c.PacketConn.WriteTo(payload, addr)
+}
+
+type dnsWriteDeadlineListener struct {
+	net.Listener
+	timeout time.Duration
+}
+
+func (l *dnsWriteDeadlineListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return &dnsWriteDeadlineConn{Conn: conn, timeout: l.timeout}, nil
+}
+
+type dnsWriteDeadlineConn struct {
+	net.Conn
+	timeout time.Duration
+}
+
+func (c *dnsWriteDeadlineConn) Write(payload []byte) (int, error) {
+	if err := c.SetWriteDeadline(time.Now().Add(c.timeout)); err != nil {
+		return 0, err
+	}
+	return c.Conn.Write(payload)
 }
 
 func (s *DNSServer) Start() error {
@@ -361,36 +429,249 @@ func (s *DNSServer) Err() error {
 	return s.fatalErr
 }
 
-func (s *DNSServer) SetMode(mode apiv1.DnsMode) {
+type preparedDNSRules struct {
+	mode           apiv1.DnsMode
+	allowedDomains map[string]bool
+	deniedDomains  map[string]bool
+	policyDomains  map[string]struct{}
+	upstreams      []string
+	limits         dnsAdmissionLimits
+}
+
+func prepareDNSRules(mode apiv1.DnsMode, allowDomains, denyDomains []*apiv1.DomainEntry, upstreamServers []string, fallback string, ceilings dnsAdmissionLimits, overrides dnsAdmissionLimitOverrides) (*preparedDNSRules, error) {
+	if err := validateDNSMode(mode); err != nil {
+		return nil, err
+	}
+	upstreams, err := normalizeUpstreamServers(upstreamServers, fallback)
+	if err != nil {
+		return nil, err
+	}
+	limits, err := ceilings.resolve(overrides)
+	if err != nil {
+		return nil, err
+	}
+	prepared := &preparedDNSRules{
+		mode:           mode,
+		allowedDomains: make(map[string]bool, len(allowDomains)),
+		deniedDomains:  make(map[string]bool, len(denyDomains)),
+		policyDomains:  make(map[string]struct{}, len(allowDomains)+len(denyDomains)),
+		upstreams:      upstreams,
+		limits:         limits,
+	}
+	if err := addPreparedDomains(prepared.allowedDomains, prepared.policyDomains, allowDomains, "allow"); err != nil {
+		return nil, err
+	}
+	if err := addPreparedDomains(prepared.deniedDomains, prepared.policyDomains, denyDomains, "deny"); err != nil {
+		return nil, err
+	}
+	if uint64(len(prepared.policyDomains)) > uint64(limits.maxTrackedDomains) {
+		return nil, fmt.Errorf("DNS policy contains %d unique domains, total tracked-domain limit is %d", len(prepared.policyDomains), limits.maxTrackedDomains)
+	}
+	return prepared, nil
+}
+
+func addPreparedDomains(dst map[string]bool, all map[string]struct{}, entries []*apiv1.DomainEntry, list string) error {
+	for i, entry := range entries {
+		if entry == nil {
+			return fmt.Errorf("DNS %s domain entry %d is nil", list, i)
+		}
+		normalized, err := validateAndNormalizeDomain(entry.Domain)
+		if err != nil {
+			return fmt.Errorf("invalid DNS %s domain %d: %w", list, i, err)
+		}
+		if _, duplicate := dst[normalized]; duplicate {
+			return fmt.Errorf("duplicate canonical DNS %s domain %q", list, normalized)
+		}
+		dst[normalized] = entry.IncludeSubdomains
+		all[normalized] = struct{}{}
+	}
+	return nil
+}
+
+func dnsLimitOverridesFromProto(cfg *apiv1.DnsConfig) dnsAdmissionLimitOverrides {
+	if cfg == nil {
+		return dnsAdmissionLimitOverrides{}
+	}
+	return dnsAdmissionLimitOverrides{
+		maxIPsPerFamily:       cfg.MaxIpsPerFamily,
+		maxIPsPerResponse:     cfg.MaxIpsPerResponse,
+		maxIPsPerPolicyDomain: cfg.MaxIpsPerPolicyDomain,
+		maxTrackedDomains:     cfg.MaxTrackedDomains,
+		maxOwnershipEdges:     cfg.MaxOwnershipEdges,
+	}
+}
+
+func (s *DNSServer) prepareConfig(cfg *apiv1.DnsConfig) (*preparedDNSRules, error) {
+	if cfg == nil {
+		cfg = &apiv1.DnsConfig{Mode: apiv1.DnsMode_DNS_MODE_DISABLED}
+	}
+	return prepareDNSRules(cfg.Mode, cfg.AllowDomains, cfg.DenyDomains, cfg.UpstreamServers,
+		s.defaultUpstream, s.limitCeilings, dnsLimitOverridesFromProto(cfg))
+}
+
+func (s *DNSServer) applyPreparedRules(prepared *preparedDNSRules) error {
+	if prepared == nil {
+		return fmt.Errorf("prepared DNS rules are nil")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.sink != nil {
+		if err := s.sink.ValidateLimits(prepared.limits); err != nil {
+			return err
+		}
+		resolver := ownershipResolver(prepared.mode, prepared.allowedDomains, prepared.deniedDomains)
+		if err := s.sink.ReconcilePolicy(prepared.limits, prepared.policyDomains, resolver, true); err != nil {
+			return errors.Join(err, s.sink.FailClosedIfAmbiguous(err))
+		}
+	}
+	s.mode = prepared.mode
+	s.allowedDomains = cloneDomainRules(prepared.allowedDomains)
+	s.deniedDomains = cloneDomainRules(prepared.deniedDomains)
+	s.upstreams = append([]string(nil), prepared.upstreams...)
+	s.limits = prepared.limits
+	s.generation++
+	s.logger.Debug().Str("mode", prepared.mode.String()).Uint64("generation", s.generation).Msg("DNS rules replaced")
+	return nil
+}
+
+func (s *DNSServer) preflightPreparedRules(prepared *preparedDNSRules) error {
+	if prepared == nil {
+		return fmt.Errorf("prepared DNS rules are nil")
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.sink == nil {
+		return nil
+	}
+	resolver := ownershipResolver(prepared.mode, prepared.allowedDomains, prepared.deniedDomains)
+	return s.sink.PreflightPolicy(prepared.limits, prepared.policyDomains, resolver, true)
+}
+
+func cloneDomainRules(rules map[string]bool) map[string]bool {
+	clone := make(map[string]bool, len(rules))
+	for domain, subdomains := range rules {
+		clone[domain] = subdomains
+	}
+	return clone
+}
+
+func (s *DNSServer) currentConfigLocked() *apiv1.DnsConfig {
+	cfg := &apiv1.DnsConfig{
+		Mode:                  s.mode,
+		UpstreamServers:       append([]string(nil), s.upstreams...),
+		MaxIpsPerFamily:       s.limits.maxIPsPerFamily,
+		MaxIpsPerResponse:     s.limits.maxIPsPerResponse,
+		MaxIpsPerPolicyDomain: s.limits.maxIPsPerPolicyDomain,
+		MaxTrackedDomains:     s.limits.maxTrackedDomains,
+		MaxOwnershipEdges:     s.limits.maxOwnershipEdges,
+	}
+	for domain, include := range s.allowedDomains {
+		cfg.AllowDomains = append(cfg.AllowDomains, &apiv1.DomainEntry{Domain: domain, IncludeSubdomains: include})
+	}
+	for domain, include := range s.deniedDomains {
+		cfg.DenyDomains = append(cfg.DenyDomains, &apiv1.DomainEntry{Domain: domain, IncludeSubdomains: include})
+	}
+	sort.Slice(cfg.AllowDomains, func(i, j int) bool { return cfg.AllowDomains[i].Domain < cfg.AllowDomains[j].Domain })
+	sort.Slice(cfg.DenyDomains, func(i, j int) bool { return cfg.DenyDomains[i].Domain < cfg.DenyDomains[j].Domain })
+	return cfg
+}
+
+func (s *DNSServer) mutateConfig(mut func(*apiv1.DnsConfig) error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cfg := s.currentConfigLocked()
+	if err := mut(cfg); err != nil {
+		return err
+	}
+	prepared, err := s.prepareConfig(cfg)
+	if err != nil {
+		return err
+	}
+	if s.sink != nil {
+		resolver := ownershipResolver(prepared.mode, prepared.allowedDomains, prepared.deniedDomains)
+		if err := s.sink.ReconcilePolicy(prepared.limits, prepared.policyDomains, resolver, false); err != nil {
+			return errors.Join(err, s.sink.FailClosedIfAmbiguous(err))
+		}
+	}
+	s.mode = prepared.mode
+	s.allowedDomains = prepared.allowedDomains
+	s.deniedDomains = prepared.deniedDomains
+	s.upstreams = prepared.upstreams
+	s.limits = prepared.limits
+	s.generation++
+	return nil
+}
+
+func (s *DNSServer) SetMode(mode apiv1.DnsMode) error {
+	return s.mutateConfig(func(cfg *apiv1.DnsConfig) error {
+		cfg.Mode = mode
+		return nil
+	})
+}
+
+// setModeForRestore holds a restored filtering resolver in empty ALLOWLIST
+// without treating that local safety posture as authoritative reconciliation;
+// in particular it preserves provisional exact keys until the CP ack arrives.
+func (s *DNSServer) setModeForRestore(mode apiv1.DnsMode) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.mode = mode
-	s.logger.Debug().Str("mode", mode.String()).Msg("DNS mode changed")
+	s.generation++
 }
 
-func (s *DNSServer) AllowDomain(domain string, includeSubdomains bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	normalized := normalizeDomain(domain)
-	s.allowedDomains[normalized] = includeSubdomains
-	s.logger.Debug().Str("domain", domain).Bool("subdomains", includeSubdomains).Msg("domain added to allowlist")
+func (s *DNSServer) AllowDomain(domain string, includeSubdomains bool) error {
+	normalized, err := validateAndNormalizeDomain(domain)
+	if err != nil {
+		return err
+	}
+	return s.mutateConfig(func(cfg *apiv1.DnsConfig) error {
+		cfg.AllowDomains = upsertDomainEntry(cfg.AllowDomains, normalized, includeSubdomains)
+		return nil
+	})
 }
 
-func (s *DNSServer) DenyDomain(domain string, includeSubdomains bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	normalized := normalizeDomain(domain)
-	s.deniedDomains[normalized] = includeSubdomains
-	s.logger.Debug().Str("domain", domain).Bool("subdomains", includeSubdomains).Msg("domain added to denylist")
+func (s *DNSServer) DenyDomain(domain string, includeSubdomains bool) error {
+	normalized, err := validateAndNormalizeDomain(domain)
+	if err != nil {
+		return err
+	}
+	return s.mutateConfig(func(cfg *apiv1.DnsConfig) error {
+		cfg.DenyDomains = upsertDomainEntry(cfg.DenyDomains, normalized, includeSubdomains)
+		return nil
+	})
 }
 
-func (s *DNSServer) RemoveDomain(domain string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	normalized := normalizeDomain(domain)
-	delete(s.allowedDomains, normalized)
-	delete(s.deniedDomains, normalized)
-	s.logger.Debug().Str("domain", domain).Msg("domain removed from rules")
+func upsertDomainEntry(entries []*apiv1.DomainEntry, normalized string, includeSubdomains bool) []*apiv1.DomainEntry {
+	for _, entry := range entries {
+		if entry.Domain == normalized {
+			entry.Domain = normalized
+			entry.IncludeSubdomains = includeSubdomains
+			return entries
+		}
+	}
+	return append(entries, &apiv1.DomainEntry{Domain: normalized, IncludeSubdomains: includeSubdomains})
+}
+
+func (s *DNSServer) RemoveDomain(domain string) error {
+	normalized, err := validateAndNormalizeDomain(domain)
+	if err != nil {
+		return err
+	}
+	return s.mutateConfig(func(cfg *apiv1.DnsConfig) error {
+		cfg.AllowDomains = removeDomainEntry(cfg.AllowDomains, normalized)
+		cfg.DenyDomains = removeDomainEntry(cfg.DenyDomains, normalized)
+		return nil
+	})
+}
+
+func removeDomainEntry(entries []*apiv1.DomainEntry, normalized string) []*apiv1.DomainEntry {
+	result := entries[:0]
+	for _, entry := range entries {
+		if entry.Domain != normalized {
+			result = append(result, entry)
+		}
+	}
+	return result
 }
 
 func (s *DNSServer) ReplaceRules(mode apiv1.DnsMode, allowDomains, denyDomains []*apiv1.DomainEntry, upstreamOverride ...[]string) error {
@@ -401,35 +682,85 @@ func (s *DNSServer) ReplaceRules(mode apiv1.DnsMode, allowDomains, denyDomains [
 	if len(upstreamOverride) == 1 {
 		upstreamServers = upstreamOverride[0]
 	}
-	upstreams, err := normalizeUpstreamServers(upstreamServers, s.defaultUpstream)
+	prepared, err := prepareDNSRules(mode, allowDomains, denyDomains, upstreamServers,
+		s.defaultUpstream, s.limitCeilings, dnsAdmissionLimitOverrides{})
 	if err != nil {
 		return err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.mode = mode
-	s.allowedDomains = make(map[string]bool, len(allowDomains))
-	s.deniedDomains = make(map[string]bool, len(denyDomains))
-	for _, entry := range allowDomains {
-		if entry == nil {
-			continue
-		}
-		s.allowedDomains[normalizeDomain(entry.Domain)] = entry.IncludeSubdomains
-	}
-	for _, entry := range denyDomains {
-		if entry == nil {
-			continue
-		}
-		s.deniedDomains[normalizeDomain(entry.Domain)] = entry.IncludeSubdomains
-	}
-	s.upstreams = upstreams
-	s.logger.Debug().Str("mode", mode.String()).Msg("DNS rules replaced")
-	return nil
+	return s.applyPreparedRules(prepared)
 }
 
 func (s *DNSServer) Stats() (allowed, blocked, queryErrors uint64) {
 	return s.queriesAllowed.Load(), s.queriesBlocked.Load(), s.queriesErrors.Load()
+}
+
+type dnsQuerySnapshot struct {
+	generation  uint64
+	mode        apiv1.DnsMode
+	queryDomain string
+	owner       dnsPolicyOwner
+	upstreams   []string
+	shouldAdmit bool
+	proxyFunc   DnsProxyFunc
+	blocked     bool
+}
+
+func (s dnsQuerySnapshot) canonicalAdmission(records []dnsAdmissionRecord) dnsCanonicalAdmissionRequest {
+	return dnsCanonicalAdmissionRequest{
+		queryDomain: dnsCanonicalDomain(s.queryDomain),
+		owner: dnsCanonicalPolicyOwner{
+			kind:   s.owner.kind,
+			domain: dnsCanonicalDomain(s.owner.domain),
+		},
+		records: records,
+	}
+}
+
+func (s *DNSServer) snapshotQuery(domain string) (dnsQuerySnapshot, bool, error) {
+	normalized, err := validateAndNormalizeDomain(domain)
+	if err != nil {
+		return dnsQuerySnapshot{}, false, err
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	snapshot := dnsQuerySnapshot{
+		generation:  s.generation,
+		mode:        s.mode,
+		queryDomain: normalized,
+		upstreams:   append([]string(nil), s.upstreams...),
+		proxyFunc:   s.proxyFunc,
+	}
+	switch s.mode {
+	case apiv1.DnsMode_DNS_MODE_DISABLED:
+		return snapshot, true, nil
+	case apiv1.DnsMode_DNS_MODE_ALLOWLIST:
+		decision, owner := evaluateCanonicalDomainRules(normalized, s.allowedDomains, s.deniedDomains)
+		if decision != domainDecisionAllow {
+			snapshot.blocked = true
+			return snapshot, false, nil
+		}
+		snapshot.owner = dnsPolicyOwner{kind: dnsOwnerRule, domain: owner}
+		snapshot.shouldAdmit = true
+		return snapshot, true, nil
+	case apiv1.DnsMode_DNS_MODE_DENYLIST:
+		decision, owner := evaluateCanonicalDomainRules(normalized, s.allowedDomains, s.deniedDomains)
+		if decision == domainDecisionDeny {
+			snapshot.blocked = true
+			return snapshot, false, nil
+		}
+		if decision == domainDecisionAllow {
+			snapshot.owner = dnsPolicyOwner{kind: dnsOwnerRule, domain: owner}
+		} else {
+			snapshot.owner = dnsPolicyOwner{kind: dnsOwnerDenylistDefault, domain: normalized}
+		}
+		snapshot.shouldAdmit = true
+		return snapshot, true, nil
+	case apiv1.DnsMode_DNS_MODE_PROXY:
+		snapshot.owner = dnsPolicyOwner{kind: dnsOwnerProxy, domain: normalized}
+		return snapshot, true, nil
+	default:
+		return snapshot, false, fmt.Errorf("invalid DNS mode %d", s.mode)
+	}
 }
 
 func (s *DNSServer) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
@@ -447,108 +778,234 @@ func (s *DNSServer) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 		queryCtx = context.Background()
 	}
 
-	s.mu.RLock()
-	mode := s.mode
-	upstreams := append([]string(nil), s.upstreams...)
-	shouldResolve := false
-	shouldAddToFilter := false
+	snapshot, shouldResolve, err := s.snapshotQuery(domain)
+	if err != nil {
+		s.logger.Debug().Err(err).Str("domain", domain).Msg("invalid DNS query domain")
+		s.writeOutcome(w, req, servFailResponse(req), dnsOutcomeError)
+		return
+	}
 
-	switch mode {
-	case apiv1.DnsMode_DNS_MODE_DISABLED:
-		s.mu.RUnlock()
-		shouldResolve = true
-
-	case apiv1.DnsMode_DNS_MODE_ALLOWLIST:
-		decision := s.evaluateDomainLocked(domain)
-		s.mu.RUnlock()
-		if decision == domainDecisionAllow {
-			shouldResolve = true
-			shouldAddToFilter = true
-		}
-
-	case apiv1.DnsMode_DNS_MODE_DENYLIST:
-		decision := s.evaluateDomainLocked(domain)
-		s.mu.RUnlock()
-		if decision != domainDecisionDeny {
-			shouldResolve = true
-			shouldAddToFilter = true
-		}
-
-	case apiv1.DnsMode_DNS_MODE_PROXY:
-		proxyFunc := s.proxyFunc
-		s.mu.RUnlock()
-		if proxyFunc == nil {
+	if snapshot.mode == apiv1.DnsMode_DNS_MODE_PROXY {
+		if snapshot.proxyFunc == nil {
 			s.logger.Warn().Str("domain", domain).Msg("DNS proxy unavailable")
 			s.writeOutcome(w, req, servFailResponse(req), dnsOutcomeError)
 			return
 		}
 		queryType := dns.TypeToString[q.Qtype]
-		decision, err := proxyFunc(queryCtx, domain, queryType)
+		// The control plane and local ownership graph must decide policy for
+		// the same identity. Hand off the wire-canonical, lowercase FQDN while
+		// preserving the original question name in the eventual DNS response.
+		decision, err := snapshot.proxyFunc(queryCtx, dns.Fqdn(snapshot.queryDomain), queryType)
 		if err != nil {
 			s.logger.Error().Err(err).Str("domain", domain).Msg("control plane query failed")
 			s.writeOutcome(w, req, servFailResponse(req), dnsOutcomeError)
 			return
 		}
 		if !decision.Allow {
+			snapshot.blocked = true
 			s.logger.Debug().Str("domain", domain).Msg("DNS query blocked by control plane")
-			s.writeOutcome(w, req, refusedResponse(req), dnsOutcomeBlocked)
+			s.writeIfCurrent(w, req, refusedResponse(req), snapshot, dnsOutcomeBlocked)
 			return
 		}
 		shouldResolve = true
-		shouldAddToFilter = decision.AddToFilter
+		snapshot.shouldAdmit = decision.AddToFilter
 		if len(decision.IPs) > 0 {
-			resp, err := s.proxyResponse(req, domain, decision.IPs, decision.AddToFilter, decision.TTLSeconds)
+			resp, err := s.proxyResponse(req, domain, decision.IPs, decision.TTLSeconds)
 			if err != nil {
-				s.logger.Error().Err(err).Str("domain", domain).Msg("proxy override admission failed")
+				s.logger.Error().Err(err).Str("domain", domain).Msg("invalid proxy override response")
 				s.writeOutcome(w, req, servFailResponse(req), dnsOutcomeError)
 				return
 			}
-			s.writeOutcome(w, req, resp, dnsOutcomeAllowed)
+			s.admitAndWrite(w, req, resp, snapshot, dnsOutcomeAllowed)
 			return
 		}
-
-	default:
-		s.mu.RUnlock()
 	}
 
 	if !shouldResolve {
 		s.logger.Debug().Str("domain", domain).Msg("DNS query blocked")
-		s.writeOutcome(w, req, refusedResponse(req), dnsOutcomeBlocked)
+		s.writeIfCurrent(w, req, refusedResponse(req), snapshot, dnsOutcomeBlocked)
 		return
 	}
 
-	resp, err := exchangeUpstreams(queryCtx, req, upstreams)
+	resp, err := exchangeUpstreams(queryCtx, req, snapshot.upstreams)
 	if err != nil {
 		s.logger.Error().Err(err).Str("domain", domain).Msg("upstream DNS query failed")
 		s.writeOutcome(w, req, servFailResponse(req), dnsOutcomeError)
 		return
 	}
-	resp = sanitizeAddressHints(resp, mode)
-
-	if shouldAddToFilter && s.sink != nil && resp.Rcode == dns.RcodeSuccess {
-		for _, section := range [][]dns.RR{resp.Answer, resp.Ns, resp.Extra} {
-			for _, rr := range section {
-				switch a := rr.(type) {
-				case *dns.A:
-					if err := s.addIPToFilter(domain, a.A, 32, a.Hdr.Ttl); err != nil {
-						s.writeOutcome(w, req, servFailResponse(req), dnsOutcomeError)
-						return
-					}
-				case *dns.AAAA:
-					if err := s.addIPToFilter(domain, a.AAAA, 128, a.Hdr.Ttl); err != nil {
-						s.writeOutcome(w, req, servFailResponse(req), dnsOutcomeError)
-						return
-					}
-				}
-			}
-		}
-	}
+	resp = sanitizeAddressHints(resp, snapshot.mode)
 
 	outcome := dnsOutcomeAllowed
 	if resp.Rcode != dns.RcodeSuccess && resp.Rcode != dns.RcodeNameError {
 		outcome = dnsOutcomeError
 	}
+	s.admitAndWrite(w, req, resp, snapshot, outcome)
+}
+
+func (s *DNSServer) writeIfCurrent(w dns.ResponseWriter, req, resp *dns.Msg, snapshot dnsQuerySnapshot, outcome dnsOutcome) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if !s.queryStillCurrentLocked(snapshot) {
+		s.writeOutcome(w, req, servFailResponse(req), dnsOutcomeError)
+		return
+	}
 	s.writeOutcome(w, req, resp, outcome)
+}
+
+func (s *DNSServer) queryStillCurrentLocked(snapshot dnsQuerySnapshot) bool {
+	if s.generation != snapshot.generation || s.mode != snapshot.mode {
+		return false
+	}
+	switch snapshot.mode {
+	case apiv1.DnsMode_DNS_MODE_DISABLED:
+		return true
+	case apiv1.DnsMode_DNS_MODE_ALLOWLIST:
+		decision, owner := evaluateCanonicalDomainRules(snapshot.queryDomain, s.allowedDomains, s.deniedDomains)
+		if snapshot.blocked {
+			return decision != domainDecisionAllow
+		}
+		return decision == domainDecisionAllow && snapshot.owner == (dnsPolicyOwner{kind: dnsOwnerRule, domain: owner})
+	case apiv1.DnsMode_DNS_MODE_DENYLIST:
+		decision, owner := evaluateCanonicalDomainRules(snapshot.queryDomain, s.allowedDomains, s.deniedDomains)
+		if snapshot.blocked {
+			return decision == domainDecisionDeny
+		}
+		if decision == domainDecisionDeny {
+			return false
+		}
+		if decision == domainDecisionAllow {
+			return snapshot.owner == (dnsPolicyOwner{kind: dnsOwnerRule, domain: owner})
+		}
+		return snapshot.owner == (dnsPolicyOwner{kind: dnsOwnerDenylistDefault, domain: snapshot.queryDomain})
+	case apiv1.DnsMode_DNS_MODE_PROXY:
+		if snapshot.blocked {
+			return true
+		}
+		return snapshot.owner == (dnsPolicyOwner{kind: dnsOwnerProxy, domain: snapshot.queryDomain})
+	default:
+		return false
+	}
+}
+
+// admitAndWrite is the linearization point for a filtered DNS response. The
+// attachment barrier is acquired before the DNS policy read lease; generation
+// and winning owner are revalidated; the entire response address set is one
+// exact-tier transaction; and the lease remains held through the bounded
+// WriteMsg. ReplaceRules therefore cannot remove admission before the workload
+// receives the answer.
+func (s *DNSServer) admitAndWrite(w dns.ResponseWriter, req, resp *dns.Msg, snapshot dnsQuerySnapshot, outcome dnsOutcome) {
+	records, err := dnsAdmissionRecords(resp)
+	if err != nil {
+		s.writeOutcome(w, req, servFailResponse(req), dnsOutcomeError)
+		return
+	}
+	if !snapshot.shouldAdmit || len(records) == 0 {
+		s.mu.RLock()
+		if !s.queryStillCurrentLocked(snapshot) {
+			s.mu.RUnlock()
+			s.writeOutcome(w, req, servFailResponse(req), dnsOutcomeError)
+			return
+		}
+		// DISABLED is the explicit pass-through exception. Every filtering
+		// mode must prove address-bearing answers admitted; in particular a
+		// PROXY decision with add_to_filter=false is not such proof.
+		if len(records) != 0 && snapshot.mode != apiv1.DnsMode_DNS_MODE_DISABLED && !snapshot.shouldAdmit {
+			s.writeOutcome(w, req, servFailResponse(req), dnsOutcomeError)
+			s.mu.RUnlock()
+			return
+		}
+		s.writeOutcome(w, req, resp, outcome)
+		s.mu.RUnlock()
+		return
+	}
+	if s.sink == nil {
+		s.writeOutcome(w, req, servFailResponse(req), dnsOutcomeError)
+		return
+	}
+	done, err := s.sink.BeginAdmission()
+	if err != nil {
+		s.writeOutcome(w, req, servFailResponse(req), dnsOutcomeError)
+		return
+	}
+	s.mu.RLock()
+	if !s.queryStillCurrentLocked(snapshot) {
+		s.mu.RUnlock()
+		done()
+		s.writeOutcome(w, req, servFailResponse(req), dnsOutcomeError)
+		return
+	}
+	err = s.sink.AdmitCanonicalResponse(snapshot.canonicalAdmission(records))
+	var failClosedErr error
+	if err != nil {
+		failClosedErr = s.sink.FailClosedIfAmbiguous(err)
+		s.mu.RUnlock()
+		done()
+		if errors.Is(err, filter.ErrDNSAllowRollback) {
+			failClosedErr = errors.Join(failClosedErr, s.sink.QuarantineAmbiguity(err))
+		}
+		admissionErr := errors.Join(err, failClosedErr)
+		if isDNSCapacityError(err) && !errors.Is(err, filter.ErrDNSAllowRollback) {
+			// The production sink owns the rate-limited capacity warning and
+			// cumulative counter. Keep per-query diagnostics below Warn so
+			// sustained resolver pressure cannot bypass that limiter.
+			s.logger.Debug().Err(admissionErr).Str("domain", snapshot.queryDomain).Msg("DNS response admission rejected by bounded capacity")
+		} else {
+			s.logger.Warn().Err(admissionErr).Str("domain", snapshot.queryDomain).Msg("DNS response admission failed")
+		}
+		s.writeOutcome(w, req, servFailResponse(req), dnsOutcomeError)
+		return
+	}
+	s.writeOutcome(w, req, resp, outcome)
+	s.mu.RUnlock()
+	done()
+}
+
+func dnsAdmissionRecords(resp *dns.Msg) ([]dnsAdmissionRecord, error) {
+	var records []dnsAdmissionRecord
+	for _, section := range [][]dns.RR{resp.Answer, resp.Ns, resp.Extra} {
+		for _, rr := range section {
+			switch value := rr.(type) {
+			case *dns.A:
+				if normalizeIP(value.A) == nil {
+					return nil, fmt.Errorf("invalid A address in DNS response")
+				}
+				records = append(records, dnsAdmissionRecord{ip: value.A, ttl: time.Duration(value.Hdr.Ttl) * time.Second})
+			case *dns.AAAA:
+				if normalizeIP(value.AAAA) == nil {
+					return nil, fmt.Errorf("invalid AAAA address in DNS response")
+				}
+				records = append(records, dnsAdmissionRecord{ip: value.AAAA, ttl: time.Duration(value.Hdr.Ttl) * time.Second})
+			}
+		}
+	}
+	return records, nil
+}
+
+// addIPToFilter is retained as an internal test/benchmark helper. Production
+// query handling always uses admitAndWrite so a complete response is one
+// transaction and policy generation is revalidated before mutation.
+func (s *DNSServer) addIPToFilter(domain string, ip net.IP, _ int, ttlSeconds uint32) error {
+	if s.sink == nil {
+		return nil
+	}
+	if ttlSeconds == 0 {
+		ttlSeconds = defaultDNSTTLSeconds
+	}
+	done, err := s.sink.BeginAdmission()
+	if err != nil {
+		return err
+	}
+	defer done()
+	normalized, err := validateAndNormalizeDomain(domain)
+	if err != nil {
+		return err
+	}
+	canonical := dnsCanonicalDomain(normalized)
+	return s.sink.AdmitCanonicalResponse(dnsCanonicalAdmissionRequest{
+		queryDomain: canonical,
+		owner:       dnsCanonicalPolicyOwner{kind: dnsOwnerRule, domain: canonical},
+		records:     []dnsAdmissionRecord{{ip: ip, ttl: time.Duration(ttlSeconds) * time.Second}},
+	})
 }
 
 type dnsOutcome uint8
@@ -718,33 +1175,79 @@ const (
 )
 
 func (s *DNSServer) evaluateDomainLocked(domain string) domainDecision {
-	domain = normalizeDomain(domain)
+	decision, _ := evaluateDomainRules(domain, s.allowedDomains, s.deniedDomains)
+	return decision
+}
+
+// evaluateDomainRules returns both the decision and the normalized winning
+// rule domain. Search is most-specific first and deny wins at equal
+// specificity, matching the resolver's historical precedence contract.
+func evaluateDomainRules(domain string, allowedDomains, deniedDomains map[string]bool) (domainDecision, string) {
+	canonical, err := validateAndNormalizeDomain(domain)
+	if err != nil {
+		return domainDecisionNone, ""
+	}
+	return evaluateCanonicalDomainRules(canonical, allowedDomains, deniedDomains)
+}
+
+// evaluateCanonicalDomainRules evaluates a wire-canonical domain against
+// wire-canonical policy keys. Keeping this internal split avoids re-packing a
+// query after snapshotQuery has already validated and canonicalized it.
+func evaluateCanonicalDomainRules(domain string, allowedDomains, deniedDomains map[string]bool) (domainDecision, string) {
 	for candidate := domain; candidate != ""; {
 		exact := candidate == domain
 		allow := false
 		deny := false
-		if includeSubdomains, ok := s.allowedDomains[candidate]; ok && (exact || includeSubdomains) {
+		if includeSubdomains, ok := allowedDomains[candidate]; ok && (exact || includeSubdomains) {
 			allow = true
 		}
-		if includeSubdomains, ok := s.deniedDomains[candidate]; ok && (exact || includeSubdomains) {
+		if includeSubdomains, ok := deniedDomains[candidate]; ok && (exact || includeSubdomains) {
 			deny = true
 		}
 		if deny {
-			return domainDecisionDeny
+			return domainDecisionDeny, candidate
 		}
 		if allow {
-			return domainDecisionAllow
+			return domainDecisionAllow, candidate
 		}
-		dot := strings.IndexByte(candidate, '.')
-		if dot < 0 {
+		if candidate == "." {
 			break
 		}
-		candidate = candidate[dot+1:]
+		next, end := dns.NextLabel(candidate, 0)
+		if end {
+			// The DNS root is the parent of every top-level label. A configured
+			// root rule with include_subdomains=true must therefore participate
+			// after the TLD, while a root query remains an exact match above.
+			candidate = "."
+			continue
+		}
+		candidate = candidate[next:]
 	}
-	return domainDecisionNone
+	return domainDecisionNone, ""
 }
 
-func (s *DNSServer) proxyResponse(req *dns.Msg, domain string, ips []string, addToFilter bool, ttlSeconds uint32) (*dns.Msg, error) {
+func ownershipResolver(mode apiv1.DnsMode, allowedDomains, deniedDomains map[string]bool) dnsOwnershipResolver {
+	return func(query string) (dnsPolicyOwner, bool) {
+		decision, owner := evaluateCanonicalDomainRules(query, allowedDomains, deniedDomains)
+		switch mode {
+		case apiv1.DnsMode_DNS_MODE_ALLOWLIST:
+			if decision == domainDecisionAllow {
+				return dnsPolicyOwner{kind: dnsOwnerRule, domain: owner}, true
+			}
+		case apiv1.DnsMode_DNS_MODE_DENYLIST:
+			if decision == domainDecisionDeny {
+				return dnsPolicyOwner{}, false
+			}
+			if decision == domainDecisionAllow {
+				return dnsPolicyOwner{kind: dnsOwnerRule, domain: owner}, true
+			}
+			return dnsPolicyOwner{kind: dnsOwnerDenylistDefault, domain: query}, true
+		}
+		return dnsPolicyOwner{}, false
+	}
+}
+
+func (s *DNSServer) proxyResponse(req *dns.Msg, domain string, ips []string, ttlSeconds uint32) (*dns.Msg, error) {
 	resp := new(dns.Msg)
 	resp.SetReply(req)
 	if ttlSeconds == 0 {
@@ -771,11 +1274,6 @@ func (s *DNSServer) proxyResponse(req *dns.Msg, domain string, ips []string, add
 			}
 			resp.Answer = append(resp.Answer, rr)
 
-			if addToFilter {
-				if err := s.addIPToFilter(domain, ip4, 32, ttlSeconds); err != nil {
-					return nil, err
-				}
-			}
 		} else {
 			if qType != dns.TypeAAAA && qType != dns.TypeANY {
 				continue
@@ -786,41 +1284,9 @@ func (s *DNSServer) proxyResponse(req *dns.Msg, domain string, ips []string, add
 			}
 			resp.Answer = append(resp.Answer, rr)
 
-			if addToFilter {
-				if err := s.addIPToFilter(domain, ip, 128, ttlSeconds); err != nil {
-					return nil, err
-				}
-			}
 		}
 	}
 	return resp, nil
-}
-
-// addIPToFilter forwards a resolved IP to the filter sink with the record's
-// TTL. The sink owns dedup (repeated resolutions of a tracked IP cost no
-// kernel syscall), the minimum-TTL floor, and expiry via the TTL janitor —
-// so unlike the old unbounded ipCache there is no per-DNS-server cache to
-// grow without bound. Errors are logged by the sink (rate-limited for
-// map-full), so only a debug line is emitted here.
-func (s *DNSServer) addIPToFilter(domain string, ip net.IP, bits int, ttlSeconds uint32) error {
-	if s.sink == nil {
-		return nil
-	}
-	if ttlSeconds == 0 {
-		ttlSeconds = defaultDNSTTLSeconds
-	}
-	ip = normalizeIP(ip)
-	if ip == nil {
-		return fmt.Errorf("invalid resolved IP")
-	}
-
-	cidr := &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)}
-	if err := s.sink.AllowIPWithTTL(cidr, time.Duration(ttlSeconds)*time.Second); err != nil {
-		s.logger.Debug().Err(err).Str("domain", domain).Str("ip", ip.String()).Msg("failed to add IP to filter")
-		return err
-	}
-	s.logger.Debug().Str("domain", domain).Str("ip", ip.String()).Msg("added IP to filter")
-	return nil
 }
 
 // normalizeUpstreamServers validates, canonicalizes, and ordered-deduplicates
@@ -971,10 +1437,45 @@ func normalizeIP(ip net.IP) net.IP {
 	return ip.To16()
 }
 
-func normalizeDomain(domain string) string {
-	domain = strings.ToLower(domain)
-	domain = strings.TrimSuffix(domain, ".")
-	return domain
+func validateAndNormalizeDomain(domain string) (string, error) {
+	if domain == "" {
+		return "", fmt.Errorf("domain is empty")
+	}
+	// Validate the original presentation before adding a root separator. This
+	// rejects malformed input such as "example.." instead of laundering it
+	// into a different valid key. Leading/trailing spaces are label bytes, not
+	// UI whitespace, and are intentionally preserved for wire canonicalization.
+	if _, ok := dns.IsDomainName(domain); !ok {
+		return "", fmt.Errorf("%q is not a valid DNS domain", domain)
+	}
+
+	// Policy configuration and unpacked DNS questions may spell the same wire
+	// label bytes differently (for example \046 vs \., \092 vs \\, or \032 vs
+	// \ ). Round-trip through the uncompressed wire form so every equivalent
+	// spelling converges on the exact same policy and ownership key.
+	const maxDNSNameWireBytes = 255
+	wire := make([]byte, maxDNSNameWireBytes)
+	packed, err := dns.PackDomainName(dns.Fqdn(domain), wire, 0, nil, false)
+	if err != nil {
+		return "", fmt.Errorf("%q is not a valid DNS domain: %w", domain, err)
+	}
+	if packed > len(wire) {
+		return "", fmt.Errorf("%q is not a valid DNS domain: wire form uses %d bytes, maximum is %d", domain, packed, len(wire))
+	}
+	canonical, unpacked, err := dns.UnpackDomainName(wire[:packed], 0)
+	if err != nil {
+		return "", fmt.Errorf("canonicalizing DNS domain %q: %w", domain, err)
+	}
+	if unpacked != packed {
+		return "", fmt.Errorf("canonicalizing DNS domain %q consumed %d of %d wire bytes", domain, unpacked, packed)
+	}
+	canonical = dns.CanonicalName(canonical)
+	if canonical == "." {
+		return canonical, nil
+	}
+	// UnpackDomainName always returns an FQDN and escapes any literal label
+	// dots, so the final byte is the one true root separator.
+	return canonical[:len(canonical)-1], nil
 }
 
 var errDNSProxyUnavailable = errors.New("DNS proxy unavailable")

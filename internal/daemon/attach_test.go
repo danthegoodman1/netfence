@@ -645,6 +645,50 @@ func TestAttachRollbackOnSubscribedAckApplyFailure(t *testing.T) {
 	assert.Equal(t, 1, filters[0].detachCallCount())
 }
 
+func TestAttachInvalidDNSLimitAckFailsValidationBeforeCommitAndRollsBack(t *testing.T) {
+	env := newAttachTestEnv(t, 12181)
+	cp := NewControlPlaneClient("", env.server, zerolog.Nop(), nil, time.Second, nil)
+	env.server.SetControlPlaneClient(cp)
+
+	result := make(chan error, 1)
+	go func() {
+		_, err := env.server.Attach(context.Background(), attachInterfaceReq("bad-dns-limit-if0"))
+		result <- err
+	}()
+
+	var id string
+	require.Eventually(t, func() bool {
+		cp.pendingAcksMu.Lock()
+		defer cp.pendingAcksMu.Unlock()
+		for pendingID := range cp.pendingAcks {
+			id = pendingID
+			return true
+		}
+		return false
+	}, time.Second, time.Millisecond)
+	dispatchAttachAck(t, cp, id, 1, &apiv1.SubscribedAck{
+		Mode: apiv1.PolicyMode_POLICY_MODE_ALLOWLIST,
+		Dns: &apiv1.DnsConfig{
+			Mode:            apiv1.DnsMode_DNS_MODE_ALLOWLIST,
+			MaxIpsPerFamily: 4097,
+		},
+	})
+
+	select {
+	case err := <-result:
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "max_ips_per_family 4097 exceeds daemon ceiling 4096")
+	case <-time.After(5 * time.Second):
+		t.Fatal("Attach did not receive the pre-commit DNS validation error")
+	}
+
+	env.assertNoResidue(t)
+	filters := env.createdFilters()
+	require.Len(t, filters, 1)
+	assert.Equal(t, 1, filters[0].detachCallCount())
+	assertDNSPortFree(t, env.port)
+}
+
 func TestZeroTimeoutInvalidSubscribedAckQuarantinesCommittedAttachment(t *testing.T) {
 	env := newAttachTestEnv(t, 12174)
 	cp := NewControlPlaneClient("", env.server, zerolog.Nop(), nil, 0, nil)

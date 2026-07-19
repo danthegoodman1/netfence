@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"errors"
+	"net"
 	"strings"
 	"syscall"
 	"testing"
@@ -217,6 +218,61 @@ func TestRestoreSubscribedAckAuthoritativeReconcileClearsExactFlag(t *testing.T)
 	dns.mu.RUnlock()
 	assert.False(t, attachmentNeedsResync(t, env.server, env.id))
 	assert.False(t, client.hasPendingAck(env.id))
+}
+
+func TestRestoreAdoptsTinyHistoricalExactMapsAndAuthoritativelyConverges(t *testing.T) {
+	env := newRestoreEnv(t, 12410, apiv1.PolicyMode_POLICY_MODE_ALLOWLIST)
+	env.adopted = &fakeFilter{
+		mode:         filter.ModeAllowlist,
+		dnsAllowed:   []string{"192.0.2.60", "2001:db8::60"},
+		dnsCapacity4: 1,
+		dnsCapacity6: 1,
+	}
+	env.mkPinDir(t)
+	require.NoError(t, env.server.Start())
+	t.Cleanup(env.server.Stop)
+
+	env.server.mu.RLock()
+	sink := env.server.attachments[env.id].dnsSink
+	env.server.mu.RUnlock()
+	require.NotNil(t, sink)
+	assert.Equal(t, uint32(1), sink.manager.limits.maxIPsPerFamily)
+	assert.Equal(t, uint32(2), sink.manager.limits.maxIPsPerResponse,
+		"dependent defaults must recap to the adopted maps' aggregate capacity")
+	assert.Equal(t, uint32(2), sink.manager.limits.maxIPsPerPolicyDomain)
+	assert.Len(t, sink.manager.entries, 2)
+	dnsAllowed, _ := env.adopted.dnsSnapshot()
+	assert.ElementsMatch(t, []string{"192.0.2.60", "2001:db8::60"}, dnsAllowed)
+
+	client := NewControlPlaneClient("", env.server, zerolog.Nop(), nil, time.Second, nil)
+	dispatchRestoreAck(t, client, env.id, 1, &apiv1.SubscribedAck{
+		Mode: apiv1.PolicyMode_POLICY_MODE_ALLOWLIST,
+		Dns:  &apiv1.DnsConfig{Mode: apiv1.DnsMode_DNS_MODE_DISABLED},
+	})
+	dnsAllowed, _ = env.adopted.dnsSnapshot()
+	assert.Empty(t, dnsAllowed)
+	assert.Empty(t, sink.manager.entries,
+		"the first authoritative DNS declaration must remove unmatched provisional exact keys")
+}
+
+func TestRestoreRejectsCanonicalExactInventoryCollisionWithoutPublishingPartialState(t *testing.T) {
+	env := newRestoreEnv(t, 12411, apiv1.PolicyMode_POLICY_MODE_ALLOWLIST)
+	mapped := net.IP{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 0, 2, 61}
+	env.adopted = &fakeFilter{
+		mode:            filter.ModeAllowlist,
+		dnsListOverride: []net.IP{net.IPv4(192, 0, 2, 61).To4(), mapped},
+		dnsOccupancyOverride: &filter.DNSAllowOccupancy{
+			IPv4Entries: 2, IPv4Capacity: 2,
+			IPv6Capacity: 2,
+		},
+	}
+	env.mkPinDir(t)
+
+	err := env.server.Start()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "canonical collision")
+	assert.Equal(t, 1, env.adopted.closeCallCount(), "startup abort must close but retain adopted pins")
+	assert.Zero(t, env.adopted.detachCallCount())
 }
 
 func TestRestoreRecreatedEmptySubscribedAckConverges(t *testing.T) {

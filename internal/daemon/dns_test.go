@@ -19,9 +19,8 @@ import (
 	apiv1 "github.com/danthegoodman1/netfence/v1"
 )
 
-// recordingSink is a fake DNSFilterSink capturing each forwarded CIDR and
-// the TTL the DNS server requested for it (pre-floor: the floor is applied
-// by the real server-side sink, not the DNS server).
+// recordingSink is a fake exact-tier DNSFilterSink capturing each atomically
+// admitted response address and TTL.
 type recordingSink struct {
 	mu    sync.Mutex
 	cidrs []string
@@ -29,16 +28,37 @@ type recordingSink struct {
 	err   error
 }
 
-func (r *recordingSink) AllowIPWithTTL(cidr *net.IPNet, ttl time.Duration) error {
+func (r *recordingSink) BeginAdmission() (func(), error) { return func() {}, nil }
+
+func (r *recordingSink) AdmitCanonicalResponse(req dnsCanonicalAdmissionRequest) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.err != nil {
 		return r.err
 	}
-	r.cidrs = append(r.cidrs, cidr.String())
-	r.ttls = append(r.ttls, ttl)
+	for _, record := range req.records {
+		ip := normalizeIP(record.ip)
+		bits := 128
+		if ip.To4() != nil {
+			bits = 32
+		}
+		r.cidrs = append(r.cidrs, (&net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)}).String())
+		r.ttls = append(r.ttls, record.ttl)
+	}
 	return nil
 }
+
+func (r *recordingSink) ReconcilePolicy(dnsAdmissionLimits, map[string]struct{}, dnsOwnershipResolver, bool) error {
+	return nil
+}
+func (r *recordingSink) PreflightPolicy(dnsAdmissionLimits, map[string]struct{}, dnsOwnershipResolver, bool) error {
+	return nil
+}
+func (r *recordingSink) Expire(time.Time) error                  { return nil }
+func (r *recordingSink) SeedPinned() error                       { return nil }
+func (r *recordingSink) ValidateLimits(dnsAdmissionLimits) error { return nil }
+func (r *recordingSink) FailClosedIfAmbiguous(error) error       { return nil }
+func (r *recordingSink) QuarantineAmbiguity(error) error         { return nil }
 
 func (r *recordingSink) setError(err error) {
 	r.mu.Lock()
@@ -79,6 +99,62 @@ func (w *captureDNSWriter) WriteMsg(msg *dns.Msg) error { w.msg = msg; return ni
 
 type failingDNSWriter struct {
 	captureDNSWriter
+}
+
+type blockingDNSWriter struct {
+	captureDNSWriter
+	entered chan struct{}
+	release <-chan struct{}
+}
+
+type blockingDeadlinePacketConn struct {
+	mu                sync.Mutex
+	deadlineCalls     int
+	writeCalls        int
+	firstWriteEntered chan struct{}
+	firstWriteRelease <-chan struct{}
+}
+
+func (c *blockingDeadlinePacketConn) ReadFrom([]byte) (int, net.Addr, error) {
+	return 0, nil, errors.New("not implemented")
+}
+
+func (c *blockingDeadlinePacketConn) WriteTo(payload []byte, _ net.Addr) (int, error) {
+	c.mu.Lock()
+	c.writeCalls++
+	call := c.writeCalls
+	if call == 1 {
+		close(c.firstWriteEntered)
+	}
+	c.mu.Unlock()
+	if call == 1 {
+		<-c.firstWriteRelease
+	}
+	return len(payload), nil
+}
+
+func (c *blockingDeadlinePacketConn) Close() error                    { return nil }
+func (c *blockingDeadlinePacketConn) LocalAddr() net.Addr             { return &net.UDPAddr{} }
+func (c *blockingDeadlinePacketConn) SetDeadline(time.Time) error     { return nil }
+func (c *blockingDeadlinePacketConn) SetReadDeadline(time.Time) error { return nil }
+func (c *blockingDeadlinePacketConn) SetWriteDeadline(time.Time) error {
+	c.mu.Lock()
+	c.deadlineCalls++
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *blockingDeadlinePacketConn) calls() (deadlines, writes int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.deadlineCalls, c.writeCalls
+}
+
+func (w *blockingDNSWriter) WriteMsg(msg *dns.Msg) error {
+	w.msg = msg
+	close(w.entered)
+	<-w.release
+	return nil
 }
 
 func (w *failingDNSWriter) WriteMsg(*dns.Msg) error {
@@ -229,6 +305,269 @@ func TestDNSServerDomainPolicySemantics(t *testing.T) {
 	assert.Equal(t, dns.RcodeSuccess, resp.Rcode)
 }
 
+func TestDNSRootDomainNormalizationAndPolicySemantics(t *testing.T) {
+	normalized, err := validateAndNormalizeDomain(".")
+	require.NoError(t, err)
+	assert.Equal(t, ".", normalized)
+
+	exactRoot := map[string]bool{".": false}
+	decision, owner := evaluateDomainRules(".", exactRoot, nil)
+	assert.Equal(t, domainDecisionAllow, decision)
+	assert.Equal(t, ".", owner)
+	decision, owner = evaluateDomainRules("example", exactRoot, nil)
+	assert.Equal(t, domainDecisionNone, decision)
+	assert.Empty(t, owner, "a root rule without include_subdomains is exact-only")
+
+	rootAndDescendants := map[string]bool{".": true}
+	decision, owner = evaluateDomainRules("deep.example.", rootAndDescendants, nil)
+	assert.Equal(t, domainDecisionAllow, decision)
+	assert.Equal(t, ".", owner, "suffix evaluation must reach the root after the TLD")
+	decision, owner = evaluateDomainRules(".", rootAndDescendants, map[string]bool{".": false})
+	assert.Equal(t, domainDecisionDeny, decision, "deny still wins an exact root tie")
+	assert.Equal(t, ".", owner)
+}
+
+func TestDNSEscapedLabelPolicySuffixesAreNotAuthorizationBoundaries(t *testing.T) {
+	allowed := map[string]bool{"allowed.example": true}
+	denied := map[string]bool{"allowed.example": true}
+
+	decision, owner := evaluateDomainRules(`evil\.allowed.example.`, allowed, nil)
+	assert.Equal(t, domainDecisionNone, decision,
+		"an escaped literal dot must not manufacture an allowed parent label")
+	assert.Empty(t, owner)
+	decision, owner = evaluateDomainRules(`evil\.allowed.example.`, nil, denied)
+	assert.Equal(t, domainDecisionNone, decision,
+		"an escaped literal dot must not manufacture a denied parent label")
+	assert.Empty(t, owner)
+
+	decision, owner = evaluateDomainRules("evil.allowed.example.", allowed, nil)
+	assert.Equal(t, domainDecisionAllow, decision)
+	assert.Equal(t, "allowed.example", owner,
+		"a real label boundary must still select the normalized parent owner")
+	decision, owner = evaluateDomainRules("evil.allowed.example.", allowed, denied)
+	assert.Equal(t, domainDecisionDeny, decision, "deny must still win at the real parent")
+	assert.Equal(t, "allowed.example", owner)
+
+	normalized, err := validateAndNormalizeDomain(`literal\.`)
+	require.NoError(t, err)
+	assert.Equal(t, `literal\.`, normalized,
+		"a terminal escaped dot belongs to the label and is not an FQDN root separator")
+}
+
+func TestDNSWireCanonicalAliasesSelectOnePolicyAndOwnershipKey(t *testing.T) {
+	tests := []struct {
+		name  string
+		rule  string
+		query string
+	}{
+		{name: "encoded ascii and case", rule: `\066AD.Example`, query: "bad.example."},
+		{name: "literal dot", rule: `BAD\046Name.Example`, query: `bad\.name.example.`},
+		{name: "literal backslash", rule: `BAD\092Name.Example`, query: `bad\\name.example.`},
+		{name: "literal space", rule: `BAD\032Name.Example`, query: `bad\ name.example.`},
+		{name: "utf8 bytes", rule: "café.example", query: `caf\195\169.example.`},
+	}
+	limits := dnsAdmissionLimits{
+		maxIPsPerFamily:       2,
+		maxIPsPerResponse:     1,
+		maxIPsPerPolicyDomain: 1,
+		maxTrackedDomains:     1,
+		maxOwnershipEdges:     1,
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			canonicalRule, err := validateAndNormalizeDomain(tt.rule)
+			require.NoError(t, err)
+			canonicalQuery, err := validateAndNormalizeDomain(tt.query)
+			require.NoError(t, err)
+			require.Equal(t, canonicalRule, canonicalQuery,
+				"wire-equivalent presentation spellings must share one key")
+
+			server := NewDNSServer("canonical", "127.0.0.1:0", "127.0.0.1:53", zerolog.Nop(), nil, nil)
+			require.NoError(t, server.ReplaceRules(apiv1.DnsMode_DNS_MODE_ALLOWLIST,
+				[]*apiv1.DomainEntry{{Domain: tt.rule}}, nil))
+			snapshot, shouldResolve, err := server.snapshotQuery(tt.query)
+			require.NoError(t, err)
+			assert.True(t, shouldResolve)
+			assert.False(t, snapshot.blocked)
+			assert.Equal(t, canonicalRule, snapshot.queryDomain)
+			assert.Equal(t, dnsPolicyOwner{kind: dnsOwnerRule, domain: canonicalRule}, snapshot.owner)
+
+			require.NoError(t, server.RemoveDomain(tt.query),
+				"an alternate wire-equivalent spelling must remove the canonical rule")
+			_, shouldResolve, err = server.snapshotQuery(tt.query)
+			require.NoError(t, err)
+			assert.False(t, shouldResolve)
+
+			require.NoError(t, server.ReplaceRules(apiv1.DnsMode_DNS_MODE_DENYLIST,
+				nil, []*apiv1.DomainEntry{{Domain: tt.rule}}))
+			snapshot, shouldResolve, err = server.snapshotQuery(tt.query)
+			require.NoError(t, err)
+			assert.False(t, shouldResolve)
+			assert.True(t, snapshot.blocked,
+				"an exact deny must match every wire-equivalent presentation spelling")
+			decision, owner := evaluateCanonicalDomainRules(canonicalQuery,
+				server.allowedDomains, server.deniedDomains)
+			assert.Equal(t, domainDecisionDeny, decision)
+			assert.Equal(t, canonicalRule, owner)
+
+			prepared, err := prepareDNSRules(apiv1.DnsMode_DNS_MODE_DENYLIST,
+				[]*apiv1.DomainEntry{{Domain: tt.rule}},
+				[]*apiv1.DomainEntry{{Domain: tt.query}}, nil, "127.0.0.1:53", limits,
+				dnsAdmissionLimitOverrides{})
+			require.NoError(t, err)
+			assert.Equal(t, map[string]struct{}{canonicalRule: {}}, prepared.policyDomains,
+				"the tracked-domain cap must count wire aliases once")
+			_, err = prepareDNSRules(apiv1.DnsMode_DNS_MODE_ALLOWLIST,
+				[]*apiv1.DomainEntry{{Domain: tt.rule}, {Domain: tt.query}}, nil,
+				nil, "127.0.0.1:53", limits, dnsAdmissionLimitOverrides{})
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "duplicate canonical DNS allow domain")
+
+			ff := &fakeFilter{dnsCapacity4: 2, dnsCapacity6: 2}
+			manager, err := newDNSOwnershipManager(ff, limits, time.Second, time.Now)
+			require.NoError(t, err)
+			ip := net.ParseIP("192.0.2.70")
+			for _, admission := range []dnsAdmissionRequest{
+				{
+					queryDomain: tt.rule,
+					owner:       dnsPolicyOwner{kind: dnsOwnerRule, domain: tt.rule},
+					records:     []dnsAdmissionRecord{{ip: ip, ttl: time.Minute}},
+				},
+				{
+					queryDomain: tt.query,
+					owner:       dnsPolicyOwner{kind: dnsOwnerRule, domain: tt.query},
+					records:     []dnsAdmissionRecord{{ip: ip, ttl: 2 * time.Minute}},
+				},
+			} {
+				require.NoError(t, manager.admit(admission))
+			}
+			assert.Equal(t, map[string]uint64{canonicalRule: 1}, manager.queryRefs)
+			assert.Equal(t, uint64(1), manager.edgeCount)
+			canonicalOwner := dnsPolicyOwner{kind: dnsOwnerRule, domain: canonicalRule}
+			assert.Len(t, manager.ownerIPRefs, 1)
+			assert.Equal(t, 1, manager.ownerIPRefs[canonicalOwner].uniqueLen())
+			entry := manager.entries[netipMustParse(t, "192.0.2.70")]
+			_, owned := entry.owners.get(dnsOwnershipKey{query: canonicalRule, owner: canonicalOwner})
+			assert.True(t, owned)
+			_, addCalls := ff.dnsSnapshot()
+			assert.Equal(t, 1, addCalls, "alias refresh must not consume another physical key")
+			assertDNSOwnershipIndexes(t, manager)
+		})
+	}
+}
+
+func TestDNSWireCanonicalDomainSyntaxAndLengthBoundaries(t *testing.T) {
+	label := func(length int) string { return strings.Repeat("a", length) }
+	maxName := strings.Join([]string{label(63), label(63), label(63), label(61)}, ".")
+	canonical, err := validateAndNormalizeDomain(maxName)
+	require.NoError(t, err)
+	assert.Equal(t, maxName, canonical)
+	canonicalFQDN, err := validateAndNormalizeDomain(maxName + ".")
+	require.NoError(t, err)
+	assert.Equal(t, canonical, canonicalFQDN)
+
+	escapedLabel := func(length int) string { return strings.Repeat(`\001`, length) }
+	escapedMax := strings.Join([]string{escapedLabel(63), escapedLabel(63), escapedLabel(63), escapedLabel(61)}, ".")
+	escapedCanonical, err := validateAndNormalizeDomain(escapedMax)
+	require.NoError(t, err)
+	assert.Equal(t, escapedMax, escapedCanonical,
+		"maximum wire name must remain valid even with a much longer escaped presentation")
+
+	for _, tooLong := range []string{
+		strings.Join([]string{label(63), label(63), label(63), label(62)}, "."),
+		strings.Join([]string{escapedLabel(63), escapedLabel(63), escapedLabel(63), escapedLabel(62)}, "."),
+	} {
+		var boundaryErr error
+		assert.NotPanics(t, func() {
+			_, boundaryErr = validateAndNormalizeDomain(tooLong)
+		}, "a one-byte-over wire name must return an error, never slice past the pack buffer")
+		require.Error(t, boundaryErr)
+	}
+
+	for _, malformed := range []string{"", "..", "a..", "example..", strings.Repeat("a", 64) + ".example"} {
+		_, err := validateAndNormalizeDomain(malformed)
+		require.Error(t, err, "malformed presentation %q must be rejected before canonicalization", malformed)
+	}
+
+	aliases := [][2]string{
+		{`literal\046`, `literal\.`},
+		{`literal\092`, `literal\\`},
+		{`literal\032`, "literal "},
+		{`\032literal\032`, " literal "},
+		{`literal\.`, `literal\..`},
+		{`literal\\`, `literal\\.`},
+		{`literal\ `, `literal\ .`},
+	}
+	for _, pair := range aliases {
+		left, err := validateAndNormalizeDomain(pair[0])
+		require.NoError(t, err)
+		right, err := validateAndNormalizeDomain(pair[1])
+		require.NoError(t, err)
+		assert.Equal(t, left, right)
+	}
+	spaced, err := validateAndNormalizeDomain(" name ")
+	require.NoError(t, err)
+	plain, err := validateAndNormalizeDomain("name")
+	require.NoError(t, err)
+	assert.NotEqual(t, plain, spaced, "boundary whitespace is a DNS label byte, not trim padding")
+}
+
+func TestDNSRootQueriesPassThroughAndDefaultDenylistOwnsAddresses(t *testing.T) {
+	upstream, queries, _ := startDualProtocolUpstream(t, dns.HandlerFunc(func(w dns.ResponseWriter, req *dns.Msg) {
+		resp := new(dns.Msg)
+		resp.SetReply(req)
+		q := req.Question[0]
+		switch q.Qtype {
+		case dns.TypeNS:
+			resp.Answer = append(resp.Answer, &dns.NS{
+				Hdr: dns.RR_Header{Name: ".", Rrtype: dns.TypeNS, Class: dns.ClassINET, Ttl: 60},
+				Ns:  "a.root.test.",
+			})
+		case dns.TypeA:
+			resp.Answer = append(resp.Answer, &dns.A{
+				Hdr: dns.RR_Header{Name: ".", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
+				A:   net.ParseIP("192.0.2.60").To4(),
+			})
+		}
+		_ = w.WriteMsg(resp)
+	}))
+	server, _, id, ff, dnsServer := newTestServerWithAttachment(t)
+
+	require.NoError(t, server.ReplaceDNSRules(id, apiv1.DnsMode_DNS_MODE_DISABLED,
+		nil, nil, []string{upstream}))
+	resp := queryServer(dnsServer, ".", dns.TypeNS)
+	require.NotNil(t, resp)
+	assert.Equal(t, dns.RcodeSuccess, resp.Rcode)
+	require.Len(t, resp.Answer, 1)
+	_, ok := resp.Answer[0].(*dns.NS)
+	assert.True(t, ok)
+	assert.Equal(t, uint64(1), queries.Load(), "disabled root query must reach the upstream")
+	dnsAllowed, _ := ff.dnsSnapshot()
+	assert.Empty(t, dnsAllowed, "disabled pass-through must not populate the exact tier")
+
+	require.NoError(t, server.ReplaceDNSRules(id, apiv1.DnsMode_DNS_MODE_DENYLIST,
+		nil, nil, []string{upstream}))
+	resp = queryServer(dnsServer, ".", dns.TypeA)
+	require.NotNil(t, resp)
+	assert.Equal(t, dns.RcodeSuccess, resp.Rcode)
+	require.Len(t, resp.Answer, 1)
+	assert.Equal(t, uint64(2), queries.Load(), "default-allowed root query must reach the upstream")
+	dnsAllowed, _ = ff.dnsSnapshot()
+	assert.Equal(t, []string{"192.0.2.60"}, dnsAllowed)
+
+	manager := server.attachments[id].dnsSink.manager
+	addr := netipMustParse(t, "192.0.2.60")
+	entry, exists := manager.entries[addr]
+	require.True(t, exists)
+	rootEdge := dnsOwnershipKey{
+		query: ".",
+		owner: dnsPolicyOwner{kind: dnsOwnerDenylistDefault, domain: "."},
+	}
+	_, owned := entry.owners.get(rootEdge)
+	assert.True(t, owned, "root must remain representable in the ownership graph")
+	assertDNSOwnershipIndexes(t, manager)
+}
+
 func TestDNSServerProxyFailsClosed(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -269,6 +608,41 @@ func TestDNSServerProxyExplicitDenyRefuses(t *testing.T) {
 	assert.Equal(t, dns.RcodeRefused, resp.Rcode)
 }
 
+func TestDNSProxyReceivesCanonicalFQDNAndPreservesResponseNames(t *testing.T) {
+	const original = `MiXeD\046Label.Example.`
+	var policyDomain, policyType string
+	sink := &recordingSink{}
+	server := NewDNSServer("att-1", "127.0.0.1:0", "127.0.0.1:1", zerolog.Nop(), sink,
+		func(_ context.Context, domain, queryType string) (DnsProxyDecision, error) {
+			policyDomain, policyType = domain, queryType
+			return DnsProxyDecision{
+				Allow:       true,
+				AddToFilter: true,
+				IPs:         []string{"192.0.2.71"},
+				TTLSeconds:  60,
+			}, nil
+		})
+	require.NoError(t, server.SetMode(apiv1.DnsMode_DNS_MODE_PROXY))
+
+	req := dnsQuery(original, dns.TypeA)
+	w := &captureDNSWriter{}
+	server.handleDNS(w, req)
+	require.NotNil(t, w.msg)
+	assert.Equal(t, dns.RcodeSuccess, w.msg.Rcode)
+	canonical, err := validateAndNormalizeDomain(original)
+	require.NoError(t, err)
+	assert.Equal(t, dns.Fqdn(canonical), policyDomain,
+		"control-plane policy and local ownership must receive the same canonical identity")
+	assert.Equal(t, "A", policyType)
+	require.Len(t, w.msg.Question, 1)
+	assert.Equal(t, req.Question[0].Name, w.msg.Question[0].Name,
+		"canonical policy handoff must not rewrite the client-visible question")
+	require.Len(t, w.msg.Answer, 1)
+	assert.Equal(t, req.Question[0].Name, w.msg.Answer[0].Header().Name,
+		"canonical policy handoff must not rewrite the synthesized RR owner name")
+	assert.Equal(t, []string{"192.0.2.71/32"}, sink.entries())
+}
+
 func TestDNSServerProxyResponseHonorsTTLQueryTypeAndFiltering(t *testing.T) {
 	filter := &recordingSink{}
 	server := NewDNSServer("att-1", "127.0.0.1:0", "127.0.0.1:1", zerolog.Nop(), filter, func(context.Context, string, string) (DnsProxyDecision, error) {
@@ -307,16 +681,17 @@ func TestDNSServerProxyResponseHonorsTTLQueryTypeAndFiltering(t *testing.T) {
 
 	resp = queryServer(server, "example.com", dns.TypeA)
 	require.NotNil(t, resp)
-	require.Len(t, resp.Answer, 1)
-	assert.Equal(t, uint32(defaultDNSTTLSeconds), resp.Answer[0].Header().Ttl)
+	assert.Equal(t, dns.RcodeServerFailure, resp.Rcode)
+	assert.Empty(t, resp.Answer, "filtering PROXY mode cannot return an address it was told not to admit")
 	assert.Zero(t, noFilter.calls())
 }
 
 // TestDNSServerForwardsEveryResolutionToSink: with the old per-server ipCache
 // gone, the DNS server forwards every resolution (with the record TTL) to the
 // sink, which owns dedup, the TTL floor, and janitor-driven expiry (see the
-// registry-level tests in ttl_test.go). A zero record TTL is coerced to the
-// default before it reaches the sink.
+// ownership-manager tests in dns_ownership_test.go). This internal helper's
+// explicit ttlSeconds=0 retains its historical 300s default; production
+// upstream RR TTL=0 reaches the manager as zero and is floored to min_filter_ttl.
 func TestDNSServerForwardsEveryResolutionToSink(t *testing.T) {
 	sink := &recordingSink{}
 	server := NewDNSServer("att-1", "127.0.0.1:0", "127.0.0.1:1", zerolog.Nop(), sink, nil)
@@ -506,7 +881,7 @@ func TestDNSServerReplaceRulesRacesQueriesSafely(t *testing.T) {
 			for i := 0; i < iterations; i++ {
 				resp := queryServer(server, "race.example", dns.TypeA)
 				require.NotNil(t, resp)
-				assert.Contains(t, []int{dns.RcodeSuccess, dns.RcodeRefused}, resp.Rcode)
+				assert.Contains(t, []int{dns.RcodeSuccess, dns.RcodeRefused, dns.RcodeServerFailure}, resp.Rcode)
 			}
 		}()
 	}
@@ -516,6 +891,175 @@ func TestDNSServerReplaceRulesRacesQueriesSafely(t *testing.T) {
 	allowed, blocked, queryErrors := server.Stats()
 	assert.Equal(t, uint64(2*iterations), allowed+blocked+queryErrors,
 		"each concurrent query must land in exactly one outcome bucket")
+}
+
+func TestDNSInFlightProxyDecisionRevalidatesGeneration(t *testing.T) {
+	for _, allowed := range []bool{true, false} {
+		t.Run(fmt.Sprintf("allow_%t", allowed), func(t *testing.T) {
+			entered := make(chan struct{})
+			release := make(chan struct{})
+			sink := &recordingSink{}
+			server := NewDNSServer("att-1", "127.0.0.1:0", "127.0.0.1:1", zerolog.Nop(), sink,
+				func(context.Context, string, string) (DnsProxyDecision, error) {
+					close(entered)
+					<-release
+					return DnsProxyDecision{Allow: allowed, AddToFilter: allowed, IPs: []string{"192.0.2.44"}}, nil
+				})
+			require.NoError(t, server.SetMode(apiv1.DnsMode_DNS_MODE_PROXY))
+			writer := &captureDNSWriter{}
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				server.handleDNS(writer, dnsQuery("race.example", dns.TypeA))
+			}()
+			<-entered
+			require.NoError(t, server.ReplaceRules(apiv1.DnsMode_DNS_MODE_DISABLED, nil, nil))
+			close(release)
+			<-done
+			require.NotNil(t, writer.msg)
+			assert.Equal(t, dns.RcodeServerFailure, writer.msg.Rcode,
+				"neither a stale allow nor stale deny decision may cross generations")
+			assert.Zero(t, sink.calls())
+		})
+	}
+}
+
+func TestDNSInFlightStaticAllowRevalidatesGenerationAfterHeldUpstream(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	upstream, _, _ := startDualProtocolUpstream(t, dns.HandlerFunc(func(w dns.ResponseWriter, req *dns.Msg) {
+		close(entered)
+		<-release
+		resp := new(dns.Msg)
+		resp.SetReply(req)
+		resp.Answer = append(resp.Answer, &dns.A{
+			Hdr: dns.RR_Header{Name: req.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
+			A:   net.ParseIP("192.0.2.46").To4(),
+		})
+		_ = w.WriteMsg(resp)
+	}))
+	sink := &recordingSink{}
+	server := NewDNSServer("att-1", "127.0.0.1:0", upstream, zerolog.Nop(), sink, nil)
+	require.NoError(t, server.ReplaceRules(apiv1.DnsMode_DNS_MODE_ALLOWLIST,
+		[]*apiv1.DomainEntry{{Domain: "race.example"}}, nil))
+
+	writer := &captureDNSWriter{}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		server.handleDNS(writer, dnsQuery("race.example", dns.TypeA))
+	}()
+	<-entered
+	require.NoError(t, server.ReplaceRules(apiv1.DnsMode_DNS_MODE_ALLOWLIST, nil, nil))
+	close(release)
+	<-done
+
+	require.NotNil(t, writer.msg)
+	assert.Equal(t, dns.RcodeServerFailure, writer.msg.Rcode)
+	assert.Empty(t, writer.msg.Answer)
+	assert.Zero(t, sink.calls(), "a stale static allow answer must never reach exact admission")
+}
+
+func TestDNSStaleStaticDenySnapshotCannotReturnRefused(t *testing.T) {
+	server := NewDNSServer("att-1", "127.0.0.1:0", "127.0.0.1:1", zerolog.Nop(), &recordingSink{}, nil)
+	require.NoError(t, server.ReplaceRules(apiv1.DnsMode_DNS_MODE_DENYLIST, nil,
+		[]*apiv1.DomainEntry{{Domain: "race.example"}}))
+	snapshot, shouldResolve, err := server.snapshotQuery("race.example")
+	require.NoError(t, err)
+	assert.False(t, shouldResolve)
+	assert.True(t, snapshot.blocked)
+
+	require.NoError(t, server.ReplaceRules(apiv1.DnsMode_DNS_MODE_DISABLED, nil, nil))
+	writer := &captureDNSWriter{}
+	req := dnsQuery("race.example", dns.TypeA)
+	server.writeIfCurrent(writer, req, refusedResponse(req), snapshot, dnsOutcomeBlocked)
+
+	require.NotNil(t, writer.msg)
+	assert.Equal(t, dns.RcodeServerFailure, writer.msg.Rcode,
+		"a static deny from an old generation must never cross the policy cutover as REFUSED")
+}
+
+func TestDNSPolicyLeaseCoversResponseWrite(t *testing.T) {
+	release := make(chan struct{})
+	writer := &blockingDNSWriter{entered: make(chan struct{}), release: release}
+	sink := &recordingSink{}
+	server := NewDNSServer("att-1", "127.0.0.1:0", "127.0.0.1:1", zerolog.Nop(), sink,
+		func(context.Context, string, string) (DnsProxyDecision, error) {
+			return DnsProxyDecision{Allow: true, AddToFilter: true, IPs: []string{"192.0.2.45"}}, nil
+		})
+	require.NoError(t, server.SetMode(apiv1.DnsMode_DNS_MODE_PROXY))
+	queryDone := make(chan struct{})
+	go func() {
+		defer close(queryDone)
+		server.handleDNS(writer, dnsQuery("lease.example", dns.TypeA))
+	}()
+	<-writer.entered
+	assert.False(t, server.mu.TryLock(), "the response write must hold the DNS policy read lease")
+
+	replaceDone := make(chan error, 1)
+	go func() {
+		replaceDone <- server.ReplaceRules(apiv1.DnsMode_DNS_MODE_DISABLED, nil, nil)
+	}()
+	close(release)
+	<-queryDone
+	require.NoError(t, <-replaceDone)
+	assert.Equal(t, dns.RcodeSuccess, writer.msg.Rcode)
+}
+
+func TestDNSWriteDeadlineConnActuallyBoundsBlockedWrite(t *testing.T) {
+	left, right := net.Pipe()
+	defer right.Close()
+	defer left.Close()
+	wrapped := &dnsWriteDeadlineConn{Conn: left, timeout: 25 * time.Millisecond}
+	start := time.Now()
+	_, err := wrapped.Write(make([]byte, 1<<20))
+	require.Error(t, err)
+	assert.Less(t, time.Since(start), time.Second)
+	var netErr net.Error
+	require.ErrorAs(t, err, &netErr)
+	assert.True(t, netErr.Timeout())
+}
+
+func TestDNSUDPWriteDeadlineCannotBeResetByConcurrentResponse(t *testing.T) {
+	releaseFirst := make(chan struct{})
+	underlying := &blockingDeadlinePacketConn{
+		firstWriteEntered: make(chan struct{}),
+		firstWriteRelease: releaseFirst,
+	}
+	wrapped := &dnsWriteDeadlinePacketConn{PacketConn: underlying, timeout: time.Second}
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := wrapped.WriteTo([]byte("first"), &net.UDPAddr{})
+		firstDone <- err
+	}()
+	<-underlying.firstWriteEntered
+	if wrapped.mu.TryLock() {
+		wrapped.mu.Unlock()
+		t.Fatal("the first UDP write did not retain the deadline/write critical section")
+	}
+	deadlines, writes := underlying.calls()
+	assert.Equal(t, 1, deadlines)
+	assert.Equal(t, 1, writes)
+
+	secondStarted := make(chan struct{})
+	secondDone := make(chan error, 1)
+	go func() {
+		close(secondStarted)
+		_, err := wrapped.WriteTo([]byte("second"), &net.UDPAddr{})
+		secondDone <- err
+	}()
+	<-secondStarted
+	deadlines, writes = underlying.calls()
+	assert.Equal(t, 1, deadlines,
+		"a later response must not reset the connection-wide deadline while the first write is blocked")
+	assert.Equal(t, 1, writes)
+
+	close(releaseFirst)
+	require.NoError(t, <-firstDone)
+	require.NoError(t, <-secondDone)
+	deadlines, writes = underlying.calls()
+	assert.Equal(t, 2, deadlines)
+	assert.Equal(t, 2, writes)
 }
 
 func startTestUpstreamWithIP(t testing.TB, answer string) string {
@@ -761,7 +1305,7 @@ func TestDNSAdmissionCoversAllReturnedSections(t *testing.T) {
 	assert.ElementsMatch(t, []string{"192.0.2.10/32", "2001:db8::10/128", "192.0.2.11/32"}, sink.entries())
 
 	failing := &recordingSink{}
-	failingServer := NewDNSServer("att-2", "127.0.0.1:0", upstream, zerolog.Nop(), &failOnNthSink{wrapped: failing, failAt: 3}, nil)
+	failingServer := NewDNSServer("att-2", "127.0.0.1:0", upstream, zerolog.Nop(), &failOnNthSink{wrapped: failing, failAt: 1}, nil)
 	require.NoError(t, failingServer.ReplaceRules(apiv1.DnsMode_DNS_MODE_ALLOWLIST,
 		[]*apiv1.DomainEntry{{Domain: "sections.example"}}, nil))
 	resp = queryServer(failingServer, "sections.example", dns.TypeA)
@@ -777,15 +1321,29 @@ type failOnNthSink struct {
 	calls   int
 }
 
-func (s *failOnNthSink) AllowIPWithTTL(cidr *net.IPNet, ttl time.Duration) error {
+func (s *failOnNthSink) BeginAdmission() (func(), error) { return func() {}, nil }
+
+func (s *failOnNthSink) AdmitCanonicalResponse(req dnsCanonicalAdmissionRequest) error {
 	s.calls++
 	if s.calls == s.failAt {
 		return errors.New("injected additional-section admission failure")
 	}
-	return s.wrapped.AllowIPWithTTL(cidr, ttl)
+	return s.wrapped.AdmitCanonicalResponse(req)
 }
 
-func TestDNSNeverAdmitsAddressesFromErrorRcodes(t *testing.T) {
+func (s *failOnNthSink) ReconcilePolicy(l dnsAdmissionLimits, d map[string]struct{}, r dnsOwnershipResolver, a bool) error {
+	return s.wrapped.ReconcilePolicy(l, d, r, a)
+}
+func (s *failOnNthSink) PreflightPolicy(l dnsAdmissionLimits, d map[string]struct{}, r dnsOwnershipResolver, a bool) error {
+	return s.wrapped.PreflightPolicy(l, d, r, a)
+}
+func (s *failOnNthSink) Expire(now time.Time) error              { return s.wrapped.Expire(now) }
+func (s *failOnNthSink) SeedPinned() error                       { return nil }
+func (s *failOnNthSink) ValidateLimits(dnsAdmissionLimits) error { return nil }
+func (s *failOnNthSink) FailClosedIfAmbiguous(error) error       { return nil }
+func (s *failOnNthSink) QuarantineAmbiguity(error) error         { return nil }
+
+func TestDNSAddressBearingErrorRcodesAreAdmittedOrSuppressed(t *testing.T) {
 	for _, rcode := range []int{dns.RcodeNameError, dns.RcodeServerFailure} {
 		t.Run(dns.RcodeToString[rcode], func(t *testing.T) {
 			upstream := startSectionAddressUpstream(t, rcode)
@@ -795,7 +1353,11 @@ func TestDNSNeverAdmitsAddressesFromErrorRcodes(t *testing.T) {
 				[]*apiv1.DomainEntry{{Domain: "sections.example"}}, nil))
 			resp := queryServer(server, "sections.example", dns.TypeA)
 			assert.Equal(t, rcode, resp.Rcode)
-			assert.Zero(t, sink.calls())
+			if rcode == dns.RcodeNameError {
+				assert.Equal(t, 3, sink.calls(), "NXDOMAIN authority/additional addresses must be admitted before return")
+			} else {
+				assert.Zero(t, sink.calls(), "upstream SERVFAIL is suppressed by failover and its sections never return")
+			}
 			allowed, blocked, queryErrors := server.Stats()
 			assert.Zero(t, blocked)
 			if rcode == dns.RcodeNameError {

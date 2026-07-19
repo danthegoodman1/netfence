@@ -1127,14 +1127,20 @@ func (c *ControlPlaneClient) validateSubscribedAck(id string, ack *apiv1.Subscri
 	if err := validateFullDesiredModes(ack.Mode, ack.Dns); err != nil {
 		return err
 	}
-	var requestedUpstreams []string
-	if ack.Dns != nil {
-		requestedUpstreams = ack.Dns.UpstreamServers
+	dnsConfig := ack.Dns
+	if dnsConfig == nil {
+		dnsConfig = &apiv1.DnsConfig{Mode: apiv1.DnsMode_DNS_MODE_DISABLED}
 	}
-	if _, err := normalizeUpstreamServers(requestedUpstreams, c.server.defaultDNSUpstream); err != nil {
-		return fmt.Errorf("validating DNS upstreams: %w", err)
+	ceilings, err := c.server.dnsLimitCeilingsForAttachment(id)
+	if err != nil {
+		return err
 	}
-	_, _, err := c.parseBulkCIDRs(id, &apiv1.BulkUpdate{
+	if _, err := prepareDNSRules(dnsConfig.Mode, dnsConfig.AllowDomains, dnsConfig.DenyDomains,
+		dnsConfig.UpstreamServers, c.server.defaultDNSUpstream, ceilings,
+		dnsLimitOverridesFromProto(dnsConfig)); err != nil {
+		return fmt.Errorf("validating DNS configuration: %w", err)
+	}
+	_, _, err = c.parseBulkCIDRs(id, &apiv1.BulkUpdate{
 		Mode:       ack.Mode,
 		AllowCidrs: ack.AllowCidrs,
 		DenyCidrs:  ack.DenyCidrs,
@@ -1162,11 +1168,12 @@ func (c *ControlPlaneClient) applySubscribedAck(id string, ack *apiv1.Subscribed
 // applyBulkUpdate reconciles the attachment to the declared state with
 // add/remove deltas instead of the old wipe-then-rebuild: a rule present in
 // both the old and new state is never removed from the kernel map, so a
-// control-plane resync opens no transient allow/block window, and
-// DNS-populated filter IPs survive (they age out via their own DNS TTLs,
-// Phase 2B). Any validation/parse error aborts BEFORE any mutation. The
-// returned error aggregates every failed step — a partially-applied bulk
-// update is a failure, never reported as success.
+// control-plane resync opens no transient allow/block window. CIDR reconcile
+// leaves the independent DNS exact tier untouched; the authoritative DNS
+// config in this same operation then remaps still-authorized ownership and
+// promptly removes blocked or provisional keys. Any validation/parse error
+// aborts BEFORE any mutation. The returned error aggregates every failed step
+// — a partially-applied bulk update is a failure, never reported as success.
 func (c *ControlPlaneClient) applyBulkUpdate(id string, update *apiv1.BulkUpdate) error {
 	if update == nil {
 		return fmt.Errorf("bulk update is nil")
@@ -1174,13 +1181,19 @@ func (c *ControlPlaneClient) applyBulkUpdate(id string, update *apiv1.BulkUpdate
 	if err := validateFullDesiredModes(update.Mode, update.Dns); err != nil {
 		return err
 	}
-	var requestedUpstreams []string
-	if update.Dns != nil {
-		requestedUpstreams = update.Dns.UpstreamServers
+	dnsConfig := update.Dns
+	if dnsConfig == nil {
+		dnsConfig = &apiv1.DnsConfig{Mode: apiv1.DnsMode_DNS_MODE_DISABLED}
 	}
-	normalizedUpstreams, err := normalizeUpstreamServers(requestedUpstreams, c.server.defaultDNSUpstream)
+	dnsCeilings, err := c.server.dnsLimitCeilingsForAttachment(id)
 	if err != nil {
-		return fmt.Errorf("validating DNS upstreams: %w", err)
+		return err
+	}
+	preparedDNS, err := prepareDNSRules(dnsConfig.Mode, dnsConfig.AllowDomains, dnsConfig.DenyDomains,
+		dnsConfig.UpstreamServers, c.server.defaultDNSUpstream, dnsCeilings,
+		dnsLimitOverridesFromProto(dnsConfig))
+	if err != nil {
+		return fmt.Errorf("validating DNS configuration: %w", err)
 	}
 	allowCIDRs, denyCIDRs, parseErr := c.parseBulkCIDRs(id, update)
 	if parseErr != nil {
@@ -1190,7 +1203,11 @@ func (c *ControlPlaneClient) applyBulkUpdate(id string, update *apiv1.BulkUpdate
 	if admissionErr != nil {
 		return admissionErr
 	}
-	defer done()
+	if state.dns != nil {
+		if preflightErr := state.dns.preflightPreparedRules(preparedDNS); preflightErr != nil {
+			return c.server.finishDNSMutation(state, done, fmt.Errorf("preflighting DNS configuration: %w", preflightErr))
+		}
+	}
 
 	// ReconcileCIDRs owns the mode write too, sandwiching it between the
 	// two list reconciles (new mode's list first) so no mode pair opens a
@@ -1201,21 +1218,22 @@ func (c *ControlPlaneClient) applyBulkUpdate(id string, update *apiv1.BulkUpdate
 		reconcileErr = fmt.Errorf("reconciling CIDRs: %w", reconcileErr)
 	}
 
-	// Domain rules are replaced wholesale as before; DNS-populated filter
-	// IPs are deliberately NOT wiped (clients still hold them in resolver
-	// caches) — the janitor expires them by their DNS TTLs.
+	// Apply the prepared authoritative DNS state after the CIDR delta. The
+	// ownership manager preserves still-authorized exact keys (and their TTLs),
+	// remaps owners when rule precedence changes, and promptly removes keys
+	// whose queries no longer have an authorizing policy owner.
 	var dnsErr error
 	if update.Dns == nil {
-		if dnsErr = c.server.replaceDNSRulesAdmitted(id, state, apiv1.DnsMode_DNS_MODE_DISABLED, nil, nil, normalizedUpstreams); dnsErr != nil {
+		if dnsErr = c.server.replaceDNSPreparedAdmitted(id, state, preparedDNS); dnsErr != nil {
 			c.logger.Error().Err(dnsErr).Str("id", id).Msg("failed to clear DNS rules in bulk update")
 			dnsErr = fmt.Errorf("clearing DNS rules: %w", dnsErr)
 		}
-	} else if dnsErr = c.server.replaceDNSRulesAdmitted(id, state, update.Dns.Mode, update.Dns.AllowDomains, update.Dns.DenyDomains, normalizedUpstreams); dnsErr != nil {
+	} else if dnsErr = c.server.replaceDNSPreparedAdmitted(id, state, preparedDNS); dnsErr != nil {
 		c.logger.Error().Err(dnsErr).Str("id", id).Msg("failed to replace DNS rules in bulk update")
 		dnsErr = fmt.Errorf("replacing DNS rules: %w", dnsErr)
 	}
 
-	return errors.Join(reconcileErr, dnsErr)
+	return c.server.finishDNSMutation(state, done, errors.Join(reconcileErr, dnsErr))
 }
 
 // validateFullDesiredModes rejects unknown/UNSPECIFIED enum values before an

@@ -650,11 +650,14 @@ type AttachmentStats struct {
 	PacketsBlocked    uint64                 `protobuf:"varint,3,opt,name=packets_blocked,json=packetsBlocked,proto3" json:"packets_blocked,omitempty"`
 	DnsQueriesAllowed uint64                 `protobuf:"varint,4,opt,name=dns_queries_allowed,json=dnsQueriesAllowed,proto3" json:"dns_queries_allowed,omitempty"`
 	DnsQueriesBlocked uint64                 `protobuf:"varint,5,opt,name=dns_queries_blocked,json=dnsQueriesBlocked,proto3" json:"dns_queries_blocked,omitempty"`
-	// Cumulative count of rule insertions (control-plane CIDRs or
-	// DNS-resolved IPs) dropped because the filter's rule map was at
-	// capacity. A non-zero, growing value means the map is full and new
-	// allows are NOT taking effect; raise filter.max_rule_entries or reduce
-	// rule volume/TTLs.
+	// Cumulative count of control-plane CIDR insertions rejected by protected
+	// LPM-map capacity plus address-bearing DNS responses rejected by exact-map
+	// or logical ownership capacity. A non-zero, growing value means new policy or
+	// DNS admissions are NOT taking effect. For protected CIDR pressure, reduce
+	// rules or raise filter.max_rule_entries; for DNS pressure, reduce
+	// domain/TTL volume or raise the corresponding bounded dns.* ceiling and,
+	// if physically full, filter.max_dns_rule_entries. Both filter map sizes are
+	// load-time: an existing pinned map must be recreated to change capacity.
 	MapFullDrops uint64 `protobuf:"varint,6,opt,name=map_full_drops,json=mapFullDrops,proto3" json:"map_full_drops,omitempty"`
 	// DNS queries that ended in SERVFAIL or another resolver/proxy/admission
 	// failure. Mutually exclusive with dns_queries_allowed (successfully
@@ -1327,7 +1330,14 @@ func (x *BulkUpdate) GetDns() *DnsConfig {
 	return nil
 }
 
-// DnsConfig contains the complete DNS filtering configuration.
+// DnsConfig contains the complete DNS filtering configuration. In every
+// filtering mode, all A/AAAA records across a response's answer, authority,
+// and additional sections are admitted transactionally to the independent
+// exact-host tier before return. This includes default/explicit allows in DNS
+// DENYLIST even when the current packet mode ignores exact allows, preserving
+// cached connectivity across a later packet ALLOWLIST transition. Capacity
+// rejection preserves the existing working set and returns SERVFAIL without
+// an address. Zero limit fields inherit the daemon ceilings.
 type DnsConfig struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Complete desired DNS filtering mode. Must be a known non-UNSPECIFIED value.
@@ -1343,8 +1353,27 @@ type DnsConfig struct {
 	// order; a truncated UDP reply is retried over TCP against that same server
 	// before failover continues.
 	UpstreamServers []string `protobuf:"bytes,4,rep,name=upstream_servers,json=upstreamServers,proto3" json:"upstream_servers,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// Per-attachment logical DNS exact-tier ceiling for each IP family. It may
+	// not exceed either the daemon's dns.max_ips_per_family ceiling or the
+	// actual exact HASH map capacity.
+	MaxIpsPerFamily uint32 `protobuf:"varint,5,opt,name=max_ips_per_family,json=maxIpsPerFamily,proto3" json:"max_ips_per_family,omitempty"`
+	// Maximum unique A/AAAA addresses admitted from one response across answer,
+	// authority, and additional sections.
+	MaxIpsPerResponse uint32 `protobuf:"varint,6,opt,name=max_ips_per_response,json=maxIpsPerResponse,proto3" json:"max_ips_per_response,omitempty"`
+	// Maximum unique addresses owned by one authorization owner: an explicit
+	// matched allow-policy domain (including wildcard matches), implicit
+	// DENYLIST query owner, or proxy query owner. Shared IPs count once per
+	// owner even when several query domains hold independent TTL edges.
+	MaxIpsPerPolicyDomain uint32 `protobuf:"varint,7,opt,name=max_ips_per_policy_domain,json=maxIpsPerPolicyDomain,proto3" json:"max_ips_per_policy_domain,omitempty"`
+	// Maximum union of normalized configured policy-rule domains and live query
+	// domains retained in TTL ownership metadata.
+	MaxTrackedDomains uint32 `protobuf:"varint,8,opt,name=max_tracked_domains,json=maxTrackedDomains,proto3" json:"max_tracked_domains,omitempty"`
+	// Maximum (query domain, matched policy owner, IP) TTL ownership edges.
+	// Shared physical IPs still consume one edge for each independent query and
+	// matched owner.
+	MaxOwnershipEdges uint32 `protobuf:"varint,9,opt,name=max_ownership_edges,json=maxOwnershipEdges,proto3" json:"max_ownership_edges,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *DnsConfig) Reset() {
@@ -1403,6 +1432,41 @@ func (x *DnsConfig) GetUpstreamServers() []string {
 		return x.UpstreamServers
 	}
 	return nil
+}
+
+func (x *DnsConfig) GetMaxIpsPerFamily() uint32 {
+	if x != nil {
+		return x.MaxIpsPerFamily
+	}
+	return 0
+}
+
+func (x *DnsConfig) GetMaxIpsPerResponse() uint32 {
+	if x != nil {
+		return x.MaxIpsPerResponse
+	}
+	return 0
+}
+
+func (x *DnsConfig) GetMaxIpsPerPolicyDomain() uint32 {
+	if x != nil {
+		return x.MaxIpsPerPolicyDomain
+	}
+	return 0
+}
+
+func (x *DnsConfig) GetMaxTrackedDomains() uint32 {
+	if x != nil {
+		return x.MaxTrackedDomains
+	}
+	return 0
+}
+
+func (x *DnsConfig) GetMaxOwnershipEdges() uint32 {
+	if x != nil {
+		return x.MaxOwnershipEdges
+	}
+	return 0
 }
 
 // CIDREntry represents a CIDR with an optional TTL. In complete
@@ -1566,7 +1630,9 @@ type DnsQueryRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Attachment ID
 	Id string `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
-	// Domain being queried (e.g., "example.com.")
+	// Wire-canonical, lowercase, fully-qualified domain being queried (for
+	// example, "example.com."). Equivalent DNS presentation escapes are
+	// normalized to one spelling before the policy call.
 	Domain string `protobuf:"bytes,2,opt,name=domain,proto3" json:"domain,omitempty"`
 	// DNS query type (e.g., "A", "AAAA", "CNAME")
 	QueryType     string `protobuf:"bytes,3,opt,name=query_type,json=queryType,proto3" json:"query_type,omitempty"`
@@ -1630,7 +1696,11 @@ type DnsQueryResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Whether to allow this query
 	Allow bool `protobuf:"varint,1,opt,name=allow,proto3" json:"allow,omitempty"`
-	// If allowed, whether to add resolved IPs to the filter
+	// If allowed, whether every returned/upstream A/AAAA address may be admitted
+	// transactionally to the attachment's bounded exact tier. In filtering
+	// PROXY mode, an address-bearing response with false is converted to
+	// SERVFAIL; non-address answers may still pass. DNS_MODE_DISABLED is the
+	// explicit pass-through mode.
 	AddToFilter bool `protobuf:"varint,2,opt,name=add_to_filter,json=addToFilter,proto3" json:"add_to_filter,omitempty"`
 	// Optional: override IPs to return (if empty, daemon queries upstream)
 	Ips []string `protobuf:"bytes,3,rep,name=ips,proto3" json:"ips,omitempty"`
@@ -1805,12 +1875,17 @@ const file_v1_control_proto_rawDesc = "" +
 	"allowCidrs\x125\n" +
 	"\n" +
 	"deny_cidrs\x18\x03 \x03(\v2\x16.netfence.v1.CIDREntryR\tdenyCidrs\x12(\n" +
-	"\x03dns\x18\x04 \x01(\v2\x16.netfence.v1.DnsConfigR\x03dns\"\xdc\x01\n" +
+	"\x03dns\x18\x04 \x01(\v2\x16.netfence.v1.DnsConfigR\x03dns\"\xd4\x03\n" +
 	"\tDnsConfig\x12(\n" +
 	"\x04mode\x18\x01 \x01(\x0e2\x14.netfence.v1.DnsModeR\x04mode\x12=\n" +
 	"\rallow_domains\x18\x02 \x03(\v2\x18.netfence.v1.DomainEntryR\fallowDomains\x12;\n" +
 	"\fdeny_domains\x18\x03 \x03(\v2\x18.netfence.v1.DomainEntryR\vdenyDomains\x12)\n" +
-	"\x10upstream_servers\x18\x04 \x03(\tR\x0fupstreamServers\"L\n" +
+	"\x10upstream_servers\x18\x04 \x03(\tR\x0fupstreamServers\x12+\n" +
+	"\x12max_ips_per_family\x18\x05 \x01(\rR\x0fmaxIpsPerFamily\x12/\n" +
+	"\x14max_ips_per_response\x18\x06 \x01(\rR\x11maxIpsPerResponse\x128\n" +
+	"\x19max_ips_per_policy_domain\x18\a \x01(\rR\x15maxIpsPerPolicyDomain\x12.\n" +
+	"\x13max_tracked_domains\x18\b \x01(\rR\x11maxTrackedDomains\x12.\n" +
+	"\x13max_ownership_edges\x18\t \x01(\rR\x11maxOwnershipEdges\"L\n" +
 	"\tCIDREntry\x12\x12\n" +
 	"\x04cidr\x18\x01 \x01(\tR\x04cidr\x12+\n" +
 	"\x03ttl\x18\x02 \x01(\v2\x19.google.protobuf.DurationR\x03ttl\"T\n" +

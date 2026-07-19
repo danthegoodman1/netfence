@@ -68,7 +68,6 @@ func TestSystemOwnedDNSBootstrapSurvivesAuthoritativeStateTTLRemoveAndClear(t *t
 
 	require.NoError(t, reg.addSystem(ff, bootstrap, listAllow))
 	require.NoError(t, reg.addCP(ff, bootstrap, listAllow, time.Second, clock.Now()))
-	require.NoError(t, reg.addDNS(ff, bootstrap, listAllow, time.Second, clock.Now()))
 	require.NoError(t, reg.reconcileCP(ff, listAllow, nil, clock.Now()))
 
 	clock.Advance(time.Hour)
@@ -101,9 +100,9 @@ func TestSystemOwnedDNSBootstrapSurvivesAuthoritativeStateTTLRemoveAndClear(t *t
 }
 
 // registryLen reports the attachment's pending-expiry count: entries with a
-// finite deadline the janitor will eventually remove. Permanent entries are
-// tracked too (for aliasing pins and the 2C diff seam) but never expire, so
-// they are excluded here.
+// finite deadline the LPM janitor will eventually remove. Permanent CP and
+// daemon-system entries are tracked for authoritative diff reconciliation but
+// never expire, so they are excluded here. DNS exact ownership is separate.
 func registryLen(t *testing.T, server *Server, id string) int {
 	t.Helper()
 	server.mu.RLock()
@@ -416,7 +415,7 @@ func TestTTLConcurrentAddAndSweep(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 2B: DNS-populated IP expiry, aliasing, TTL floor, map-full handling.
+// DNS exact-tier expiry, CP overlap, TTL floor, and capacity handling.
 // ---------------------------------------------------------------------------
 
 func mustCIDR(t *testing.T, s string) *net.IPNet {
@@ -428,28 +427,28 @@ func mustCIDR(t *testing.T, s string) *net.IPNet {
 
 // TestDNSAddedIPExpiresViaJanitor: a DNS-resolved IP whose record TTL is
 // below the floor lives for the floor (default 60s), then the janitor
-// removes it from the filter and the registry.
+// removes it from the exact filter tier and ownership manager.
 func TestDNSAddedIPExpiresViaJanitor(t *testing.T) {
 	server, _, id, ff, dnsServer := newTestServerWithAttachment(t)
 	clk := newFakeClock()
 	server.now = clk.Now
 
 	dnsServer.addIPToFilter("example.com", net.ParseIP("203.0.113.10"), 32, 30)
-	_, allowed, _, _ := ff.snapshot()
-	assert.Equal(t, []string{"203.0.113.10/32"}, allowed)
-	assert.Equal(t, 1, registryLen(t, server, id))
+	dnsAllowed, _ := ff.dnsSnapshot()
+	assert.Equal(t, []string{"203.0.113.10"}, dnsAllowed)
+	assert.Zero(t, registryLen(t, server, id), "DNS exact ownership is not stored in the authoritative LPM TTL registry")
 
 	// At the record TTL (30s) the 60s floor keeps it alive.
 	clk.Advance(30 * time.Second)
 	server.sweepExpiredTTLs(clk.Now())
-	_, allowed, _, _ = ff.snapshot()
-	assert.Equal(t, []string{"203.0.113.10/32"}, allowed, "floor must outlive the record TTL")
+	dnsAllowed, _ = ff.dnsSnapshot()
+	assert.Equal(t, []string{"203.0.113.10"}, dnsAllowed, "floor must outlive the record TTL")
 
 	// At the floor it expires.
 	clk.Advance(30 * time.Second)
 	server.sweepExpiredTTLs(clk.Now())
-	_, allowed, _, _ = ff.snapshot()
-	assert.Empty(t, allowed)
+	dnsAllowed, _ = ff.dnsSnapshot()
+	assert.Empty(t, dnsAllowed)
 	assert.Zero(t, registryLen(t, server, id))
 }
 
@@ -464,13 +463,13 @@ func TestDNSRecordTTLAboveFloorIsHonored(t *testing.T) {
 
 	clk.Advance(60 * time.Second)
 	server.sweepExpiredTTLs(clk.Now())
-	_, allowed, _, _ := ff.snapshot()
-	assert.Equal(t, []string{"203.0.113.11/32"}, allowed, "record TTL above the floor must govern")
+	dnsAllowed, _ := ff.dnsSnapshot()
+	assert.Equal(t, []string{"203.0.113.11"}, dnsAllowed, "record TTL above the floor must govern")
 
 	clk.Advance(240 * time.Second)
 	server.sweepExpiredTTLs(clk.Now())
-	_, allowed, _, _ = ff.snapshot()
-	assert.Empty(t, allowed)
+	dnsAllowed, _ = ff.dnsSnapshot()
+	assert.Empty(t, dnsAllowed)
 	assert.Zero(t, registryLen(t, server, id))
 }
 
@@ -484,24 +483,25 @@ func TestDNSReResolutionRefreshesDeadline(t *testing.T) {
 	dnsServer.addIPToFilter("example.com", net.ParseIP("203.0.113.12"), 32, 60) // deadline t0+60
 	clk.Advance(30 * time.Second)
 	dnsServer.addIPToFilter("example.com", net.ParseIP("203.0.113.12"), 32, 60) // deadline t0+90
-	assert.Equal(t, 1, ff.allowCallCount(), "re-resolution of a tracked IP must not hit the filter")
+	_, dnsAddCalls := ff.dnsSnapshot()
+	assert.Equal(t, 1, dnsAddCalls, "re-resolution of a tracked IP must not hit the exact map")
 
 	clk.Advance(30 * time.Second) // t0+60: past the original deadline
 	server.sweepExpiredTTLs(clk.Now())
-	_, allowed, _, _ := ff.snapshot()
-	assert.Equal(t, []string{"203.0.113.12/32"}, allowed, "refreshed deadline must survive the original one")
+	dnsAllowed, _ := ff.dnsSnapshot()
+	assert.Equal(t, []string{"203.0.113.12"}, dnsAllowed, "refreshed deadline must survive the original one")
 
 	clk.Advance(30 * time.Second) // t0+90
 	server.sweepExpiredTTLs(clk.Now())
-	_, allowed, _, _ = ff.snapshot()
-	assert.Empty(t, allowed)
+	dnsAllowed, _ = ff.dnsSnapshot()
+	assert.Empty(t, dnsAllowed)
 	assert.Zero(t, registryLen(t, server, id))
 }
 
-// TestPermanentCPAllowPinsAliasedDNSIP is the aliasing key test: a permanent
-// control-plane allow for the same /32 a DNS resolution produced must NEVER
-// be removed when the DNS TTL lapses — in either arrival order, and
-// including a bare-IP CP rule that canonicalizes to the same /32 key.
+// TestPermanentCPAllowPinsAliasedDNSIP proves independent-tier overlap: a
+// permanent control-plane LPM allow for the same host a DNS resolution
+// admitted exactly must survive exact ownership expiry in either arrival
+// order.
 func TestPermanentCPAllowPinsAliasedDNSIP(t *testing.T) {
 	server, _, id, ff, dnsServer := newTestServerWithAttachment(t)
 	clk := newFakeClock()
@@ -515,21 +515,22 @@ func TestPermanentCPAllowPinsAliasedDNSIP(t *testing.T) {
 
 	// Order 2: DNS first, CP permanent (as bare IP) second.
 	dnsServer.addIPToFilter("two.example.com", net.ParseIP("203.0.113.20"), 32, 30)
-	assert.Equal(t, 1, registryLen(t, server, id))
+	assert.Zero(t, registryLen(t, server, id), "DNS ownership has an independent bounded exact registry")
 	c.handleCommand(allowCidrCmd(id, "203.0.113.20", 0))
-	assert.Zero(t, registryLen(t, server, id), "permanent CP re-add must clear the DNS deadline")
+	assert.Zero(t, registryLen(t, server, id), "the permanent CP LPM owner has no pending LPM deadline")
 
 	clk.Advance(1000 * time.Hour)
 	server.sweepExpiredTTLs(clk.Now())
 	_, allowed, _, _ := ff.snapshot()
 	assert.ElementsMatch(t, []string{"203.0.113.10/32", "203.0.113.20/32"}, allowed,
 		"CP-permanent entries aliased by DNS resolutions must never expire")
+	dnsAllowed, _ := ff.dnsSnapshot()
+	assert.Empty(t, dnsAllowed, "expired DNS exact aliases are removed independently of protected CP LPM allows")
 }
 
-// TestAliasedDeadlineIsMaxOfSources: when a TTL'd CP rule and a DNS
-// resolution alias the same CIDR, the entry lives until the LATEST deadline
-// of any source.
-func TestAliasedDeadlineIsMaxOfSources(t *testing.T) {
+// TestAliasedDeadlineIsMaxOfSources proves each tier honors its own deadline:
+// connectivity survives while either the CP LPM or DNS exact owner remains.
+func TestIndependentCPAndDNSDeadlinesPreserveCoverage(t *testing.T) {
 	server, _, id, ff, dnsServer := newTestServerWithAttachment(t)
 	clk := newFakeClock()
 	server.now = clk.Now
@@ -567,8 +568,8 @@ func TestAliasedDeadlineIsMaxOfSources(t *testing.T) {
 }
 
 // TestDNSEntriesDrainAfterExpiry: DNS tracking is bounded — there is no
-// per-DNS-server cache anymore, and the registry drains fully once TTLs
-// lapse instead of accumulating entries forever.
+// per-DNS-server cache anymore, and the ownership graph drains fully once
+// TTLs lapse instead of accumulating entries forever.
 func TestDNSEntriesDrainAfterExpiry(t *testing.T) {
 	server, _, id, ff, dnsServer := newTestServerWithAttachment(t)
 	clk := newFakeClock()
@@ -577,7 +578,9 @@ func TestDNSEntriesDrainAfterExpiry(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		dnsServer.addIPToFilter("bulk.example.com", net.ParseIP(fmt.Sprintf("203.0.113.%d", i+1)).To4(), 32, 30)
 	}
-	assert.Equal(t, 100, registryLen(t, server, id))
+	dnsAllowed, _ := ff.dnsSnapshot()
+	assert.Len(t, dnsAllowed, 100)
+	assert.Zero(t, registryLen(t, server, id))
 
 	clk.Advance(60 * time.Second)
 	server.sweepExpiredTTLs(clk.Now())
@@ -586,14 +589,12 @@ func TestDNSEntriesDrainAfterExpiry(t *testing.T) {
 	total := server.attachments[id].ttls.len()
 	server.mu.RUnlock()
 	assert.Zero(t, total, "registry must drain fully after expiry")
-	_, allowed, _, _ := ff.snapshot()
-	assert.Empty(t, allowed)
+	dnsAllowed, _ = ff.dnsSnapshot()
+	assert.Empty(t, dnsAllowed)
 }
 
-// TestMapFullCountedSurfacedAndRecovers: a full rule map increments the
-// per-attachment map_full_drops stat (DNS and CP paths alike) instead of
-// silently dropping, records nothing bogus in the registry, and recovers as
-// soon as capacity frees up.
+// TestMapFullCountedSurfacedAndRecovers: authoritative LPM pressure remains
+// independently counted; DNS exact admission does not consume that map.
 func TestMapFullCountedSurfacedAndRecovers(t *testing.T) {
 	server, _, id, ff, dnsServer := newTestServerWithAttachment(t)
 	clk := newFakeClock()
@@ -604,7 +605,10 @@ func TestMapFullCountedSurfacedAndRecovers(t *testing.T) {
 
 	dnsServer.addIPToFilter("a.example.com", net.ParseIP("203.0.113.40"), 32, 30)
 	dnsServer.addIPToFilter("b.example.com", net.ParseIP("203.0.113.41"), 32, 30)
-	assert.Zero(t, registryLen(t, server, id), "dropped adds must not be tracked")
+	assert.Zero(t, registryLen(t, server, id))
+	dnsAllowed, _ := ff.dnsSnapshot()
+	assert.ElementsMatch(t, []string{"203.0.113.40", "203.0.113.41"}, dnsAllowed,
+		"DNS exact admission must remain independent of an LPM allow-map failure")
 
 	err := server.AllowCIDR(id, mustCIDR(t, "198.51.100.1/32"), 0)
 	require.Error(t, err)
@@ -617,19 +621,19 @@ func TestMapFullCountedSurfacedAndRecovers(t *testing.T) {
 		}
 	}
 	require.NotNil(t, stat)
-	assert.Equal(t, uint64(3), stat.MapFullDrops, "every dropped add (DNS and CP) must be counted")
+	assert.Equal(t, uint64(1), stat.MapFullDrops, "the failed authoritative LPM add is counted independently")
 
 	// Capacity frees up (janitor expired something): adds work again and the
 	// counter stops growing.
 	ff.setAllowErr(nil)
 	dnsServer.addIPToFilter("a.example.com", net.ParseIP("203.0.113.40"), 32, 30)
 	_, allowed, _, _ := ff.snapshot()
-	assert.Equal(t, []string{"203.0.113.40/32"}, allowed)
-	assert.Equal(t, 1, registryLen(t, server, id))
+	assert.Empty(t, allowed)
+	assert.Zero(t, registryLen(t, server, id))
 	server.mu.RLock()
 	drops := server.attachments[id].ttls.mapFullCount()
 	server.mu.RUnlock()
-	assert.Equal(t, uint64(3), drops)
+	assert.Equal(t, uint64(1), drops)
 }
 
 // ---------------------------------------------------------------------------
@@ -692,7 +696,7 @@ func TestBulkUpdateNoWindowForSurvivingRules(t *testing.T) {
 	assert.Equal(t, []string{"10.0.0.0/8"}, allowed)
 }
 
-// TestBulkUpdatePreservesDNSPopulatedIPs: a DNS-populated /32 absent from
+// TestBulkUpdatePreservesDNSPopulatedIPs: a DNS-populated exact host absent from
 // the bulk's declared CP set is NOT removed by the resync — it stays in the
 // filter and only ages out later when its own DNS TTL lapses.
 func TestBulkUpdatePreservesDNSPopulatedIPs(t *testing.T) {
@@ -706,11 +710,17 @@ func TestBulkUpdatePreservesDNSPopulatedIPs(t *testing.T) {
 	c.applyBulkUpdate(id, &apiv1.BulkUpdate{
 		Mode:       apiv1.PolicyMode_POLICY_MODE_ALLOWLIST,
 		AllowCidrs: []*apiv1.CIDREntry{{Cidr: "198.51.100.0/24"}},
+		Dns: &apiv1.DnsConfig{
+			Mode:         apiv1.DnsMode_DNS_MODE_ALLOWLIST,
+			AllowDomains: []*apiv1.DomainEntry{{Domain: "cached.example.com"}},
+		},
 	})
 
 	_, allowed, _, _ := ff.snapshot()
-	assert.ElementsMatch(t, []string{"203.0.113.5/32", "198.51.100.0/24"}, allowed,
-		"DNS-populated IP must survive the bulk update")
+	assert.ElementsMatch(t, []string{"198.51.100.0/24"}, allowed)
+	dnsAllowed, _ := ff.dnsSnapshot()
+	assert.Equal(t, []string{"203.0.113.5"}, dnsAllowed,
+		"an exact key whose query remains authorized must survive the bulk update")
 	removedAllowed, _ := ff.removeCalls()
 	assert.Empty(t, removedAllowed)
 
@@ -719,13 +729,13 @@ func TestBulkUpdatePreservesDNSPopulatedIPs(t *testing.T) {
 	server.sweepExpiredTTLs(clk.Now())
 	_, allowed, _, _ = ff.snapshot()
 	assert.Equal(t, []string{"198.51.100.0/24"}, allowed)
+	dnsAllowed, _ = ff.dnsSnapshot()
+	assert.Empty(t, dnsAllowed)
 }
 
-// TestBulkUpdateClearsCPSourceButDNSKeepsEntry: when a CIDR held by BOTH a
-// TTL'd CP rule and a DNS resolution is dropped from the bulk's declared
-// set, only the CP source is cleared — the DNS source keeps the entry in
-// the filter, and it then expires at the DNS deadline, NOT the (longer) CP
-// deadline the bulk revoked.
+// TestBulkUpdateClearsCPSourceButDNSKeepsEntry proves a BulkUpdate can revoke
+// an overlapping CP LPM rule while its still-authorized DNS exact owner stays
+// live until the independent DNS deadline.
 func TestBulkUpdateClearsCPSourceButDNSKeepsEntry(t *testing.T) {
 	server, _, id, ff, dnsServer := newTestServerWithAttachment(t)
 	clk := newFakeClock()
@@ -739,12 +749,18 @@ func TestBulkUpdateClearsCPSourceButDNSKeepsEntry(t *testing.T) {
 	c.applyBulkUpdate(id, &apiv1.BulkUpdate{
 		Mode:       apiv1.PolicyMode_POLICY_MODE_ALLOWLIST,
 		AllowCidrs: []*apiv1.CIDREntry{{Cidr: "198.51.100.0/24"}},
+		Dns: &apiv1.DnsConfig{
+			Mode:         apiv1.DnsMode_DNS_MODE_ALLOWLIST,
+			AllowDomains: []*apiv1.DomainEntry{{Domain: "both.example.com"}},
+		},
 	})
 
 	_, allowed, _, _ := ff.snapshot()
-	assert.Contains(t, allowed, "203.0.113.6/32", "live DNS source must keep the entry through the bulk")
+	assert.NotContains(t, allowed, "203.0.113.6/32", "the revoked CP LPM owner is removed")
+	dnsAllowed, _ := ff.dnsSnapshot()
+	assert.Contains(t, dnsAllowed, "203.0.113.6", "the independent DNS exact owner keeps connectivity")
 	removedAllowed, _ := ff.removeCalls()
-	assert.Empty(t, removedAllowed)
+	assert.Contains(t, removedAllowed, "203.0.113.6/32", "the revoked CP source is removed only from the LPM tier")
 
 	// The revoked CP deadline (10min) must NOT keep it alive: it expires at
 	// the DNS deadline (60s).
@@ -753,15 +769,16 @@ func TestBulkUpdateClearsCPSourceButDNSKeepsEntry(t *testing.T) {
 	_, allowed, _, _ = ff.snapshot()
 	assert.Equal(t, []string{"198.51.100.0/24"}, allowed,
 		"entry must expire at the DNS deadline once the bulk cleared the CP source")
+	dnsAllowed, _ = ff.dnsSnapshot()
+	assert.Empty(t, dnsAllowed)
 	// Only the bulk's permanent entry remains, and it is pinned: nothing
 	// is pending expiry.
 	assert.Zero(t, registryLen(t, server, id))
 }
 
-// TestBulkUpdateConcurrentWithDNSAdds hammers bulk reconciles against
-// concurrent DNS sink adds and janitor sweeps so the race detector can vet
-// the reconcile locking, and asserts the invariant that a CIDR declared in
-// every bulk is present at the end.
+// TestBulkUpdateConcurrentWithDNSAdds hammers independent LPM reconciliation
+// and exact ownership admission/expiry under the attachment mutation barrier,
+// and asserts the permanent CP survivor remains installed.
 func TestBulkUpdateConcurrentWithDNSAdds(t *testing.T) {
 	server, _, id, ff, dnsServer := newTestServerWithAttachment(t)
 	clk := newFakeClock()

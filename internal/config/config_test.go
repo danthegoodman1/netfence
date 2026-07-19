@@ -25,6 +25,66 @@ func TestValidateIndependentDNSExactMapCapacity(t *testing.T) {
 	}
 }
 
+func TestValidateDNSOwnershipLimitRelationships(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Config)
+		want   string
+	}{
+		{
+			name:   "explicit family cap above default exact map",
+			mutate: func(c *Config) { c.DNS.MaxIPsPerFamily = 4097 },
+			want:   "effective filter.max_dns_rule_entries capacity (4096)",
+		},
+		{
+			name: "response above aggregate",
+			mutate: func(c *Config) {
+				c.Filter.MaxDNSRuleEntries = 2
+				c.DNS.MaxIPsPerResponse = 5
+			},
+			want: "aggregate logical exact-tier capacity (4)",
+		},
+		{
+			name: "policy owner above aggregate",
+			mutate: func(c *Config) {
+				c.Filter.MaxDNSRuleEntries = 2
+				c.DNS.MaxIPsPerPolicyDomain = 5
+			},
+			want: "max_ips_per_policy_domain",
+		},
+		{
+			name: "response above edges",
+			mutate: func(c *Config) {
+				c.DNS.MaxIPsPerResponse = 3
+				c.DNS.MaxOwnershipEdges = 2
+			},
+			want: "max_ownership_edges (2)",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validBase()
+			tt.mutate(cfg)
+			err := cfg.Validate()
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("expected deterministic error containing %q, got %v", tt.want, err)
+			}
+		})
+	}
+}
+
+func TestValidateDNSOwnershipFieldOrderIsDeterministic(t *testing.T) {
+	cfg := validBase()
+	cfg.DNS.MaxIPsPerFamily = -1
+	cfg.DNS.MaxIPsPerResponse = -1
+	for i := 0; i < 20; i++ {
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "dns.max_ips_per_family") {
+			t.Fatalf("first invalid field changed on run %d: %v", i, err)
+		}
+	}
+}
+
 // validBase returns a Config that passes every non-control-plane Validate
 // check, so control-plane cases only exercise the invariant under test.
 func validBase() *Config {

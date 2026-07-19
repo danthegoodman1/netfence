@@ -300,11 +300,12 @@ func TestServerReplaceDNSRulesPersists(t *testing.T) {
 	server, st, id, ff, dnsServer := newTestServerWithAttachment(t)
 	dnsServer.addIPToFilter("example.com", netIP(t, "203.0.113.20"), 32, 60)
 
-	// DNS-populated IPs are tracked in the TTL registry (janitor-expired),
-	// not a per-DNS-server cache; replacing domain rules leaves them in the
-	// filter until their TTL lapses.
+	// DNS-populated IPs live only in the exact tier, never the authoritative
+	// LPM map.
 	_, allowed, _, _ := ff.snapshot()
-	require.Equal(t, []string{"203.0.113.20/32"}, allowed)
+	require.Empty(t, allowed)
+	dnsAllowed, _ := ff.dnsSnapshot()
+	require.Equal(t, []string{"203.0.113.20"}, dnsAllowed)
 
 	require.NoError(t, server.ReplaceDNSRules(
 		id,
@@ -312,6 +313,8 @@ func TestServerReplaceDNSRulesPersists(t *testing.T) {
 		[]*apiv1.DomainEntry{{Domain: "allowed.test", IncludeSubdomains: true}},
 		[]*apiv1.DomainEntry{{Domain: "denied.test"}},
 	))
+	dnsAllowed, _ = ff.dnsSnapshot()
+	assert.Empty(t, dnsAllowed, "replacing away the owner promptly de-allows its exact key")
 
 	stored, err := st.GetAttachment(id)
 	require.NoError(t, err)

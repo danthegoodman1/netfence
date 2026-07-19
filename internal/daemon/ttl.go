@@ -34,8 +34,6 @@ const (
 	// sourceCP is a control-plane CIDR rule (AllowCidr/DenyCidr commands,
 	// SubscribedAck, BulkUpdate).
 	sourceCP ruleSource = iota
-	// sourceDNS is a DNS-resolved IP added through the DNSFilterSink.
-	sourceDNS
 	// sourceSystem is daemon-owned attachment infrastructure. Today it is the
 	// concrete host route for the attachment's DNS listener. It is permanent
 	// for the attachment lifetime and is deliberately outside authoritative
@@ -44,23 +42,21 @@ const (
 )
 
 // ttlKey identifies one tracked filter entry. cidr is the canonical (masked)
-// string form produced by (*net.IPNet).String(), so equal networks written
-// differently — including a control-plane CIDR and a DNS-resolved /32 for
-// the same address — collapse to one key.
+// string form produced by (*net.IPNet).String(), so equal control-plane
+// networks written differently collapse to one key.
 type ttlKey struct {
 	cidr string
 	list ruleList
 }
 
-// ttlEntry is one filter entry with its per-source lifetimes. Each source is
-// independent: the entry stays in the filter while ANY source is live, and
-// its effective deadline is the max over live sources (a permanent CP source
-// counts as infinite).
+// ttlEntry is one authoritative/system LPM entry. A system owner pins it for
+// the attachment lifetime; otherwise the control-plane lifetime determines
+// expiry.
 type ttlEntry struct {
 	cidr *net.IPNet
 
 	// systemLive pins daemon-owned attachment infrastructure. Control-plane
-	// reconciliation/removal, DNS expiry, and rule clears must preserve it.
+	// reconciliation/removal, TTL expiry, and rule clears must preserve it.
 	systemLive bool
 
 	// cpLive reports whether a control-plane rule currently wants this
@@ -69,14 +65,9 @@ type ttlEntry struct {
 	cpLive     bool
 	cpDeadline time.Time
 
-	// dnsLive reports whether a DNS resolution currently wants this entry;
-	// dnsDeadline (always finite) is when that claim lapses.
-	dnsLive     bool
-	dnsDeadline time.Time
-
 	// inFilter records whether the entry was successfully written to the
-	// eBPF filter, so repeated adds (e.g. every DNS query for a cached
-	// domain) skip the redundant map syscall. It stays false while the
+	// eBPF filter, so repeated CP/system adds skip the redundant map syscall.
+	// It stays false while the
 	// attachment has no filter yet (restore window, !linux stub) so the
 	// first add after the filter exists writes through.
 	inFilter bool
@@ -87,32 +78,17 @@ func (e ttlEntry) cpPermanent() bool {
 	return e.cpLive && e.cpDeadline.IsZero()
 }
 
-// ttlRegistry tracks every CIDR entry the daemon has added to one
-// attachment's filter — control-plane rules and DNS-resolved IPs alike —
-// with an independent lifetime per source (see ttlEntry), and serializes
-// that attachment's CIDR-rule mutations: every add/remove/reconcile/clear/
-// expire routes through a method that holds r.mu across BOTH the eBPF
-// filter call and the bookkeeping update. That makes "a concurrent re-add
-// wins over an in-flight expiry" trivially true — the janitor's expire pass
-// and an add can never interleave between the kernel map write and the
-// registry write.
+// ttlRegistry is the single owner of authoritative control-plane and
+// daemon-system LPM bookkeeping. DNS-derived host allows deliberately do not
+// enter this registry; dnsOwnershipManager owns their separate exact HASH
+// tier, TTLs, query/policy edges, and prompt removal.
 //
-// Lifetime model (per-source max-deadline / permanent-pin): a CP add with
-// ttl <= 0 pins the CP source permanent; a CP add with ttl > 0 extends the
-// CP deadline to max(existing, now+ttl) and never demotes a permanent CP
-// source; a DNS add extends the DNS deadline the same way. The entry lives
-// while ANY source is live, so it lives as long as the longest-lived source
-// that wants it: a permanent control-plane allow aliasing a DNS-resolved
-// /32 is never removed when the DNS TTL lapses, while a DNS-only /32
-// expires on schedule. The source split is what lets BulkUpdate reconcile
-// the control-plane rule set as a delta (reconcileCP): entries with a live
-// CP source ARE the current CP-declared set, and dropping a CIDR from that
-// set clears only the CP source — a live DNS source keeps the entry in the
-// filter until its own TTL lapses.
-//
-// Explicit remove() and clear() drop control-plane/DNS ownership, but retain
-// daemon-owned system entries. A DNS-populated entry self-heals on the next
-// resolution.
+// Every LPM add/remove/reconcile/clear/expire holds r.mu across both the eBPF
+// syscall and bookkeeping update, so a concurrent re-add cannot interleave
+// with expiry. A CP add with ttl <= 0 is permanent; a positive TTL extends the
+// deadline monotonically. Authoritative reconcile may replace that lifetime
+// exactly. Explicit remove() and clear() drop CP ownership while retaining
+// daemon-owned system entries.
 //
 // Locking: r.mu is a leaf lock. Callers snapshot the *ttlRegistry and
 // filter.Filter under Server.mu, release Server.mu, and only then lock r.mu;
@@ -151,14 +127,6 @@ func (r *ttlRegistry) addCP(f filter.Filter, cidr *net.IPNet, list ruleList, ttl
 	return r.addSourceLocked(f, cidr, list, sourceCP, ttl, now)
 }
 
-// addDNS records a DNS-resolution claim on the CIDR, extending the DNS
-// deadline to max(existing, now+ttl). It never touches the CP source.
-func (r *ttlRegistry) addDNS(f filter.Filter, cidr *net.IPNet, list ruleList, ttl time.Duration, now time.Time) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.addSourceLocked(f, cidr, list, sourceDNS, ttl, now)
-}
-
 // addSystem installs a permanent daemon-owned entry. It is used for
 // attachment infrastructure that must remain reachable independently of
 // authoritative control-plane desired state and DNS-derived admission.
@@ -169,8 +137,8 @@ func (r *ttlRegistry) addSystem(f filter.Filter, cidr *net.IPNet, list ruleList)
 }
 
 // removeSystem rolls back this daemon generation's system claim. Independent
-// CP/DNS aliases survive; the physical entry is removed only when system was
-// its sole owner. On removal failure the source-less entry remains for retry.
+// CP aliases survive; the physical entry is removed only when system was its
+// sole owner. On removal failure the source-less entry remains for retry.
 func (r *ttlRegistry) removeSystem(f filter.Filter, cidr *net.IPNet, list ruleList) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -180,7 +148,7 @@ func (r *ttlRegistry) removeSystem(f filter.Filter, cidr *net.IPNet, list ruleLi
 		return nil
 	}
 	entry.systemLive = false
-	if entry.cpLive || entry.dnsLive {
+	if entry.cpLive {
 		r.entries[key] = entry
 		return nil
 	}
@@ -222,11 +190,6 @@ func (r *ttlRegistry) addSourceLocked(f filter.Filter, cidr *net.IPNet, list rul
 			}
 			entry.cpLive = true
 		}
-	case sourceDNS:
-		deadline := now.Add(ttl)
-		if !entry.dnsLive || entry.dnsDeadline.Before(deadline) {
-			entry.dnsLive, entry.dnsDeadline = true, deadline
-		}
 	case sourceSystem:
 		entry.systemLive = true
 	}
@@ -260,11 +223,10 @@ func (r *ttlRegistry) addSourceLocked(f filter.Filter, cidr *net.IPNet, list rul
 //     state may shorten a TTL or demote a previously-permanent restored rule)
 //     while a CIDR in both old and new sets is NEVER removed/re-added in the
 //     kernel map — no transient allow/block window;
-//   - entries whose CP source is no longer declared lose ONLY that source:
-//     a live DNS source keeps them in the filter until its own TTL lapses,
-//     and only source-less entries are removed from the filter.
+//   - entries whose CP source is no longer declared are removed unless a
+//     daemon-system owner pins them.
 //
-// The whole reconcile holds r.mu, so concurrent DNS adds and janitor sweeps
+// The whole reconcile holds r.mu, so concurrent CP adds and janitor sweeps
 // serialize around it and can never observe a half-applied update.
 func (r *ttlRegistry) reconcileCP(f filter.Filter, list ruleList, desired []parsedCIDR, now time.Time) error {
 	r.mu.Lock()
@@ -291,16 +253,10 @@ func (r *ttlRegistry) reconcileCP(f filter.Filter, list ruleList, desired []pars
 		// already false; continue into the same removal path so every retry keeps
 		// reporting failure until the stale kernel rule is actually gone.
 		entry.cpLive, entry.cpDeadline = false, time.Time{}
-		if entry.dnsLive && !entry.dnsDeadline.After(now) {
-			entry.dnsLive, entry.dnsDeadline = false, time.Time{}
-		}
-		if entry.systemLive || entry.dnsLive {
-			// DNS still wants it: keep the filter entry, drop only the CP
-			// source. It ages out via its DNS deadline.
+		if entry.systemLive {
 			r.entries[key] = entry
 			continue
 		}
-		entry.dnsLive, entry.dnsDeadline = false, time.Time{}
 		var err error
 		if f != nil {
 			if list == listAllow {
@@ -326,7 +282,7 @@ func (r *ttlRegistry) reconcileCP(f filter.Filter, list ruleList, desired []pars
 // state. Unlike incremental addCP's monotonic max-deadline semantics, this
 // replaces the CP lifetime exactly: permanent may become finite and a longer
 // deadline may become shorter. An already-installed survivor is bookkeeping
-// only (no filter Remove/Add); independent DNS ownership is preserved.
+// only (no filter Remove/Add).
 func (r *ttlRegistry) replaceCPSourceLocked(f filter.Filter, cidr *net.IPNet, list ruleList, ttl time.Duration, now time.Time) error {
 	key := ttlKey{cidr: cidr.String(), list: list}
 	entry, exists := r.entries[key]
@@ -363,7 +319,7 @@ func (r *ttlRegistry) replaceCPSourceLocked(f filter.Filter, cidr *net.IPNet, li
 	return nil
 }
 
-// remove deletes control-plane and DNS ownership for the CIDR. A protected
+// remove deletes control-plane ownership for the CIDR. A protected
 // system owner survives without a filter syscall; otherwise it purges the
 // whole entry so the janitor never "expires" an entry that was
 // explicitly removed (and possibly re-added as permanent) in the meantime.
@@ -380,7 +336,6 @@ func (r *ttlRegistry) remove(f filter.Filter, cidr *net.IPNet, list ruleList) er
 	key := ttlKey{cidr: cidr.String(), list: list}
 	if entry, ok := r.entries[key]; ok && entry.systemLive {
 		entry.cpLive, entry.cpDeadline = false, time.Time{}
-		entry.dnsLive, entry.dnsDeadline = false, time.Time{}
 		r.entries[key] = entry
 		return nil
 	}
@@ -413,12 +368,10 @@ func (r *ttlRegistry) clear(f filter.Filter) error {
 	for key, entry := range r.entries {
 		if entry.systemLive {
 			entry.cpLive, entry.cpDeadline = false, time.Time{}
-			entry.dnsLive, entry.dnsDeadline = false, time.Time{}
 			r.entries[key] = entry
 			continue
 		}
 		entry.cpLive, entry.cpDeadline = false, time.Time{}
-		entry.dnsLive, entry.dnsDeadline = false, time.Time{}
 		var err error
 		if f != nil {
 			if key.list == listAllow {
@@ -487,14 +440,11 @@ type sweptEntry struct {
 	err  error
 }
 
-// expire ages each entry's sources independently and removes an entry from
-// both the filter and the registry only when NO source remains live. A
-// permanent CP source is never expired; a lapsed DNS source on a CP-pinned
-// entry only drops the DNS bookkeeping. On a filter removal error the
-// (source-less) entry is KEPT for retry on the next sweep: failing to
-// remove an expired allow entry is fail-open, so silently dropping the
-// bookkeeping is the wrong direction. (Detach purges the registry, so a
-// closed filter cannot cause an endless retry loop.)
+// expire removes finite control-plane LPM entries after their deadline. A
+// permanent CP or daemon-system source never expires. On a filter removal
+// error the source-less entry is kept for retry on the next sweep: silently
+// dropping bookkeeping while an expired allow remains live would fail open.
+// DNS exact-tier expiry is owned independently by dnsOwnershipManager.
 func (r *ttlRegistry) expire(f filter.Filter, now time.Time) []sweptEntry {
 	if r == nil {
 		return nil
@@ -509,11 +459,7 @@ func (r *ttlRegistry) expire(f filter.Filter, now time.Time) []sweptEntry {
 			entry.cpLive, entry.cpDeadline = false, time.Time{}
 			changed = true
 		}
-		if entry.dnsLive && !entry.dnsDeadline.After(now) {
-			entry.dnsLive, entry.dnsDeadline = false, time.Time{}
-			changed = true
-		}
-		if entry.systemLive || entry.cpLive || entry.dnsLive {
+		if entry.systemLive || entry.cpLive {
 			if changed {
 				r.entries[key] = entry
 			}

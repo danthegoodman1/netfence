@@ -46,8 +46,8 @@ func TestApplyBulkUpdateReplacesExistingState(t *testing.T) {
 		[]*apiv1.DomainEntry{{Domain: "old-deny.test"}},
 	))
 	dnsServer.addIPToFilter("cached.test", netIP(t, "203.0.113.200"), 32, 60)
-	_, allowedBefore, _, _ := ff.snapshot()
-	require.Contains(t, allowedBefore, "203.0.113.200/32")
+	dnsBefore, _ := ff.dnsSnapshot()
+	require.Contains(t, dnsBefore, "203.0.113.200")
 
 	c.applyBulkUpdate(id, &apiv1.BulkUpdate{
 		Mode:       apiv1.PolicyMode_POLICY_MODE_DENYLIST,
@@ -64,21 +64,22 @@ func TestApplyBulkUpdateReplacesExistingState(t *testing.T) {
 	mode, allowed, denied, clearCalls := ff.snapshot()
 	assert.Equal(t, filter.ModeDenylist, mode)
 	assert.Zero(t, clearCalls, "bulk update must reconcile deltas, never wipe the filter")
-	// The stale CP rule is removed, the new one added — and the
-	// DNS-populated IP SURVIVES the resync (it ages out via its own DNS
-	// TTL; clients still hold it in resolver caches).
-	assert.ElementsMatch(t, []string{"198.51.100.0/24", "203.0.113.200/32"}, allowed)
+	// The stale CP rule is removed and the new one added. cached.test loses
+	// ownership because the authoritative DNS allowlist no longer permits it.
+	assert.ElementsMatch(t, []string{"198.51.100.0/24"}, allowed)
+	dnsAfter, _ := ff.dnsSnapshot()
+	assert.Empty(t, dnsAfter)
 	assert.Equal(t, []string{"2001:db8::/32"}, denied)
 	removedAllowed, removedDenied := ff.removeCalls()
 	assert.Equal(t, []string{"10.0.0.0/8"}, removedAllowed)
 	assert.Equal(t, []string{"192.0.2.0/24"}, removedDenied)
 
-	// Exactly one entry is pending expiry afterwards: the surviving
-	// DNS-populated IP. The bulk's permanent entries are pinned.
+	// DNS ownership is independent of the authoritative LPM TTL registry, and
+	// the bulk's remaining CP entries are permanent.
 	server.mu.RLock()
 	reg := server.attachments[id].ttls
 	server.mu.RUnlock()
-	assert.Equal(t, 1, reg.pendingLen())
+	assert.Zero(t, reg.pendingLen())
 
 	dnsServer.mu.RLock()
 	defer dnsServer.mu.RUnlock()
@@ -200,7 +201,7 @@ func TestApplyBulkUpdateRejectsInvalidUpstreamBeforeAnyMutation(t *testing.T) {
 	results := drainCommandResults(t, client)
 	require.Len(t, results, 1)
 	assert.False(t, results[0].Success)
-	assert.Contains(t, results[0].Error, "validating DNS upstreams")
+	assert.Contains(t, results[0].Error, "validating DNS configuration")
 	assert.Equal(t, beforeEvents, ff.eventLog())
 	afterStored, err := st.GetAttachment(id)
 	require.NoError(t, err)

@@ -167,11 +167,14 @@ message AttachmentStats {
   uint64 packets_blocked = 3;
   uint64 dns_queries_allowed = 4;
   uint64 dns_queries_blocked = 5;
-  // Cumulative count of rule insertions (control-plane CIDRs or
-  // DNS-resolved IPs) dropped because the filter's rule map was at
-  // capacity. A non-zero, growing value means the map is full and new
-  // allows are NOT taking effect; raise filter.max_rule_entries or reduce
-  // rule volume/TTLs.
+  // Cumulative count of control-plane CIDR insertions rejected by protected
+  // LPM-map capacity plus address-bearing DNS responses rejected by exact-map
+  // or logical ownership capacity. A non-zero, growing value means new policy or
+  // DNS admissions are NOT taking effect. For protected CIDR pressure, reduce
+  // rules or raise filter.max_rule_entries; for DNS pressure, reduce
+  // domain/TTL volume or raise the corresponding bounded dns.* ceiling and,
+  // if physically full, filter.max_dns_rule_entries. Both filter map sizes are
+  // load-time: an existing pinned map must be recreated to change capacity.
   uint64 map_full_drops = 6;
   // DNS queries that ended in SERVFAIL or another resolver/proxy/admission
   // failure. Mutually exclusive with dns_queries_allowed (successfully
@@ -282,7 +285,14 @@ message BulkUpdate {
   DnsConfig dns = 4;
 }
 
-// DnsConfig contains the complete DNS filtering configuration.
+// DnsConfig contains the complete DNS filtering configuration. In every
+// filtering mode, all A/AAAA records across a response's answer, authority,
+// and additional sections are admitted transactionally to the independent
+// exact-host tier before return. This includes default/explicit allows in DNS
+// DENYLIST even when the current packet mode ignores exact allows, preserving
+// cached connectivity across a later packet ALLOWLIST transition. Capacity
+// rejection preserves the existing working set and returns SERVFAIL without
+// an address. Zero limit fields inherit the daemon ceilings.
 message DnsConfig {
   // Complete desired DNS filtering mode. Must be a known non-UNSPECIFIED value.
   DnsMode mode = 1;
@@ -297,6 +307,26 @@ message DnsConfig {
   // order; a truncated UDP reply is retried over TCP against that same server
   // before failover continues.
   repeated string upstream_servers = 4;
+
+  // Per-attachment logical DNS exact-tier ceiling for each IP family. It may
+  // not exceed either the daemon's dns.max_ips_per_family ceiling or the
+  // actual exact HASH map capacity.
+  uint32 max_ips_per_family = 5;
+  // Maximum unique A/AAAA addresses admitted from one response across answer,
+  // authority, and additional sections.
+  uint32 max_ips_per_response = 6;
+  // Maximum unique addresses owned by one authorization owner: an explicit
+  // matched allow-policy domain (including wildcard matches), implicit
+  // DENYLIST query owner, or proxy query owner. Shared IPs count once per
+  // owner even when several query domains hold independent TTL edges.
+  uint32 max_ips_per_policy_domain = 7;
+  // Maximum union of normalized configured policy-rule domains and live query
+  // domains retained in TTL ownership metadata.
+  uint32 max_tracked_domains = 8;
+  // Maximum (query domain, matched policy owner, IP) TTL ownership edges.
+  // Shared physical IPs still consume one edge for each independent query and
+  // matched owner.
+  uint32 max_ownership_edges = 9;
 }
 
 // CIDREntry represents a CIDR with an optional TTL. In complete
@@ -323,7 +353,9 @@ message SetDnsMode { DnsMode mode = 1; }
 message DnsQueryRequest {
   // Attachment ID
   string id = 1;
-  // Domain being queried (e.g., "example.com.")
+  // Wire-canonical, lowercase, fully-qualified domain being queried (for
+  // example, "example.com."). Equivalent DNS presentation escapes are
+  // normalized to one spelling before the policy call.
   string domain = 2;
   // DNS query type (e.g., "A", "AAAA", "CNAME")
   string query_type = 3;
@@ -333,7 +365,11 @@ message DnsQueryRequest {
 message DnsQueryResponse {
   // Whether to allow this query
   bool allow = 1;
-  // If allowed, whether to add resolved IPs to the filter
+  // If allowed, whether every returned/upstream A/AAAA address may be admitted
+  // transactionally to the attachment's bounded exact tier. In filtering
+  // PROXY mode, an address-bearing response with false is converted to
+  // SERVFAIL; non-address answers may still pass. DNS_MODE_DISABLED is the
+  // explicit pass-through mode.
   bool add_to_filter = 2;
   // Optional: override IPs to return (if empty, daemon queries upstream)
   repeated string ips = 3;
