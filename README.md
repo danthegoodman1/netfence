@@ -281,6 +281,70 @@ daemon `dns.max_churn_units` ceiling. Raising the daemon ceiling requires a
 restart; increasing `filter.max_dns_rule_entries` also requires recreating the
 attachment because pinned maps cannot be resized in place.
 
+### Protected CIDR capacity and fail-closed recovery
+
+Authoritative control-plane CIDRs and daemon-system rules use four independent,
+non-evictable LPM maps: allow/deny × IPv4/IPv6. Each map has
+`filter.max_rule_entries` slots. The DNS listener `/32` or `/128` bootstrap is a
+system allow and counts against the corresponding protected allow map. DNS
+exact-host entries remain in their separate maps and cannot consume these
+slots. No protected rule is ever LRU-evicted: explicit allows, system rules,
+and every deny remain until an authorized removal or complete replacement.
+
+A complete `SubscribedAck` or `BulkUpdate` is canonicalized and its final
+occupancy is checked for all four maps before mutation. Capacity is based on the
+final state, so replacing keys in a full map is valid; oversized state is
+rejected without evicting or partially accepting rules. Survivors are not
+removed and re-added. If a later map syscall fails, Netfence restores and
+verifies the exact pre-call four-map inventory. The proven mode after rollback
+is the old mode or `BLOCK_ALL` (normally `BLOCK_ALL`), so the daemon still holds
+the attachment fail closed until a complete authoritative retry succeeds.
+
+Protected-policy safety state is persisted with the attachment and exported in
+heartbeats. `BLOCK_ALL` by itself is a normal, healthy configured mode:
+`policy_degraded` is false when `policy_degraded_reason` is empty. A risky
+protected mutation that starts while healthy `BLOCK_ALL` first journals
+`protected_policy_mutation_in_progress`. This is a transient crash journal, not
+a stable failure diagnosis: the live operation may publish its intended mode
+before the final journal-clear save, and successful completion clears the
+journal itself. If startup finds it after a crash, startup first forces and
+proves `BLOCK_ALL`, then persists
+`protected_policy_mutation_interrupted`. Stable degraded reason codes are:
+
+- `protected_policy_mutation_interrupted`
+- `authoritative_protected_policy_failed`
+- `incremental_deny_install_failed`
+- `incremental_allow_removal_failed`
+- `incremental_mode_change_failed`
+
+These are stable classifications, never raw syscall/store text. The
+in-progress journal is an internal persisted crash boundary; heartbeat stats
+serialize with the owning mutation and therefore observe either its successful
+clear or a stable failure conversion, not the live intermediate journal.
+Stable degraded/interrupted reasons hold packet enforcement in proven
+`BLOCK_ALL` and reject incremental CIDR and packet-mode commands.
+Independent DNS configuration changes and DNS TTL expiry may continue under
+that proven hold, but cannot clear the stable reason or reactivate packet
+policy. Recovery from a stable reason requires one complete LPM **and** DNS
+desired state: send `BulkUpdate` (or answer a restored attachment's fresh
+`Subscribed` with `SubscribedAck`). Netfence stages the full protected state,
+applies the authoritative DNS state, activates the requested mode, and clears
+the durable reason only after every step succeeds. Prefer a unique `command_id`
+on recovery `BulkUpdate` and require a successful `CommandResult`.
+
+Heartbeats expose current physical entries, hard capacity, and
+daemon-generation high-water independently for all four protected maps. The
+bootstrap is included; adopted pinned entries initialize the new generation's
+high-water. `map_full_drops` is cumulative and includes protected capacity
+rejections. If an occupancy read fails, the daemon retains the last proven
+snapshot and emits a warning at most once per 30 seconds instead of inventing
+new counts. To recover from pressure, reduce the complete desired rules below
+each per-map capacity and retry the full update. Raising
+`filter.max_rule_entries` is load-time only and requires recreating an existing
+pinned attachment. If the daemon cannot prove `BLOCK_ALL` or durably record its
+safety marker, it stops mutation admission; repair the map/store fault and
+restart rather than assuming enforcement reopened.
+
 ## Per host
 
 Run the daemon, which:
@@ -412,6 +476,9 @@ filter:
   # pinning off entirely (BPF state then dies with the process).
   bpf_pin_dir: /sys/fs/bpf/netfence
   # Capacity of each authoritative/system LPM map (allowed/denied per family).
+  # Protected entries are non-evictable; the DNS listener bootstrap consumes
+  # one slot in its address family. Changing pinned-map capacity requires
+  # recreating the attachment.
   max_rule_entries: 4096
   # Independent capacity of each DNS-derived exact-host HASH map (IPv4/IPv6).
   # These entries can never consume or evict authoritative/deny capacity.
@@ -515,11 +582,18 @@ cgroup attachments.
 
 - Daemon attaches eBPF filter to the target
 - Daemon sends `Subscribed{id, target, type, metadata}` to the control plane and waits for `SubscribedAck` with initial config (mode, CIDRs, DNS rules)
-- If the control plane doesn't respond within the timeout (default 5s, configurable via `control_plane.subscribe_ack_timeout`), the attachment is rolled back and the attach call fails
+- If the control plane doesn't respond within the timeout (default 5s, configurable via `control_plane.subscribe_ack_timeout`), the attachment is rolled back and the attach call fails. Validation and other pre-commit failures follow the same ordinary rollback rule.
+- A valid initial policy that reaches a protected-map/store failure is the deliberate committed-error exception: the daemon retains the attachment in durable `BLOCK_ALL` instead of destructively rolling it back. With a bounded timeout, `Attach` returns an error containing the retained attachment ID; the caller can discover that ID by matching the target in `List`, and the control plane must recover it with a complete `BulkUpdate`.
 - With `subscribe_ack_timeout: 0`, a new `Attach` returns after queuing
   `Subscribed`; a later ack is still validated and applied. This zero value
   does not disable restored-attachment reconciliation: restore attempts wait
-  up to 5s in the background and retry on a later connection if needed.
+  up to 5s in the background and retry on a later connection if needed. If
+  that later ack hits protected pressure, the already-returned attachment is
+  retained in `BLOCK_ALL`; `SubscribedAck` emits neither `CommandResult` nor
+  error `Unsubscribed`, and the daemon does not automatically re-drive the
+  declaration before restart. Detect `policy_degraded` plus its reason,
+  occupancy/capacity, and `map_full_drops` in `Heartbeat`, then send a complete
+  `BulkUpdate` with `command_id` to obtain an explicit recovery result.
 - Daemon watches for target removal and sends `Unsubscribed` automatically
 
 **RPC:**
@@ -610,4 +684,4 @@ idempotently:
 - CIDR entries (`AllowCIDR`/`DenyCIDR` commands, and the CIDR lists in `SubscribedAck`/`BulkUpdate`) carry an optional TTL. TTL'd rules are removed by a daemon janitor once they expire (scan interval `ttl_janitor_interval`, default 1s); rules without a TTL are permanent.
 - Incremental `AllowCIDR`/`DenyCIDR` re-adds extend a CIDR to the later deadline — they never shorten one — and an incremental re-add without a TTL makes it permanent. In contrast, the complete state in `SubscribedAck`/`BulkUpdate` replaces each control-plane lifetime exactly, so authoritative reconciliation can shorten a TTL or change permanent to finite without removing/re-adding the live map entry. Use `RemoveCIDR` to drop an incremental rule early.
 - DNS-resolved IPs enter only the exact tier with the record TTL floored by `dns.min_filter_ttl` (default 60s; zero/unset means the default, not "no floor"). An upstream TTL of zero therefore lives for the floor; an omitted PROXY TTL is explicitly defaulted to 300s before the floor is applied. A permanent or longer-lived CIDR rule covering the same address remains independently installed in the protected LPM tier when exact DNS ownership expires.
-- Authoritative/system allow CIDRs and deny CIDRs remain in four protected LPM maps sized by `filter.max_rule_entries` per attachment (default 4096 each). DNS-derived host addresses use separate exact-match HASH maps sized by `filter.max_dns_rule_entries` (default 4096 per IP family), so they cannot consume or evict authoritative or deny capacity. Complete-response admission validates/canonicalizes every address and preflights physical and logical capacity before mutation. A kernel error restores the exact pre-call snapshot; if rollback cannot prove that snapshot, the resolver suppresses the answer and quarantines the attachment in durable IP `BLOCK_ALL` before accepting another mutation.
+- Authoritative/system allow CIDRs and deny CIDRs remain in four protected, non-evictable LPM maps sized by `filter.max_rule_entries` per attachment (default 4096 each); see “Protected CIDR capacity and fail-closed recovery” above. DNS-derived host addresses use separate exact-match HASH maps sized by `filter.max_dns_rule_entries` (default 4096 per IP family), so they cannot consume or evict authoritative or deny capacity. Complete DNS-response admission validates/canonicalizes every address and preflights physical and logical capacity before mutation. A DNS exact-map kernel error restores its exact pre-call snapshot; if that rollback cannot be proven, the resolver suppresses the answer and quarantines the attachment in durable IP `BLOCK_ALL` before accepting another mutation.

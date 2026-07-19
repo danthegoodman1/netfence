@@ -108,7 +108,11 @@ message Attachment {
 // ack applies completely. It always follows the fresh SyncRequest (which may
 // already list the same attachment). The control plane acknowledges
 // Subscribed, not SyncRequest; it MUST answer each effective declaration with
-// a complete fresh SubscribedAck.
+// a complete fresh SubscribedAck. One exception is operational, not an
+// idempotency relaxation: after a zero-timeout new attachment consumes an ack
+// that leaves protected policy durably degraded, the daemon reports that state
+// in Heartbeat but does not automatically re-drive Subscribed before restart.
+// The control plane must send a complete BulkUpdate to recover it.
 message Subscribed {
   // Unique identifier for this attachment
   string id = 1;
@@ -200,6 +204,38 @@ message AttachmentStats {
   // map_full_drops because rejection is due to a rolling mutation/attempt
   // allowance, not inability to represent the state or a raw map insertion.
   uint64 dns_budget_throttles = 16;
+  // Current physical occupancy/capacity and daemon-generation high-water
+  // values for each protected, non-evictable authoritative/system LPM map.
+  // The DNS listener bootstrap is included in protected allow occupancy;
+  // adopted pinned entries initialize high-water for the new daemon process.
+  // A transient inventory failure retains the last proven snapshot and emits
+  // a rate-limited daemon warning rather than publishing guessed counts.
+  uint32 protected_allow_ipv4_entries = 17;
+  uint32 protected_allow_ipv4_capacity = 18;
+  uint32 protected_allow_ipv4_high_water = 19;
+  uint32 protected_allow_ipv6_entries = 20;
+  uint32 protected_allow_ipv6_capacity = 21;
+  uint32 protected_allow_ipv6_high_water = 22;
+  uint32 protected_deny_ipv4_entries = 23;
+  uint32 protected_deny_ipv4_capacity = 24;
+  uint32 protected_deny_ipv4_high_water = 25;
+  uint32 protected_deny_ipv6_entries = 26;
+  uint32 protected_deny_ipv6_capacity = 27;
+  uint32 protected_deny_ipv6_high_water = 28;
+  // policy_degraded is true while a protected-policy safety record is nonempty;
+  // configured BLOCK_ALL alone is healthy and reports false. The
+  // protected_policy_mutation_in_progress reason is a transient crash journal:
+  // its owning live operation clears it on success and may publish the intended
+  // mode before that final clear. Startup that finds it first proves BLOCK_ALL
+  // and converts it to protected_policy_mutation_interrupted. That interrupted
+  // code and authoritative_protected_policy_failed,
+  // incremental_deny_install_failed, incremental_allow_removal_failed, and
+  // incremental_mode_change_failed are stable degraded reasons (never raw
+  // errors): they hold proven BLOCK_ALL, reject protected incrementals, and
+  // require a complete authoritative LPM+DNS reconcile. Independent DNS
+  // mutation and expiry may continue but cannot reactivate packet policy.
+  bool policy_degraded = 29;
+  string policy_degraded_reason = 30;
 }
 
 // ControlCommand represents commands sent from the control plane to the daemon.
@@ -270,7 +306,11 @@ message SyncAck {}
 // delta: unchanged CIDRs remain installed, stale CIDRs are removed, new CIDRs
 // are added, and control-plane TTLs are replaced exactly. The restore remains
 // pending after any validation or apply failure and is retried after a later
-// connection.
+// connection. For a zero-timeout new attachment, however, a protected-policy
+// apply failure consumes this ack and is signaled by degraded Heartbeat fields;
+// it emits no CommandResult or error Unsubscribed and is not re-driven before
+// restart. Recover that live attachment with a complete BulkUpdate, preferably
+// carrying command_id for an explicit outcome.
 //
 // Design note: This is sent over the bidirectional stream (rather than a separate
 // unary RPC) to ensure the same control plane node that holds the stream connection
@@ -293,7 +333,10 @@ message SetMode { PolicyMode mode = 1; }
 
 // BulkUpdate sets the complete authoritative state for an attachment. The
 // daemon reconciles by delta; an unchanged CIDR is not removed/re-added, and
-// its control-plane TTL is replaced exactly by the provided lifetime.
+// its control-plane TTL is replaced exactly by the provided lifetime. This is
+// also the live recovery operation for protected-policy degradation: maps and
+// DNS must both apply before the requested mode activates and the durable
+// marker clears. Use command_id when the outcome must be observed.
 message BulkUpdate {
   // Complete desired IP filter policy mode. Must be a known non-UNSPECIFIED value.
   PolicyMode mode = 1;

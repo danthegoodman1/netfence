@@ -38,6 +38,26 @@ var (
 	// and restoring its exact pre-call state also failed. The operation never
 	// hides this ambiguity; callers must fail closed until reconciled.
 	ErrDNSAllowRollback = errors.New("DNS exact allow batch rollback failed")
+	// ErrProtectedRuleCapacity reports an authoritative protected-LPM
+	// replacement whose final state cannot fit one of the four independent
+	// allow/deny IPv4/IPv6 maps. The check happens before mutation.
+	ErrProtectedRuleCapacity = errors.New("protected rule map capacity exceeded")
+	// ErrProtectedRuleSnapshot means the filter could not prove the complete
+	// pre-mutation contents/capacity of every protected LPM map. Callers must
+	// fail closed because an authoritative deny replacement cannot safely be
+	// inferred from partial inventory.
+	ErrProtectedRuleSnapshot = errors.New("protected rule map snapshot is unprovable")
+	// ErrProtectedRuleRollback marks a protected-LPM mutation failure whose
+	// exact pre-call four-map inventory could not be restored and verified.
+	// Even a successful map rollback proves the effective mode only as the old
+	// mode or BLOCK_ALL (normally BLOCK_ALL), not necessarily the pre-call mode;
+	// callers must keep the attachment fail closed until authoritative recovery.
+	ErrProtectedRuleRollback = errors.New("protected rule map rollback failed")
+	// ErrProtectedRuleModeAmbiguous marks a mode-map write/read sequence whose
+	// effective enforcement posture cannot be proven. Callers must make a
+	// separate BLOCK_ALL write/read-back attempt and stop admission if that
+	// safety posture also cannot be proven.
+	ErrProtectedRuleModeAmbiguous = errors.New("protected policy mode is ambiguous")
 )
 
 // PolicyMode defines the filtering behavior
@@ -177,6 +197,23 @@ type DNSAllowOccupancy struct {
 	IPv4Capacity uint32
 	IPv6Entries  uint32
 	IPv6Capacity uint32
+}
+
+// RuleMapUsage reports current entries and hard capacity for one protected
+// LPM map. High-water values are daemon-generation telemetry and therefore
+// live in the daemon's registry rather than this physical snapshot.
+type RuleMapUsage struct {
+	Entries  uint32
+	Capacity uint32
+}
+
+// ProtectedRuleOccupancy reports each non-evictable authoritative/system LPM
+// map independently. DNS exact-host maps are intentionally excluded.
+type ProtectedRuleOccupancy struct {
+	AllowedIPv4 RuleMapUsage
+	AllowedIPv6 RuleMapUsage
+	DeniedIPv4  RuleMapUsage
+	DeniedIPv6  RuleMapUsage
 }
 
 // PinnedSchemaState is the read-only classification used by startup orphan

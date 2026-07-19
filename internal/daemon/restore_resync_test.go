@@ -662,9 +662,10 @@ func TestRestoreLateAckAfterDetachIsIgnored(t *testing.T) {
 	assert.NotContains(t, allowed, "192.0.2.7/32", "late ack must not mutate the detached filter")
 }
 
-// Map inventory is mandatory for delta convergence. If Rules or registry
-// seeding fails, startup leaves the pins enforcing and aborts before exposing a
-// needsResync flag that an incomplete reconcile could falsely clear.
+// Map inventory is mandatory for delta convergence. If Rules fails, startup
+// leaves the pins enforcing and aborts before exposing a needsResync flag that
+// an incomplete reconcile could falsely clear. Registry seeding itself is now
+// an in-memory O(N) inventory build and performs no fallible map upserts.
 func TestRestoreAdoptedInventoryFailureAbortsWithoutUnpinning(t *testing.T) {
 	tests := []struct {
 		name string
@@ -672,7 +673,6 @@ func TestRestoreAdoptedInventoryFailureAbortsWithoutUnpinning(t *testing.T) {
 		prep func(*fakeFilter)
 	}{
 		{name: "rules_iteration", port: 12317, prep: func(ff *fakeFilter) { ff.setRulesErr(errors.New("iterate failed")) }},
-		{name: "registry_seed", port: 12318, prep: func(ff *fakeFilter) { ff.setAllowErr(syscall.ENOSPC) }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

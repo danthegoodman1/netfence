@@ -78,6 +78,18 @@ type Filter interface {
 	DenyIP(cidr *net.IPNet) error
 	RemoveAllowedIP(cidr *net.IPNet) error
 	RemoveDeniedIP(cidr *net.IPNet) error
+	// ReplaceProtectedRules replaces all four authoritative/system allow/deny
+	// LPM maps as one userspace transaction. Inputs are canonicalized, every
+	// final per-map capacity is checked before mutation, unchanged keys are not
+	// touched, and a syscall failure restores and verifies the exact pre-call
+	// four-map inventory or returns ErrProtectedRuleRollback. After a proven
+	// rollback, mode is guaranteed to be either the old mode or BLOCK_ALL
+	// (normally BLOCK_ALL), so callers still reconcile authoritatively before
+	// reactivating policy.
+	ReplaceProtectedRules(allowed, denied []*net.IPNet, mode PolicyMode) error
+	// ProtectedRuleOccupancy returns current entries/capacity for all four
+	// protected LPM maps.
+	ProtectedRuleOccupancy() (ProtectedRuleOccupancy, error)
 	// AddDNSAllowedIPs atomically-at-the-API-boundary adds canonical host
 	// addresses to the separately bounded DNS exact tier. Inputs are fully
 	// validated and per-family capacity is preflighted before mutation. On a

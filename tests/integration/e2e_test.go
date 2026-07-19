@@ -19,6 +19,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/danthegoodman1/netfence/internal/config"
 	"github.com/danthegoodman1/netfence/internal/daemon"
@@ -118,6 +119,8 @@ type testControlPlane struct {
 	unsubscribed   map[string]*apiv1.Unsubscribed
 	commandResults map[string]*apiv1.CommandResult // command_id -> result
 	subscribed     map[string]int                  // attachment_id -> observed declarations
+	heartbeatStats map[string]*apiv1.AttachmentStats
+	heartbeatCount map[string]int
 }
 
 func newTestControlPlane() *testControlPlane {
@@ -129,6 +132,8 @@ func newTestControlPlane() *testControlPlane {
 		unsubscribed:   make(map[string]*apiv1.Unsubscribed),
 		commandResults: make(map[string]*apiv1.CommandResult),
 		subscribed:     make(map[string]int),
+		heartbeatStats: make(map[string]*apiv1.AttachmentStats),
+		heartbeatCount: make(map[string]int),
 	}
 }
 
@@ -196,6 +201,18 @@ func (cp *testControlPlane) CommandResultCount() int {
 	cp.mu.RLock()
 	defer cp.mu.RUnlock()
 	return len(cp.commandResults)
+}
+
+// HeartbeatStats returns the most recently observed wire heartbeat stats and
+// the number of heartbeats that have carried this attachment.
+func (cp *testControlPlane) HeartbeatStats(id string) (*apiv1.AttachmentStats, int) {
+	cp.mu.RLock()
+	defer cp.mu.RUnlock()
+	stats := cp.heartbeatStats[id]
+	if stats == nil {
+		return nil, cp.heartbeatCount[id]
+	}
+	return proto.Clone(stats).(*apiv1.AttachmentStats), cp.heartbeatCount[id]
 }
 
 func (cp *testControlPlane) SendCommand(attachmentID string, cmd *apiv1.ControlCommand) error {
@@ -268,6 +285,14 @@ func (cp *testControlPlane) Connect(stream grpc.BidiStreamingServer[apiv1.Daemon
 			cp.mu.Lock()
 			cp.commandResults[e.CommandResult.CommandId] = e.CommandResult
 			cp.mu.Unlock()
+
+		case *apiv1.DaemonEvent_Heartbeat:
+			cp.mu.Lock()
+			for _, stats := range e.Heartbeat.Stats {
+				cp.heartbeatStats[stats.Id] = proto.Clone(stats).(*apiv1.AttachmentStats)
+				cp.heartbeatCount[stats.Id]++
+			}
+			cp.mu.Unlock()
 		}
 	}
 }
@@ -304,6 +329,10 @@ func newE2ETestEnv(t *testing.T) *e2eTestEnv {
 }
 
 func newE2ETestEnvWithOptions(t *testing.T, portMin, portMax int, subscribeAckTimeout time.Duration) *e2eTestEnv {
+	return newE2ETestEnvWithConfig(t, portMin, portMax, subscribeAckTimeout, nil)
+}
+
+func newE2ETestEnvWithConfig(t *testing.T, portMin, portMax int, subscribeAckTimeout time.Duration, configure func(*config.Config)) *e2eTestEnv {
 	t.Helper()
 
 	cp := newTestControlPlane()
@@ -341,6 +370,9 @@ func newE2ETestEnvWithOptions(t *testing.T, portMin, portMax int, subscribeAckTi
 			Insecure:            true,
 			SubscribeAckTimeout: subscribeAckTimeout,
 		},
+	}
+	if configure != nil {
+		configure(cfg)
 	}
 
 	logger := zerolog.New(io.Discard)

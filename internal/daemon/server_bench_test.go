@@ -32,6 +32,23 @@ func BenchmarkServerListWithConcurrentStats(b *testing.B) {
 	})
 }
 
+func BenchmarkTTLRegistrySeedAdoptedMaxCapacity(b *testing.B) {
+	const perMap = 4096
+	allowed, denied := protectedCapacitySeedCIDRs(b, perMap)
+	b.ReportAllocs()
+	b.ReportMetric(float64(perMap*4), "rules/seed")
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		registry := newTTLRegistry()
+		if err := registry.seedAdopted(allowed, denied); err != nil {
+			b.Fatal(err)
+		}
+		if got := registry.len(); got != perMap*4 {
+			b.Fatalf("seeded registry has %d rules, want %d", got, perMap*4)
+		}
+	}
+}
+
 func newBenchmarkServer(b *testing.B, attachmentCount int) *Server {
 	b.Helper()
 

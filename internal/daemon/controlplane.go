@@ -805,7 +805,9 @@ func (c *ControlPlaneClient) handleCommandForEpoch(cmd *apiv1.ControlCommand, ep
 	case *apiv1.ControlCommand_SetMode:
 		c.logger.Debug().Str("id", cmd.Id).Str("mode", v.SetMode.Mode.String()).Msg("received set mode")
 		if err = c.server.SetFilterMode(cmd.Id, v.SetMode.Mode); err != nil {
-			c.logger.Error().Err(err).Str("id", cmd.Id).Msg("failed to set filter mode")
+			if !isReportedProtectedPressure(err) {
+				c.logger.Error().Err(err).Str("id", cmd.Id).Msg("failed to set filter mode")
+			}
 			err = fmt.Errorf("setting filter mode: %w", err)
 		}
 
@@ -816,7 +818,9 @@ func (c *ControlPlaneClient) handleCommandForEpoch(cmd *apiv1.ControlCommand, ep
 			c.logger.Error().Err(parseErr).Str("id", cmd.Id).Str("cidr", v.AllowCidr.Cidr).Msg("failed to parse CIDR")
 			err = fmt.Errorf("parsing CIDR %q: %w", v.AllowCidr.Cidr, parseErr)
 		} else if err = c.server.AllowCIDR(cmd.Id, cidr, v.AllowCidr.GetTtl().AsDuration()); err != nil {
-			c.logger.Error().Err(err).Str("id", cmd.Id).Msg("failed to allow CIDR")
+			if !isReportedProtectedPressure(err) {
+				c.logger.Error().Err(err).Str("id", cmd.Id).Msg("failed to allow CIDR")
+			}
 			err = fmt.Errorf("allowing CIDR %q: %w", v.AllowCidr.Cidr, err)
 		}
 
@@ -827,7 +831,9 @@ func (c *ControlPlaneClient) handleCommandForEpoch(cmd *apiv1.ControlCommand, ep
 			c.logger.Error().Err(parseErr).Str("id", cmd.Id).Str("cidr", v.DenyCidr.Cidr).Msg("failed to parse CIDR")
 			err = fmt.Errorf("parsing CIDR %q: %w", v.DenyCidr.Cidr, parseErr)
 		} else if err = c.server.DenyCIDR(cmd.Id, cidr, v.DenyCidr.GetTtl().AsDuration()); err != nil {
-			c.logger.Error().Err(err).Str("id", cmd.Id).Msg("failed to deny CIDR")
+			if !isReportedProtectedPressure(err) {
+				c.logger.Error().Err(err).Str("id", cmd.Id).Msg("failed to deny CIDR")
+			}
 			err = fmt.Errorf("denying CIDR %q: %w", v.DenyCidr.Cidr, err)
 		}
 
@@ -841,11 +847,15 @@ func (c *ControlPlaneClient) handleCommandForEpoch(cmd *apiv1.ControlCommand, ep
 		}
 		var allowErr, denyErr error
 		if allowErr = c.server.RemoveAllowedCIDR(cmd.Id, cidr); allowErr != nil {
-			c.logger.Warn().Err(allowErr).Str("id", cmd.Id).Msg("failed to remove CIDR from allowlist")
+			if !isReportedProtectedPressure(allowErr) {
+				c.logger.Warn().Err(allowErr).Str("id", cmd.Id).Msg("failed to remove CIDR from allowlist")
+			}
 			allowErr = fmt.Errorf("removing from allowlist: %w", allowErr)
 		}
 		if denyErr = c.server.RemoveDeniedCIDR(cmd.Id, cidr); denyErr != nil {
-			c.logger.Warn().Err(denyErr).Str("id", cmd.Id).Msg("failed to remove CIDR from denylist")
+			if !isReportedProtectedPressure(denyErr) {
+				c.logger.Warn().Err(denyErr).Str("id", cmd.Id).Msg("failed to remove CIDR from denylist")
+			}
 			denyErr = fmt.Errorf("removing from denylist: %w", denyErr)
 		}
 		err = errors.Join(allowErr, denyErr)
@@ -894,7 +904,7 @@ func (c *ControlPlaneClient) handleCommandForEpoch(cmd *apiv1.ControlCommand, ep
 		}
 
 		err = c.applyPendingSubscribedAck(cmd.Id, pending, v.SubscribedAck)
-		if err != nil {
+		if err != nil && !isReportedProtectedPressure(err) {
 			c.logger.Error().Err(err).Str("id", cmd.Id).Msg("failed to apply subscribed ack")
 		}
 		c.deliverSubscriptionResult(pending, SubscribedAckResult{Ack: v.SubscribedAck, Err: err})
@@ -916,6 +926,10 @@ func (c *ControlPlaneClient) handleCommandForEpoch(cmd *apiv1.ControlCommand, ep
 	if reportResult {
 		c.sendCommandResult(cmd.CommandId, cmd.Id, err)
 	}
+}
+
+func isReportedProtectedPressure(err error) bool {
+	return errors.Is(err, errPolicyDegraded) || errors.Is(err, errProtectedPolicyDurablyDegraded)
 }
 
 // sendCommandResult reports a command outcome back to the control plane,
@@ -1102,6 +1116,9 @@ func (c *ControlPlaneClient) applyPendingSubscribedAck(id string, pending *pendi
 
 	if err := c.applySubscribedAck(id, ack); err != nil {
 		if zeroTimeoutAttach {
+			if errors.Is(err, errProtectedPolicyDurablyDegraded) {
+				return err
+			}
 			quarantineErr := c.server.quarantineAttachment(id, pending.state)
 			c.SendUnsubscribed(&apiv1.Unsubscribed{
 				Id: id, Reason: apiv1.UnsubscribeReason_UNSUBSCRIBE_REASON_ERROR,
@@ -1220,10 +1237,20 @@ func (c *ControlPlaneClient) applyBulkUpdate(id string, update *apiv1.BulkUpdate
 	// ReconcileCIDRs owns the mode write too, sandwiching it between the
 	// two list reconciles (new mode's list first) so no mode pair opens a
 	// transient allow/block window — see its doc comment.
-	reconcileErr := c.server.reconcileCIDRsAdmitted(id, state, update.Mode, allowCIDRs, denyCIDRs)
+	degradedActivationHeld, holdErr := c.server.holdAuthoritativeRecoveryIfNeededAdmitted(id, state)
+	if holdErr != nil {
+		return c.server.finishDNSMutation(state, done, fmt.Errorf("preparing authoritative BLOCK_ALL recovery hold: %w", holdErr))
+	}
+	degradedActivationHeld, reconcileErr := c.server.stageAuthoritativeCIDRsAdmitted(id, state, update.Mode, allowCIDRs, denyCIDRs, degradedActivationHeld)
 	if reconcileErr != nil {
-		c.logger.Error().Err(reconcileErr).Str("id", id).Msg("failed to reconcile CIDRs in bulk update")
+		if !errors.Is(reconcileErr, errProtectedPolicyDurablyDegraded) {
+			c.logger.Error().Err(reconcileErr).Str("id", id).Msg("failed to reconcile CIDRs in bulk update")
+		}
 		reconcileErr = fmt.Errorf("reconciling CIDRs: %w", reconcileErr)
+		// A valid protected-policy projection that cannot complete is now
+		// durable BLOCK_ALL. Do not apply the DNS half of the authoritative
+		// update or claim partial recovery; a later complete retry owns both.
+		return c.server.finishDNSMutation(state, done, reconcileErr)
 	}
 
 	// Apply the prepared authoritative DNS state after the CIDR delta. The
@@ -1239,6 +1266,18 @@ func (c *ControlPlaneClient) applyBulkUpdate(id string, update *apiv1.BulkUpdate
 	} else if dnsErr = c.server.replaceDNSPreparedAdmitted(id, state, preparedDNS); dnsErr != nil {
 		c.logger.Error().Err(dnsErr).Str("id", id).Msg("failed to replace DNS rules in bulk update")
 		dnsErr = fmt.Errorf("replacing DNS rules: %w", dnsErr)
+	}
+	if dnsErr != nil && degradedActivationHeld {
+		// The pre-existing durable marker and effective BLOCK_ALL intentionally
+		// remain until a later complete retry succeeds. Convert a transient
+		// in-progress marker to the stable failure reason before returning.
+		degradeErr := c.server.enterPolicyDegradedAdmitted(id, state, policyDegradedAuthoritative, dnsErr)
+		return c.server.finishDNSMutation(state, done, errors.Join(dnsErr, degradeErr))
+	}
+	if degradedActivationHeld {
+		if activationErr := c.server.activateAuthoritativePolicyAdmitted(id, state, update.Mode); activationErr != nil {
+			return c.server.finishDNSMutation(state, done, fmt.Errorf("activating recovered protected policy: %w", activationErr))
+		}
 	}
 
 	return c.server.finishDNSMutation(state, done, errors.Join(reconcileErr, dnsErr))

@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -58,6 +59,121 @@ func denyCidrCmd(id, cidr string, ttl time.Duration) *apiv1.ControlCommand {
 
 func removeCidrCmd(id, cidr string) *apiv1.ControlCommand {
 	return &apiv1.ControlCommand{Id: id, Command: &apiv1.ControlCommand_RemoveCidr{RemoveCidr: cidr}}
+}
+
+func assertProtectedCurrent(t testing.TB, reg *ttlRegistry, allow4, allow6, deny4, deny6 uint32) {
+	t.Helper()
+	reg.mu.Lock()
+	defer reg.mu.Unlock()
+	assert.Equal(t, protectedRuleCurrent{allow4: allow4, allow6: allow6, deny4: deny4, deny6: deny6}, reg.protectedCurrent)
+}
+
+func TestProtectedCurrentCountersTrackPhysicalTransitionsAndFailures(t *testing.T) {
+	ff := &fakeFilter{}
+	reg := newTTLRegistry()
+	now := time.Now()
+	allow4 := mustCIDR(t, "192.0.2.1/32")
+	allow6 := mustCIDR(t, "2001:db8:1::1/128")
+	deny4 := mustCIDR(t, "198.51.100.1/32")
+	deny6 := mustCIDR(t, "2001:db8:2::1/128")
+
+	require.NoError(t, reg.addSystem(ff, allow4, listAllow))
+	require.NoError(t, reg.addCP(ff, allow4, listAllow, 0, now))
+	assertProtectedCurrent(t, reg, 1, 0, 0, 0)
+	require.NoError(t, reg.removeSystem(ff, allow4, listAllow))
+	assertProtectedCurrent(t, reg, 1, 0, 0, 0)
+
+	require.NoError(t, reg.addCP(ff, allow6, listAllow, 0, now))
+	require.NoError(t, reg.addCP(ff, deny4, listDeny, 0, now))
+	require.NoError(t, reg.addCP(ff, deny6, listDeny, 0, now))
+	assertProtectedCurrent(t, reg, 1, 1, 1, 1)
+
+	ff.setAllowErr(errors.New("injected add failure"))
+	require.Error(t, reg.addCP(ff, mustCIDR(t, "192.0.2.2/32"), listAllow, 0, now))
+	ff.setAllowErr(nil)
+	assertProtectedCurrent(t, reg, 1, 1, 1, 1)
+
+	ff.removeDenyErr = errors.New("injected remove failure")
+	require.Error(t, reg.reconcileCP(ff, listDeny, []parsedCIDR{{cidr: deny6}}, now))
+	assertProtectedCurrent(t, reg, 1, 1, 1, 1)
+	ff.removeDenyErr = nil
+	require.NoError(t, reg.reconcileCP(ff, listDeny, []parsedCIDR{{cidr: deny6}}, now))
+	assertProtectedCurrent(t, reg, 1, 1, 0, 1)
+
+	ff.removeAllowErr = errors.New("injected clear failure")
+	require.Error(t, reg.clear(ff))
+	assertProtectedCurrent(t, reg, 1, 1, 0, 0)
+	ff.removeAllowErr = nil
+	require.NoError(t, reg.clear(ff))
+	assertProtectedCurrent(t, reg, 0, 0, 0, 0)
+	assert.Equal(t, uint32(1), reg.allowedIPv4HighWater.Load())
+	assert.Equal(t, uint32(1), reg.allowedIPv6HighWater.Load())
+	assert.Equal(t, uint32(1), reg.deniedIPv4HighWater.Load())
+	assert.Equal(t, uint32(1), reg.deniedIPv6HighWater.Load())
+
+	expiring := mustCIDR(t, "203.0.113.9/32")
+	require.NoError(t, reg.addCP(ff, expiring, listAllow, time.Second, now))
+	assertProtectedCurrent(t, reg, 1, 0, 0, 0)
+	ff.removeAllowErr = errors.New("injected expiry failure")
+	swept := reg.expire(ff, now.Add(time.Second))
+	require.Len(t, swept, 1)
+	require.Error(t, swept[0].err)
+	assertProtectedCurrent(t, reg, 1, 0, 0, 0)
+	ff.removeAllowErr = nil
+	swept = reg.expire(ff, now.Add(2*time.Second))
+	require.Len(t, swept, 1)
+	require.NoError(t, swept[0].err)
+	assertProtectedCurrent(t, reg, 0, 0, 0, 0)
+
+	ff.protectedReplaceErr = errors.New("injected authoritative failure")
+	require.Error(t, reg.reconcileAuthoritative(ff, filter.ModeDenylist,
+		[]parsedCIDR{{cidr: allow4}, {cidr: allow6}}, []parsedCIDR{{cidr: deny4}, {cidr: deny6}}, now))
+	assertProtectedCurrent(t, reg, 0, 0, 0, 0)
+	ff.protectedReplaceErr = nil
+	require.NoError(t, reg.reconcileAuthoritative(ff, filter.ModeDenylist,
+		[]parsedCIDR{{cidr: allow4}, {cidr: allow6}}, []parsedCIDR{{cidr: deny4}, {cidr: deny6}}, now))
+	assertProtectedCurrent(t, reg, 1, 1, 1, 1)
+}
+
+func protectedCapacitySeedCIDRs(t testing.TB, perMap int) (allowed, denied []*net.IPNet) {
+	t.Helper()
+	parse := func(raw string) *net.IPNet {
+		_, cidr, err := net.ParseCIDR(raw)
+		require.NoError(t, err)
+		return cidr
+	}
+	allowed = make([]*net.IPNet, 0, perMap*2)
+	denied = make([]*net.IPNet, 0, perMap*2)
+	for i := 0; i < perMap; i++ {
+		allowed = append(allowed,
+			parse(fmt.Sprintf("10.%d.%d.%d/32", (i>>16)&255, (i>>8)&255, i&255)),
+			parse(fmt.Sprintf("2001:db8:1::%x/128", i+1)),
+		)
+		denied = append(denied,
+			parse(fmt.Sprintf("11.%d.%d.%d/32", (i>>16)&255, (i>>8)&255, i&255)),
+			parse(fmt.Sprintf("2001:db8:2::%x/128", i+1)),
+		)
+	}
+	return allowed, denied
+}
+
+func TestSeedAdoptedMaxCapacityIsAtomicAndTracksHighWaterWithoutMapWrites(t *testing.T) {
+	const perMap = 4096
+	allowed, denied := protectedCapacitySeedCIDRs(t, perMap)
+	reg := newTTLRegistry()
+	require.NoError(t, reg.seedAdopted(allowed, denied))
+	assert.Equal(t, perMap*4, reg.len())
+	assertProtectedCurrent(t, reg, perMap, perMap, perMap, perMap)
+	assert.Equal(t, uint32(perMap), reg.allowedIPv4HighWater.Load())
+	assert.Equal(t, uint32(perMap), reg.allowedIPv6HighWater.Load())
+	assert.Equal(t, uint32(perMap), reg.deniedIPv4HighWater.Load())
+	assert.Equal(t, uint32(perMap), reg.deniedIPv6HighWater.Load())
+
+	beforeCurrent := reg.protectedCurrent
+	beforeLen := reg.len()
+	require.Error(t, reg.seedAdopted([]*net.IPNet{mustCIDR(t, "192.0.2.1/32"), nil}, nil))
+	assert.Equal(t, beforeLen, reg.len(), "invalid inventory must not partially replace registry entries")
+	assert.Equal(t, beforeCurrent, reg.protectedCurrent, "invalid inventory must not partially replace counters")
 }
 
 func TestSystemOwnedDNSBootstrapSurvivesAuthoritativeStateTTLRemoveAndClear(t *testing.T) {
@@ -898,12 +1014,7 @@ func TestBulkUpdateModeFlipOrdering(t *testing.T) {
 			AllowCidrs: []*apiv1.CIDREntry{{Cidr: "10.0.0.0/8"}, {Cidr: "198.51.100.0/24"}}, // drops 203.0.113.0/24
 		})
 		events := ff.eventLog()[before:]
-		modeIdx := indexOfEvent(t, events, "set-mode "+filter.ModeAllowlist.String())
-		for i, ev := range events {
-			if strings.HasPrefix(ev, "allow ") || strings.HasPrefix(ev, "remove-allow ") {
-				assert.Less(t, i, modeIdx, "live-list op %q must precede the (no-op) mode write (log: %v)", ev, events)
-			}
-		}
+		assert.NotContains(t, events, "set-mode "+filter.ModeAllowlist.String(), "same-mode reconcile does not rewrite the mode map")
 		// Survivor never removed; the live list is reconciled with survivor
 		// dedup so there is no window on the same-mode path either.
 		assert.Contains(t, events, "allow 198.51.100.0/24")

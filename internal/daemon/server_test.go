@@ -221,6 +221,33 @@ func TestServerModeChangesPersistToStoreAndSyncViews(t *testing.T) {
 	assert.Equal(t, apiv1.DnsMode_DNS_MODE_DENYLIST, syncAttachments[0].DnsMode)
 }
 
+func TestListSkipsProtectedOccupancyWhileHeartbeatStatsRefreshesIt(t *testing.T) {
+	server, _, id, ff, _ := newTestServerWithAttachment(t)
+	ff.mu.Lock()
+	ff.stats = filter.Stats{Allowed: 17, Blocked: 9}
+	ff.mu.Unlock()
+
+	listed, err := server.List(context.Background(), &apiv1.ListRequest{})
+	require.NoError(t, err)
+	require.Len(t, listed.Attachments, 1)
+	assert.Equal(t, id, listed.Attachments[0].Id)
+	assert.Equal(t, uint64(17), listed.Attachments[0].PacketsAllowed)
+	assert.Equal(t, uint64(9), listed.Attachments[0].PacketsBlocked)
+	assert.Zero(t, ff.protectedOccupancyCallCount(),
+		"List does not expose protected telemetry and must not walk four LPM maps")
+
+	heartbeatStats := server.GetAttachmentStats()
+	require.Len(t, heartbeatStats, 1)
+	assert.Equal(t, id, heartbeatStats[0].Id)
+	assert.Equal(t, 1, ff.protectedOccupancyCallCount(),
+		"GetAttachmentStats is the fixed-cadence heartbeat refresh path")
+
+	_, err = server.List(context.Background(), &apiv1.ListRequest{})
+	require.NoError(t, err)
+	assert.Equal(t, 1, ff.protectedOccupancyCallCount(),
+		"repeated caller-driven List requests must not refresh protected occupancy")
+}
+
 func TestNewServerRestoresIPv6DNSPortReservation(t *testing.T) {
 	st, err := store.New(filepath.Join(t.TempDir(), "netfence.db"))
 	require.NoError(t, err)

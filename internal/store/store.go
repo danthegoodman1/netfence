@@ -44,6 +44,12 @@ type Attachment struct {
 	// row deletion has not yet been proven complete. The daemon must never
 	// restore or subscribe such a row as a live policy attachment.
 	CleanupNeeded bool `json:"cleanup_needed"`
+	// PolicyDegradedReason is a daemon-defined protected-policy safety code.
+	// The in-progress code is a transient crash journal cleared by its successful
+	// operation; startup converts a surviving journal to interrupted after proving
+	// BLOCK_ALL. Interrupted and stable failure codes require complete
+	// authoritative recovery before packet policy can reactivate.
+	PolicyDegradedReason string `json:"policy_degraded_reason"`
 	// PinDir is the exact bpffs directory used by this attachment. Empty with
 	// PinPathKnown=true explicitly means pinning was disabled; false denotes a
 	// legacy row whose pin identity must be established before cleanup.
@@ -108,7 +114,8 @@ func migrate(db *sql.DB) error {
 				direction TEXT NOT NULL DEFAULT '',
 				cleanup_needed INTEGER NOT NULL DEFAULT 0,
 				pin_dir TEXT NOT NULL DEFAULT '',
-				pin_path_known INTEGER NOT NULL DEFAULT 0
+				pin_path_known INTEGER NOT NULL DEFAULT 0,
+				policy_degraded_reason TEXT NOT NULL DEFAULT ''
 			) STRICT, WITHOUT ROWID
 		`); err != nil {
 		return err
@@ -135,6 +142,11 @@ func migrate(db *sql.DB) error {
 	}
 	if _, err := db.Exec(`
 		ALTER TABLE attachments ADD COLUMN pin_path_known INTEGER NOT NULL DEFAULT 0
+	`); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		return err
+	}
+	if _, err := db.Exec(`
+		ALTER TABLE attachments ADD COLUMN policy_degraded_reason TEXT NOT NULL DEFAULT ''
 	`); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 		return err
 	}
@@ -245,9 +257,9 @@ func (s *Store) SaveAttachment(a *Attachment) error {
 	}
 
 	_, err = s.db.Exec(`
-		INSERT OR REPLACE INTO attachments (id, target, type, mode, dns_mode, dns_address, direction, cleanup_needed, pin_dir, pin_path_known, metadata, attached_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, a.ID, a.Target, a.Type, a.Mode, a.DnsMode, a.DnsAddress, a.Direction, a.CleanupNeeded, a.PinDir, a.PinPathKnown, string(metadata), a.AttachedAt.UTC().Format(attachedAtLayout))
+		INSERT OR REPLACE INTO attachments (id, target, type, mode, dns_mode, dns_address, direction, cleanup_needed, pin_dir, pin_path_known, policy_degraded_reason, metadata, attached_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, a.ID, a.Target, a.Type, a.Mode, a.DnsMode, a.DnsAddress, a.Direction, a.CleanupNeeded, a.PinDir, a.PinPathKnown, a.PolicyDegradedReason, string(metadata), a.AttachedAt.UTC().Format(attachedAtLayout))
 	return err
 }
 
@@ -258,7 +270,7 @@ func (s *Store) DeleteAttachment(id string) error {
 
 func (s *Store) GetAttachment(id string) (*Attachment, error) {
 	row := s.db.QueryRow(`
-		SELECT id, target, type, mode, dns_mode, dns_address, direction, cleanup_needed, pin_dir, pin_path_known, metadata, attached_at
+		SELECT id, target, type, mode, dns_mode, dns_address, direction, cleanup_needed, pin_dir, pin_path_known, policy_degraded_reason, metadata, attached_at
 		FROM attachments WHERE id = ?
 	`, id)
 
@@ -279,7 +291,7 @@ func (s *Store) ListAttachments(pageSize int, pageToken string) ([]Attachment, s
 	}
 
 	query := `
-		SELECT id, target, type, mode, dns_mode, dns_address, direction, cleanup_needed, pin_dir, pin_path_known, metadata, attached_at
+		SELECT id, target, type, mode, dns_mode, dns_address, direction, cleanup_needed, pin_dir, pin_path_known, policy_degraded_reason, metadata, attached_at
 		FROM attachments
 		WHERE (attached_at, id) > (?, ?)
 		ORDER BY attached_at, id
@@ -321,7 +333,7 @@ func (s *Store) ListAttachments(pageSize int, pageToken string) ([]Attachment, s
 
 func (s *Store) GetAllAttachments() ([]Attachment, error) {
 	rows, err := s.db.Query(`
-		SELECT id, target, type, mode, dns_mode, dns_address, direction, cleanup_needed, pin_dir, pin_path_known, metadata, attached_at
+		SELECT id, target, type, mode, dns_mode, dns_address, direction, cleanup_needed, pin_dir, pin_path_known, policy_degraded_reason, metadata, attached_at
 		FROM attachments ORDER BY attached_at, id
 	`)
 	if err != nil {
@@ -370,7 +382,7 @@ func scanAttachment(s scanner) (*Attachment, error) {
 	var a Attachment
 	var cleanupNeeded, pinPathKnown int
 	var metadata, attachedAt string
-	err := s.Scan(&a.ID, &a.Target, &a.Type, &a.Mode, &a.DnsMode, &a.DnsAddress, &a.Direction, &cleanupNeeded, &a.PinDir, &pinPathKnown, &metadata, &attachedAt)
+	err := s.Scan(&a.ID, &a.Target, &a.Type, &a.Mode, &a.DnsMode, &a.DnsAddress, &a.Direction, &cleanupNeeded, &a.PinDir, &pinPathKnown, &a.PolicyDegradedReason, &metadata, &attachedAt)
 	if err == sql.ErrNoRows {
 		return nil, sql.ErrNoRows
 	}

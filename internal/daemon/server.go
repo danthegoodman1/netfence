@@ -188,6 +188,18 @@ type attachmentState struct {
 	cleanupNeeded bool // guarded by Server.mu
 }
 
+const (
+	policyDegradedAuthoritative = "authoritative_protected_policy_failed"
+	policyMutationInProgress    = "protected_policy_mutation_in_progress"
+	policyMutationInterrupted   = "protected_policy_mutation_interrupted"
+	policyDegradedDenyAdd       = "incremental_deny_install_failed"
+	policyDegradedAllowRemove   = "incremental_allow_removal_failed"
+	policyDegradedMode          = "incremental_mode_change_failed"
+)
+
+var errPolicyDegraded = errors.New("attachment protected policy is degraded; a complete authoritative reconcile is required")
+var errProtectedPolicyDurablyDegraded = errors.New("attachment was durably placed in proven BLOCK_ALL degradation")
+
 func (s *attachmentState) finishSetup(committed bool) {
 	if s == nil || s.setupDone == nil {
 		return
@@ -688,6 +700,9 @@ func (s *Server) Start() error {
 		}
 		attachType := parseAttachmentType(state.info.Type)
 		mode := parsePolicyMode(state.info.Mode)
+		if state.info.PolicyDegradedReason != "" {
+			mode = apiv1.PolicyMode_POLICY_MODE_BLOCK_ALL
+		}
 		direction := parseTcDirection(state.info.Direction)
 		expectedIdentity, err := s.targetIdentity(attachType, state.info.Target)
 		if err != nil {
@@ -732,6 +747,32 @@ func (s *Server) Start() error {
 			pinIdentityChanged:   pinIdentityChanged,
 		}
 		resources = append(resources, resource)
+		if state.info.PolicyDegradedReason != "" {
+			if err := setAndProveFilterMode(ebpfFilter, filter.ModeBlockAll); err != nil {
+				return abortStart(fmt.Errorf("forcing restored degraded attachment %s BLOCK_ALL: %w", id, err))
+			}
+			candidate := cloneAttachment(state.info)
+			needsPersist := false
+			interruptedJournal := state.info.PolicyDegradedReason == policyMutationInProgress
+			if interruptedJournal {
+				candidate.PolicyDegradedReason = policyMutationInterrupted
+				needsPersist = true
+			}
+			if state.info.Mode != apiv1.PolicyMode_POLICY_MODE_BLOCK_ALL.String() {
+				candidate.Mode = apiv1.PolicyMode_POLICY_MODE_BLOCK_ALL.String()
+				needsPersist = true
+			}
+			if needsPersist {
+				if err := s.saveAttachment(candidate); err != nil {
+					return abortStart(fmt.Errorf("persisting restored degraded attachment %s BLOCK_ALL: %w", id, err))
+				}
+				state.info.Mode = candidate.Mode
+				state.info.PolicyDegradedReason = candidate.PolicyDegradedReason
+			}
+			if interruptedJournal {
+				s.logInterruptedProtectedPolicy(id)
+			}
+		}
 		dnsSink, sinkErr := s.newDNSFilterSink(id, ebpfFilter)
 		if sinkErr != nil {
 			return abortStart(fmt.Errorf("initializing DNS exact-tier ownership for attachment %s: %w", id, sinkErr))
@@ -1176,7 +1217,23 @@ func (s *Server) seedAdoptedState(id string, state *attachmentState, f filter.Fi
 	if liveMode, err := f.GetMode(); err != nil {
 		s.logger.Warn().Err(err).Str("id", id).Msg("failed to read mode from re-adopted filter")
 		seedErr = errors.Join(seedErr, fmt.Errorf("reading adopted mode: %w", err))
-	} else if apiMode := filterModeToAPIMode(liveMode); apiMode.String() != state.info.Mode {
+	} else if state.info.PolicyDegradedReason != "" && liveMode != filter.ModeBlockAll {
+		seedErr = errors.Join(seedErr, fmt.Errorf("persisted degraded attachment live mode is %s, want BLOCK_ALL", liveMode))
+	} else if state.info.PolicyDegradedReason == "" && liveMode == filter.ModeBlockAll && state.info.Mode != apiv1.PolicyMode_POLICY_MODE_BLOCK_ALL.String() {
+		// A crash after fail-closed mode staging but before the degraded marker
+		// save is indistinguishable from a lagging ordinary mode write. Infer a
+		// conservative interrupted state so incrementals cannot reopen it.
+		candidate := cloneAttachment(state.info)
+		candidate.Mode = apiv1.PolicyMode_POLICY_MODE_BLOCK_ALL.String()
+		candidate.PolicyDegradedReason = policyMutationInterrupted
+		if err := s.saveAttachment(candidate); err != nil {
+			seedErr = errors.Join(seedErr, fmt.Errorf("persisting inferred interrupted BLOCK_ALL policy: %w", err))
+		} else {
+			state.info.Mode = candidate.Mode
+			state.info.PolicyDegradedReason = candidate.PolicyDegradedReason
+			s.logInterruptedProtectedPolicy(id)
+		}
+	} else if apiMode := filterModeToAPIMode(liveMode); state.info.PolicyDegradedReason == "" && apiMode.String() != state.info.Mode {
 		s.logger.Info().Str("id", id).
 			Str("store_mode", state.info.Mode).
 			Str("live_mode", apiMode.String()).
@@ -1198,24 +1255,22 @@ func (s *Server) seedAdoptedState(id string, state *attachmentState, f filter.Fi
 	if err != nil {
 		return errors.Join(seedErr, fmt.Errorf("listing adopted rules: %w", err))
 	}
-	now := s.now()
-	for _, cidr := range allowed {
-		if err := state.ttls.addCP(f, cidr, listAllow, 0, now); err != nil {
-			s.logger.Warn().Err(err).Str("id", id).Str("cidr", cidr.String()).Msg("failed to seed re-adopted allow rule")
-			seedErr = errors.Join(seedErr, fmt.Errorf("seeding adopted allow %s: %w", cidr, err))
-		}
-	}
-	for _, cidr := range denied {
-		if err := state.ttls.addCP(f, cidr, listDeny, 0, now); err != nil {
-			s.logger.Warn().Err(err).Str("id", id).Str("cidr", cidr.String()).Msg("failed to seed re-adopted deny rule")
-			seedErr = errors.Join(seedErr, fmt.Errorf("seeding adopted deny %s: %w", cidr, err))
-		}
+	if err := state.ttls.seedAdopted(allowed, denied); err != nil {
+		s.logger.Warn().Err(err).Str("id", id).Msg("failed to seed re-adopted protected rule inventory")
+		seedErr = errors.Join(seedErr, fmt.Errorf("seeding adopted protected rule inventory: %w", err))
 	}
 	s.logger.Info().Str("id", id).
 		Int("allow_rules", len(allowed)).
 		Int("deny_rules", len(denied)).
 		Msg("re-adopted pinned rules (permanent until next control-plane sync; TTL deadlines are not persisted)")
 	return seedErr
+}
+
+func (s *Server) logInterruptedProtectedPolicy(id string) {
+	s.logger.Error().
+		Str("id", id).
+		Str("degraded_reason", policyMutationInterrupted).
+		Msg("attachment protected policy degraded after an interrupted mutation; enforcing BLOCK_ALL until authoritative recovery")
 }
 
 // targetPresent distinguishes explicit target disappearance from ambiguous
@@ -1382,13 +1437,30 @@ func (s *Server) sweepExpiredTTLs(now time.Time) {
 		if err != nil {
 			continue
 		}
-		for _, swept := range state.ttls.expire(state.filter, now) {
+		s.mu.RLock()
+		protectedHeld := s.attachments[id] == state && state.info.PolicyDegradedReason != ""
+		s.mu.RUnlock()
+		var protectedExpiryErr error
+		var protectedAllowExpiryErr error
+		var protectedSweeps []sweptEntry
+		journaled := false
+		if !protectedHeld && state.ttls.hasExpiredRemovableAllow(now) {
+			journaled, protectedExpiryErr = s.beginProtectedMutationJournalAdmitted(
+				id, state, policyDegradedAllowRemove, "expiring protected allow rules")
+		}
+		if !protectedHeld && protectedExpiryErr == nil {
+			protectedSweeps = state.ttls.expire(state.filter, now)
+		}
+		for _, swept := range protectedSweeps {
 			if swept.err != nil {
 				s.logger.Warn().Err(swept.err).
 					Str("id", id).
 					Str("cidr", swept.cidr).
 					Str("list", swept.list.String()).
 					Msg("failed to remove expired CIDR, will retry")
+				if swept.list == listAllow {
+					protectedAllowExpiryErr = errors.Join(protectedAllowExpiryErr, fmt.Errorf("removing expired allow %s: %w", swept.cidr, swept.err))
+				}
 				continue
 			}
 			s.logger.Debug().
@@ -1397,6 +1469,13 @@ func (s *Server) sweepExpiredTTLs(now time.Time) {
 				Str("list", swept.list.String()).
 				Msg("removed expired CIDR")
 		}
+		if protectedAllowExpiryErr != nil {
+			protectedExpiryErr = errors.Join(protectedExpiryErr, protectedAllowExpiryErr,
+				s.enterPolicyDegradedAdmitted(id, state, policyDegradedAllowRemove, protectedAllowExpiryErr))
+		} else if journaled {
+			protectedExpiryErr = errors.Join(protectedExpiryErr,
+				s.finishProtectedMutationJournalAdmitted(id, state, journaled, policyDegradedAllowRemove, "expiring protected allow rules"))
+		}
 		var dnsExpiryErr error
 		if state.dnsSink != nil {
 			dnsExpiryErr = state.dnsSink.Expire(now)
@@ -1404,7 +1483,7 @@ func (s *Server) sweepExpiredTTLs(now time.Time) {
 				dnsExpiryErr = errors.Join(dnsExpiryErr, state.dnsSink.FailClosedIfAmbiguous(dnsExpiryErr))
 			}
 		}
-		if finishErr := s.finishDNSMutation(state, done, dnsExpiryErr); finishErr != nil {
+		if finishErr := s.finishDNSMutation(state, done, errors.Join(protectedExpiryErr, dnsExpiryErr)); finishErr != nil {
 			s.logger.Warn().Err(finishErr).Str("id", id).Msg("failed to expire DNS exact-tier ownership; will retry or remain quarantined")
 		}
 	}
@@ -1902,7 +1981,7 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (resp *ap
 		return nil, fmt.Errorf("DNS listener exited during attachment setup: %w", err)
 	}
 	if attachmentCP == nil {
-		if err := ebpfFilter.SetMode(filter.ModeDisabled); err != nil {
+		if err := setAndProveFilterMode(ebpfFilter, filter.ModeDisabled); err != nil {
 			s.mu.Unlock()
 			registered.reconcileMu.Unlock()
 			return nil, fmt.Errorf("committing initial disabled filter mode: %w", err)
@@ -1916,6 +1995,12 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (resp *ap
 	s.mu.Unlock()
 	if subscribedAck != nil {
 		if err := attachmentCP.applySubscribedAck(id, subscribedAck); err != nil {
+			if errors.Is(err, errProtectedPolicyDurablyDegraded) {
+				registered.finishSetup(true)
+				registered.reconcileMu.Unlock()
+				s.startDNSLifecycleWatch(id, registered)
+				return nil, fmt.Errorf("applying initial control-plane policy left retained attachment %s safely degraded for authoritative retry: %w", id, err)
+			}
 			quarantineErr := s.quarantineAttachment(id, registered)
 			registered.finishSetup(true)
 			registered.reconcileMu.Unlock()
@@ -2127,9 +2212,9 @@ func (s *Server) List(ctx context.Context, req *apiv1.ListRequest) (*apiv1.ListR
 		return nil, fmt.Errorf("listing attachments: %w", err)
 	}
 
-	statsByID := make(map[string]attachmentStatsSnapshot, len(attachments))
+	statsByID := make(map[string]attachmentTrafficStatsSnapshot, len(attachments))
 	for _, a := range attachments {
-		if stats, ok := s.readAttachmentStats(a.ID); ok {
+		if stats, ok := s.readAttachmentTrafficStats(a.ID); ok {
 			statsByID[a.ID] = stats
 		}
 	}
@@ -2312,44 +2397,69 @@ func (s *Server) GetAttachmentStats() []*apiv1.AttachmentStats {
 			continue
 		}
 		stats = append(stats, &apiv1.AttachmentStats{
-			Id:                    id,
-			PacketsAllowed:        snapshot.packetsAllowed,
-			PacketsBlocked:        snapshot.packetsBlocked,
-			DnsQueriesAllowed:     snapshot.dnsAllowed,
-			DnsQueriesBlocked:     snapshot.dnsBlocked,
-			DnsQueriesErrors:      snapshot.dnsErrors,
-			MapFullDrops:          snapshot.mapFullDrops,
-			DnsExactIpv4Entries:   snapshot.dnsExactIPv4Entries,
-			DnsExactIpv4Capacity:  snapshot.dnsExactIPv4Capacity,
-			DnsExactIpv4HighWater: snapshot.dnsExactIPv4HighWater,
-			DnsExactIpv6Entries:   snapshot.dnsExactIPv6Entries,
-			DnsExactIpv6Capacity:  snapshot.dnsExactIPv6Capacity,
-			DnsExactIpv6HighWater: snapshot.dnsExactIPv6HighWater,
-			DnsLruEvictions:       snapshot.dnsLRUEvictions,
-			DnsAdmissionFailures:  snapshot.dnsAdmissionFailures,
-			DnsBudgetThrottles:    snapshot.dnsBudgetThrottles,
+			Id:                          id,
+			PacketsAllowed:              snapshot.packetsAllowed,
+			PacketsBlocked:              snapshot.packetsBlocked,
+			DnsQueriesAllowed:           snapshot.dnsAllowed,
+			DnsQueriesBlocked:           snapshot.dnsBlocked,
+			DnsQueriesErrors:            snapshot.dnsErrors,
+			MapFullDrops:                snapshot.mapFullDrops,
+			DnsExactIpv4Entries:         snapshot.dnsExactIPv4Entries,
+			DnsExactIpv4Capacity:        snapshot.dnsExactIPv4Capacity,
+			DnsExactIpv4HighWater:       snapshot.dnsExactIPv4HighWater,
+			DnsExactIpv6Entries:         snapshot.dnsExactIPv6Entries,
+			DnsExactIpv6Capacity:        snapshot.dnsExactIPv6Capacity,
+			DnsExactIpv6HighWater:       snapshot.dnsExactIPv6HighWater,
+			DnsLruEvictions:             snapshot.dnsLRUEvictions,
+			DnsAdmissionFailures:        snapshot.dnsAdmissionFailures,
+			DnsBudgetThrottles:          snapshot.dnsBudgetThrottles,
+			ProtectedAllowIpv4Entries:   snapshot.protectedAllowIPv4Entries,
+			ProtectedAllowIpv4Capacity:  snapshot.protectedAllowIPv4Capacity,
+			ProtectedAllowIpv4HighWater: snapshot.protectedAllowIPv4HighWater,
+			ProtectedAllowIpv6Entries:   snapshot.protectedAllowIPv6Entries,
+			ProtectedAllowIpv6Capacity:  snapshot.protectedAllowIPv6Capacity,
+			ProtectedAllowIpv6HighWater: snapshot.protectedAllowIPv6HighWater,
+			ProtectedDenyIpv4Entries:    snapshot.protectedDenyIPv4Entries,
+			ProtectedDenyIpv4Capacity:   snapshot.protectedDenyIPv4Capacity,
+			ProtectedDenyIpv4HighWater:  snapshot.protectedDenyIPv4HighWater,
+			ProtectedDenyIpv6Entries:    snapshot.protectedDenyIPv6Entries,
+			ProtectedDenyIpv6Capacity:   snapshot.protectedDenyIPv6Capacity,
+			ProtectedDenyIpv6HighWater:  snapshot.protectedDenyIPv6HighWater,
+			PolicyDegraded:              snapshot.policyDegraded,
+			PolicyDegradedReason:        snapshot.policyDegradedReason,
 		})
 	}
 	return stats
 }
 
 type attachmentStatsSnapshot struct {
-	packetsAllowed, packetsBlocked                                   uint64
-	dnsAllowed, dnsBlocked                                           uint64
-	dnsErrors, mapFullDrops                                          uint64
-	dnsExactIPv4Entries, dnsExactIPv4Capacity, dnsExactIPv4HighWater uint32
-	dnsExactIPv6Entries, dnsExactIPv6Capacity, dnsExactIPv6HighWater uint32
-	dnsLRUEvictions, dnsAdmissionFailures, dnsBudgetThrottles        uint64
+	packetsAllowed, packetsBlocked                                                     uint64
+	dnsAllowed, dnsBlocked                                                             uint64
+	dnsErrors, mapFullDrops                                                            uint64
+	dnsExactIPv4Entries, dnsExactIPv4Capacity, dnsExactIPv4HighWater                   uint32
+	dnsExactIPv6Entries, dnsExactIPv6Capacity, dnsExactIPv6HighWater                   uint32
+	dnsLRUEvictions, dnsAdmissionFailures, dnsBudgetThrottles                          uint64
+	protectedAllowIPv4Entries, protectedAllowIPv4Capacity, protectedAllowIPv4HighWater uint32
+	protectedAllowIPv6Entries, protectedAllowIPv6Capacity, protectedAllowIPv6HighWater uint32
+	protectedDenyIPv4Entries, protectedDenyIPv4Capacity, protectedDenyIPv4HighWater    uint32
+	protectedDenyIPv6Entries, protectedDenyIPv6Capacity, protectedDenyIPv6HighWater    uint32
+	policyDegraded                                                                     bool
+	policyDegradedReason                                                               string
 }
 
-func (s *Server) readAttachmentStats(id string) (attachmentStatsSnapshot, bool) {
-	state, done, err := s.beginAttachmentMutation(id)
-	if err != nil {
-		return attachmentStatsSnapshot{}, false
-	}
-	defer done()
+// attachmentTrafficStatsSnapshot is the lightweight subset returned by the
+// local List API. List has no protected/exact occupancy fields, so it must not
+// pay the four-map inventory walk used by fixed-cadence heartbeat telemetry.
+type attachmentTrafficStatsSnapshot struct {
+	packetsAllowed uint64
+	packetsBlocked uint64
+	dnsAllowed     uint64
+	dnsBlocked     uint64
+	dnsErrors      uint64
+}
 
-	var snapshot attachmentStatsSnapshot
+func readAttachmentTrafficStatsAdmitted(state *attachmentState) attachmentTrafficStatsSnapshot {
+	var snapshot attachmentTrafficStatsSnapshot
 	if state.filter != nil {
 		if stats, err := state.filter.GetStats(); err == nil {
 			snapshot.packetsAllowed = stats.Allowed
@@ -2359,9 +2469,59 @@ func (s *Server) readAttachmentStats(id string) (attachmentStatsSnapshot, bool) 
 	if state.dns != nil {
 		snapshot.dnsAllowed, snapshot.dnsBlocked, snapshot.dnsErrors = state.dns.Stats()
 	}
+	return snapshot
+}
+
+func (s *Server) readAttachmentTrafficStats(id string) (attachmentTrafficStatsSnapshot, bool) {
+	state, done, err := s.beginAttachmentMutation(id)
+	if err != nil {
+		return attachmentTrafficStatsSnapshot{}, false
+	}
+	defer done()
+	return readAttachmentTrafficStatsAdmitted(state), true
+}
+
+func (s *Server) readAttachmentStats(id string) (attachmentStatsSnapshot, bool) {
+	state, done, err := s.beginAttachmentMutation(id)
+	if err != nil {
+		return attachmentStatsSnapshot{}, false
+	}
+	defer done()
+
+	traffic := readAttachmentTrafficStatsAdmitted(state)
+	snapshot := attachmentStatsSnapshot{
+		packetsAllowed: traffic.packetsAllowed,
+		packetsBlocked: traffic.packetsBlocked,
+		dnsAllowed:     traffic.dnsAllowed,
+		dnsBlocked:     traffic.dnsBlocked,
+		dnsErrors:      traffic.dnsErrors,
+	}
 	if state.ttls != nil {
 		snapshot.mapFullDrops = state.ttls.mapFullCount()
+		protected, protectedErr := state.ttls.protectedStats(state.filter)
+		snapshot.protectedAllowIPv4Entries = protected.occupancy.AllowedIPv4.Entries
+		snapshot.protectedAllowIPv4Capacity = protected.occupancy.AllowedIPv4.Capacity
+		snapshot.protectedAllowIPv4HighWater = protected.allow4HighWater
+		snapshot.protectedAllowIPv6Entries = protected.occupancy.AllowedIPv6.Entries
+		snapshot.protectedAllowIPv6Capacity = protected.occupancy.AllowedIPv6.Capacity
+		snapshot.protectedAllowIPv6HighWater = protected.allow6HighWater
+		snapshot.protectedDenyIPv4Entries = protected.occupancy.DeniedIPv4.Entries
+		snapshot.protectedDenyIPv4Capacity = protected.occupancy.DeniedIPv4.Capacity
+		snapshot.protectedDenyIPv4HighWater = protected.deny4HighWater
+		snapshot.protectedDenyIPv6Entries = protected.occupancy.DeniedIPv6.Entries
+		snapshot.protectedDenyIPv6Capacity = protected.occupancy.DeniedIPv6.Capacity
+		snapshot.protectedDenyIPv6HighWater = protected.deny6HighWater
+		if protectedErr != nil && state.ttls.protectedStatsWarningAllowed(s.now()) {
+			s.logger.Warn().Err(protectedErr).Str("id", id).
+				Msg("failed to refresh protected LPM telemetry; reporting last proven snapshot")
+		}
 	}
+	s.mu.RLock()
+	if s.attachments[id] == state {
+		snapshot.policyDegradedReason = state.info.PolicyDegradedReason
+		snapshot.policyDegraded = snapshot.policyDegradedReason != ""
+	}
+	s.mu.RUnlock()
 	if state.dnsSink != nil {
 		snapshot.mapFullDrops += state.dnsSink.CapacityDropCount()
 		ownership := state.dnsSink.OwnershipStats()
@@ -2560,18 +2720,36 @@ func (s *Server) finishDNSMutation(state *attachmentState, done func(), mutation
 }
 
 func (s *Server) ClearRules(id string) error {
-	ebpfFilter, reg, done, err := s.filterAndRegistry(id)
+	state, ebpfFilter, reg, done, err := s.filterAndRegistry(id)
 	if err != nil {
 		return err
 	}
 	defer done()
+	if err := s.requirePolicyNotDegraded(id, state); err != nil {
+		return err
+	}
+	journaled := false
+	if reg.hasRemovableAllow() {
+		journaled, err = s.beginProtectedMutationJournalAdmitted(
+			id, state, policyDegradedAllowRemove, "clearing protected rules")
+		if err != nil {
+			return err
+		}
+	}
 
 	// Clearing goes through the TTL registry and delta-removes every ordinary
 	// control-plane LPM entry. It deliberately never invokes Filter.ClearRules:
 	// the system-owned DNS bootstrap route must remain reachable, while failed
 	// removals stay tracked for a later retry instead of being forgotten. DNS
 	// exact ownership is independent and changes only with DNS policy/TTL.
-	return reg.clear(ebpfFilter)
+	if err := reg.clear(ebpfFilter); err != nil {
+		if errors.Is(err, errProtectedAllowRemoval) {
+			return errors.Join(err, s.enterPolicyDegradedAdmitted(id, state, policyDegradedAllowRemove, err))
+		}
+		return errors.Join(err,
+			s.finishProtectedMutationJournalAdmitted(id, state, journaled, policyDegradedAllowRemove, "clearing protected rules"))
+	}
+	return s.finishProtectedMutationJournalAdmitted(id, state, journaled, policyDegradedAllowRemove, "clearing protected rules")
 }
 
 func (s *Server) SetFilterMode(id string, mode apiv1.PolicyMode) error {
@@ -2583,12 +2761,36 @@ func (s *Server) SetFilterMode(id string, mode apiv1.PolicyMode) error {
 		return err
 	}
 	defer done()
-	return s.setFilterModeAdmitted(id, state, mode)
+	if err := s.requirePolicyNotDegraded(id, state); err != nil {
+		return err
+	}
+	s.mu.RLock()
+	if s.attachments[id] != state {
+		s.mu.RUnlock()
+		return fmt.Errorf("attachment changed while checking filter mode: %s", id)
+	}
+	sameMode := state.info.Mode == mode.String()
+	s.mu.RUnlock()
+	if sameMode {
+		return nil
+	}
+	journaled := false
+	if mode != apiv1.PolicyMode_POLICY_MODE_BLOCK_ALL {
+		journaled, err = s.beginProtectedMutationJournalAdmitted(
+			id, state, policyDegradedMode, "changing protected policy mode")
+		if err != nil {
+			return err
+		}
+	}
+	if err := s.setFilterModeAdmitted(id, state, mode); err != nil {
+		return errors.Join(err, s.enterPolicyDegradedAdmitted(id, state, policyDegradedMode, err))
+	}
+	return s.finishProtectedMutationJournalAdmitted(id, state, journaled, policyDegradedMode, "changing protected policy mode")
 }
 
 func (s *Server) setFilterModeAdmitted(id string, state *attachmentState, mode apiv1.PolicyMode) error {
 	if state.filter != nil {
-		if err := state.filter.SetMode(apiModeToFilterMode(mode)); err != nil {
+		if err := setAndProveFilterMode(state.filter, apiModeToFilterMode(mode)); err != nil {
 			return err
 		}
 	}
@@ -2607,6 +2809,253 @@ func (s *Server) setFilterModeAdmitted(id string, state *attachmentState, mode a
 	return nil
 }
 
+func setAndProveFilterMode(f filter.Filter, mode filter.PolicyMode) error {
+	writeErr := f.SetMode(mode)
+	got, readErr := f.GetMode()
+	if readErr == nil && got == mode {
+		return nil
+	}
+	var errs []error
+	if writeErr != nil {
+		errs = append(errs, fmt.Errorf("writing mode %s: %w", mode, writeErr))
+	}
+	if readErr != nil {
+		errs = append(errs, fmt.Errorf("reading mode after write: %w", readErr))
+	} else if got != mode {
+		errs = append(errs, fmt.Errorf("mode write not effective: want %s, got %s", mode, got))
+	}
+	return errors.Join(errs...)
+}
+
+func (s *Server) requirePolicyNotDegraded(id string, state *attachmentState) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.attachments[id] != state {
+		return fmt.Errorf("attachment changed while checking degraded policy: %s", id)
+	}
+	if state.info.PolicyDegradedReason != "" {
+		return fmt.Errorf("%w: %s", errPolicyDegraded, state.info.PolicyDegradedReason)
+	}
+	return nil
+}
+
+// beginProtectedMutationJournalAdmitted closes the restart ambiguity unique
+// to a healthy attachment intentionally configured as BLOCK_ALL. If a
+// safety-sensitive incremental mutation changed a protected map and the
+// process died before publishing its outcome, live BLOCK_ALL would otherwise
+// be indistinguishable from the healthy persisted posture. Prove BLOCK_ALL,
+// persist an in-progress marker before the first policy mutation syscall, and
+// only then publish the marker in memory. Startup turns an interrupted marker
+// into stable degraded BLOCK_ALL, recoverable solely by a complete
+// authoritative LPM+DNS update. Non-BLOCK_ALL policies need no journal.
+//
+// The caller owns this attachment's mutationSerialMu and has already rejected
+// an existing degraded marker.
+func (s *Server) beginProtectedMutationJournalAdmitted(id string, state *attachmentState, failureReason, operation string) (bool, error) {
+	s.mu.RLock()
+	if s.attachments[id] != state {
+		s.mu.RUnlock()
+		return false, fmt.Errorf("attachment changed before %s: %s", operation, id)
+	}
+	mode := state.info.Mode
+	reason := state.info.PolicyDegradedReason
+	row := cloneAttachment(state.info)
+	s.mu.RUnlock()
+	if reason != "" {
+		return false, fmt.Errorf("%w: %s", errPolicyDegraded, reason)
+	}
+	if mode != apiv1.PolicyMode_POLICY_MODE_BLOCK_ALL.String() {
+		return false, nil
+	}
+	if state.filter == nil {
+		err := fmt.Errorf("%s: filter is unavailable", operation)
+		return false, errors.Join(err, s.enterPolicyDegradedAdmitted(id, state, failureReason, err))
+	}
+	if err := setAndProveFilterMode(state.filter, filter.ModeBlockAll); err != nil {
+		wrapped := fmt.Errorf("proving BLOCK_ALL before %s: %w", operation, err)
+		return false, errors.Join(wrapped, s.enterPolicyDegradedAdmitted(id, state, failureReason, wrapped))
+	}
+	row.Mode = apiv1.PolicyMode_POLICY_MODE_BLOCK_ALL.String()
+	row.PolicyDegradedReason = policyMutationInProgress
+	if err := s.saveAttachment(row); err != nil {
+		wrapped := fmt.Errorf("persisting in-progress marker before %s: %w", operation, err)
+		return false, errors.Join(wrapped, s.enterPolicyDegradedAdmitted(id, state, failureReason, wrapped))
+	}
+	s.mu.Lock()
+	if s.attachments[id] != state {
+		s.mu.Unlock()
+		return false, fmt.Errorf("attachment changed after journaling %s: %s", operation, id)
+	}
+	state.info.Mode = row.Mode
+	state.info.PolicyDegradedReason = policyMutationInProgress
+	s.mu.Unlock()
+	return true, nil
+}
+
+// finishProtectedMutationJournalAdmitted durably clears a transient marker
+// only after the full incremental operation has succeeded (or failed only in
+// a fail-closed direction). Failure to clear is itself converted to the
+// operation's stable degradation reason so restart intent remains explicit.
+// Successful journal clearing is intentionally silent: intentional BLOCK_ALL
+// outside an active/interrupted journal is healthy, not a recovery event.
+func (s *Server) finishProtectedMutationJournalAdmitted(id string, state *attachmentState, journaled bool, failureReason, operation string) error {
+	if !journaled {
+		return nil
+	}
+	s.mu.RLock()
+	if s.attachments[id] != state {
+		s.mu.RUnlock()
+		return fmt.Errorf("attachment changed while completing %s: %s", operation, id)
+	}
+	if state.info.PolicyDegradedReason != policyMutationInProgress {
+		reason := state.info.PolicyDegradedReason
+		s.mu.RUnlock()
+		err := fmt.Errorf("in-progress marker changed while completing %s: %q", operation, reason)
+		return errors.Join(err, s.enterPolicyDegradedAdmitted(id, state, failureReason, err))
+	}
+	row := cloneAttachment(state.info)
+	s.mu.RUnlock()
+	row.PolicyDegradedReason = ""
+	if err := s.saveAttachment(row); err != nil {
+		wrapped := fmt.Errorf("clearing in-progress marker after %s: %w", operation, err)
+		return errors.Join(wrapped, s.enterPolicyDegradedAdmitted(id, state, failureReason, wrapped))
+	}
+	s.mu.Lock()
+	if s.attachments[id] != state {
+		s.mu.Unlock()
+		return fmt.Errorf("attachment changed after completing %s: %s", operation, id)
+	}
+	state.info.Mode = row.Mode
+	state.info.PolicyDegradedReason = ""
+	s.mu.Unlock()
+	return nil
+}
+
+// enterPolicyDegradedAdmitted forces and proves BLOCK_ALL, then persists a
+// stable reason code. The raw error stays in logs only. A one-shot store retry
+// lets transient persistence failures converge; inability to prove both live
+// fail-closed enforcement and durable restart intent stops command admission.
+// The caller owns this attachment's mutationSerialMu.
+func (s *Server) enterPolicyDegradedAdmitted(id string, state *attachmentState, reason string, cause error) error {
+	if state == nil || state.filter == nil {
+		err := fmt.Errorf("degrading protected policy: filter is unavailable")
+		s.enterTerminal(err)
+		return err
+	}
+	modeErr := setAndProveFilterMode(state.filter, filter.ModeBlockAll)
+
+	s.mu.RLock()
+	if s.attachments[id] != state {
+		s.mu.RUnlock()
+		err := fmt.Errorf("degrading protected policy: attachment ownership changed")
+		s.enterTerminal(err)
+		return errors.Join(modeErr, err)
+	}
+	existingReason := state.info.PolicyDegradedReason
+	existingMode := state.info.Mode
+	wasDegraded := existingReason != "" && existingReason != policyMutationInProgress
+	stableReason := reason
+	if wasDegraded {
+		// Preserve the first durable diagnosis until full authoritative recovery.
+		// Later failures may add incident logs, but must not churn operator-visible
+		// reason codes or rewrite the same row on every retry.
+		stableReason = existingReason
+	}
+	row := cloneAttachment(state.info)
+	s.mu.RUnlock()
+	row.Mode = apiv1.PolicyMode_POLICY_MODE_BLOCK_ALL.String()
+	row.PolicyDegradedReason = stableReason
+	needsPersist := !wasDegraded || existingMode != row.Mode
+
+	var persistErr error
+	if needsPersist {
+		persistErr = s.saveAttachment(row)
+		if persistErr != nil {
+			s.logger.Warn().Err(persistErr).Str("id", id).Str("degraded_reason", stableReason).
+				Msg("failed to persist protected-policy degradation; retrying once")
+			if retryErr := s.saveAttachment(row); retryErr != nil {
+				persistErr = errors.Join(persistErr, retryErr)
+			} else {
+				persistErr = nil
+			}
+		}
+		if persistErr == nil {
+			s.mu.Lock()
+			if s.attachments[id] != state {
+				s.mu.Unlock()
+				ownershipErr := fmt.Errorf("degrading protected policy: attachment ownership changed after persistence")
+				s.enterTerminal(ownershipErr)
+				return errors.Join(modeErr, ownershipErr)
+			}
+			state.info.Mode = row.Mode
+			state.info.PolicyDegradedReason = row.PolicyDegradedReason
+			s.mu.Unlock()
+		}
+	}
+	if !wasDegraded {
+		s.logger.Error().Err(cause).Str("id", id).Str("degraded_reason", stableReason).
+			Msg("attachment protected policy degraded; enforcing BLOCK_ALL until authoritative recovery")
+	} else if errors.Is(cause, filter.ErrProtectedRuleRollback) || errors.Is(cause, filter.ErrProtectedRuleModeAmbiguous) {
+		s.logger.Error().Err(cause).
+			Str("id", id).
+			Str("degraded_reason", stableReason).
+			Bool("rollback_ambiguous", errors.Is(cause, filter.ErrProtectedRuleRollback)).
+			Bool("mode_ambiguous", errors.Is(cause, filter.ErrProtectedRuleModeAmbiguous)).
+			Msg("new protected-policy ambiguity while attachment was already degraded")
+	}
+	if modeErr != nil || persistErr != nil {
+		terminalErr := errors.Join(
+			func() error {
+				if modeErr != nil {
+					return fmt.Errorf("proving degraded BLOCK_ALL: %w", modeErr)
+				}
+				return nil
+			}(),
+			func() error {
+				if persistErr != nil {
+					return fmt.Errorf("persisting degraded policy: %w", persistErr)
+				}
+				return nil
+			}(),
+		)
+		s.enterTerminal(terminalErr)
+		return terminalErr
+	}
+	return errProtectedPolicyDurablyDegraded
+}
+
+// commitAuthoritativePolicyAdmitted durably publishes a successful combined
+// map+mode transaction and clears any prior degradation. If durability fails,
+// the attachment is forced back to durable BLOCK_ALL and remains retryable.
+func (s *Server) commitAuthoritativePolicyAdmitted(id string, state *attachmentState, mode apiv1.PolicyMode) error {
+	s.mu.RLock()
+	if s.attachments[id] != state {
+		s.mu.RUnlock()
+		return fmt.Errorf("attachment changed while committing authoritative protected policy: %s", id)
+	}
+	wasDegraded := state.info.PolicyDegradedReason != "" && state.info.PolicyDegradedReason != policyMutationInProgress
+	row := cloneAttachment(state.info)
+	s.mu.RUnlock()
+	row.Mode = mode.String()
+	row.PolicyDegradedReason = ""
+	if err := s.saveAttachment(row); err != nil {
+		commitErr := fmt.Errorf("persisting authoritative protected policy: %w", err)
+		return errors.Join(commitErr, s.enterPolicyDegradedAdmitted(id, state, policyDegradedAuthoritative, commitErr))
+	}
+	s.mu.Lock()
+	if s.attachments[id] != state {
+		s.mu.Unlock()
+		return fmt.Errorf("attachment changed after persisting authoritative protected policy: %s", id)
+	}
+	state.info.Mode = mode.String()
+	state.info.PolicyDegradedReason = ""
+	s.mu.Unlock()
+	if wasDegraded {
+		s.logger.Info().Str("id", id).Msg("attachment protected policy recovered after authoritative reconciliation")
+	}
+	return nil
+}
+
 // AllowCIDR adds the CIDR to the attachment's allowlist under the registry's
 // max-deadline / permanent-pin model (see ttlRegistry): a ttl > 0 schedules
 // removal by the TTL janitor, with a re-add only ever EXTENDING an existing
@@ -2614,66 +3063,84 @@ func (s *Server) setFilterModeAdmitted(id string, state *attachmentState, mode a
 // entry permanent, and a permanent entry is never demoted by a later TTL'd
 // re-add. Use RemoveAllowedCIDR to drop an entry early.
 func (s *Server) AllowCIDR(id string, cidr *net.IPNet, ttl time.Duration) error {
-	ebpfFilter, reg, done, err := s.filterAndRegistry(id)
+	state, ebpfFilter, reg, done, err := s.filterAndRegistry(id)
 	if err != nil {
 		return err
 	}
 	defer done()
+	if err := s.requirePolicyNotDegraded(id, state); err != nil {
+		return err
+	}
 	return reg.addCP(ebpfFilter, cidr, listAllow, ttl, s.now())
 }
 
 // DenyCIDR adds the CIDR to the attachment's denylist. TTL semantics match
 // AllowCIDR.
 func (s *Server) DenyCIDR(id string, cidr *net.IPNet, ttl time.Duration) error {
-	ebpfFilter, reg, done, err := s.filterAndRegistry(id)
+	state, ebpfFilter, reg, done, err := s.filterAndRegistry(id)
 	if err != nil {
 		return err
 	}
 	defer done()
-	return reg.addCP(ebpfFilter, cidr, listDeny, ttl, s.now())
+	if err := s.requirePolicyNotDegraded(id, state); err != nil {
+		return err
+	}
+	journaled := false
+	if reg.needsPhysicalAdd(cidr, listDeny) {
+		journaled, err = s.beginProtectedMutationJournalAdmitted(
+			id, state, policyDegradedDenyAdd, "installing protected deny rule")
+		if err != nil {
+			return err
+		}
+	}
+	if err := reg.addCP(ebpfFilter, cidr, listDeny, ttl, s.now()); err != nil {
+		return errors.Join(err, s.enterPolicyDegradedAdmitted(id, state, policyDegradedDenyAdd, err))
+	}
+	return s.finishProtectedMutationJournalAdmitted(id, state, journaled, policyDegradedDenyAdd, "installing protected deny rule")
 }
 
 func (s *Server) RemoveAllowedCIDR(id string, cidr *net.IPNet) error {
-	ebpfFilter, reg, done, err := s.filterAndRegistry(id)
+	state, ebpfFilter, reg, done, err := s.filterAndRegistry(id)
 	if err != nil {
 		return err
 	}
 	defer done()
-	return reg.remove(ebpfFilter, cidr, listAllow)
+	if err := s.requirePolicyNotDegraded(id, state); err != nil {
+		return err
+	}
+	journaled := false
+	if reg.needsPhysicalRemove(cidr, listAllow) {
+		journaled, err = s.beginProtectedMutationJournalAdmitted(
+			id, state, policyDegradedAllowRemove, "removing protected allow rule")
+		if err != nil {
+			return err
+		}
+	}
+	if err := reg.remove(ebpfFilter, cidr, listAllow); err != nil {
+		return errors.Join(err, s.enterPolicyDegradedAdmitted(id, state, policyDegradedAllowRemove, err))
+	}
+	return s.finishProtectedMutationJournalAdmitted(id, state, journaled, policyDegradedAllowRemove, "removing protected allow rule")
 }
 
 func (s *Server) RemoveDeniedCIDR(id string, cidr *net.IPNet) error {
-	ebpfFilter, reg, done, err := s.filterAndRegistry(id)
+	state, ebpfFilter, reg, done, err := s.filterAndRegistry(id)
 	if err != nil {
 		return err
 	}
 	defer done()
+	if err := s.requirePolicyNotDegraded(id, state); err != nil {
+		return err
+	}
 	return reg.remove(ebpfFilter, cidr, listDeny)
 }
 
-// ReconcileCIDRs applies a bulk update — target mode plus declared CIDR
-// sets — as add/remove deltas against the registry's live CP entries (see
-// ttlRegistry.reconcileCP), in an order that is window-free for EVERY mode
-// pair. The BPF program consults exactly one rule map per mode (allowlist
-// -> allowed_*, denylist -> denied_*, block-all/disabled -> none), so:
-//
-//  1. The list the NEW mode consults is reconciled first — adds AND
-//     removes. During a mode flip that list is inert under the OLD mode, so
-//     correcting it opens no window; on a same-mode resync this is the live
-//     list, and survivor dedup means a rule present before and after is
-//     never touched.
-//  2. The mode is flipped only once the map it will read is fully correct.
-//     (Without this order, e.g. allowlist->denylist would consult a
-//     still-empty deny map and fail OPEN until the deny rules landed.)
-//  3. The other list is reconciled last — inert under the NEW mode, so its
-//     churn (e.g. stale allow entries that would otherwise sit live at a
-//     later flip back) is harmless.
-//
-// This CIDR-only operation does not mutate DNS exact ownership. A full
-// BulkUpdate follows it with authoritative DNS reconciliation, which remaps
-// still-authorized owners and promptly removes blocked/provisional exact keys.
-// Per-CIDR failures (e.g. map-full) are aggregated, not aborting the rest of
-// the reconcile.
+// ReconcileCIDRs applies one complete protected policy projection. The filter
+// snapshots and preflights every final LPM map before mutation, preserves
+// survivors, orders inert/live maps around the mode transition, and restores
+// the exact physical snapshot on failure. Registry ownership/deadlines commit
+// only after that combined transaction succeeds. Every valid projection that
+// cannot complete deliberately enters durable observable BLOCK_ALL; only a
+// later successful complete reconcile clears degradation.
 func (s *Server) ReconcileCIDRs(id string, mode apiv1.PolicyMode, allow, deny []parsedCIDR) error {
 	if err := validatePolicyMode(mode); err != nil {
 		return err
@@ -2683,29 +3150,91 @@ func (s *Server) ReconcileCIDRs(id string, mode apiv1.PolicyMode, allow, deny []
 		return err
 	}
 	defer done()
-	return s.reconcileCIDRsAdmitted(id, state, mode, allow, deny)
+	if err := s.requirePolicyNotDegraded(id, state); err != nil {
+		return err
+	}
+	held, err := s.stageAuthoritativeCIDRsAdmitted(id, state, mode, allow, deny, false)
+	if err != nil {
+		return err
+	}
+	if held {
+		return fmt.Errorf("%w: protected maps staged safely; complete BulkUpdate/SubscribedAck including DNS is required for recovery", errPolicyDegraded)
+	}
+	return nil
 }
 
-func (s *Server) reconcileCIDRsAdmitted(id string, state *attachmentState, mode apiv1.PolicyMode, allow, deny []parsedCIDR) error {
+// stageAuthoritativeCIDRsAdmitted keeps an already-degraded attachment in
+// proven BLOCK_ALL while installing the desired protected maps. The caller of
+// a larger full-state transaction may then reconcile DNS and call
+// activateAuthoritativePolicyAdmitted only after every component succeeds.
+// Non-degraded updates retain the normal window-free direct target-mode path.
+func (s *Server) stageAuthoritativeCIDRsAdmitted(id string, state *attachmentState, mode apiv1.PolicyMode, allow, deny []parsedCIDR, held bool) (bool, error) {
 	ebpfFilter, reg := state.filter, state.ttls
 	if ebpfFilter == nil {
-		return fmt.Errorf("attachment %s filter is unavailable", id)
+		return false, fmt.Errorf("attachment %s filter is unavailable", id)
 	}
-
-	// Which list does the new mode consult? Denylist reads denied_*;
-	// allowlist reads allowed_*; block-all/disabled read neither, so the
-	// order is arbitrary — allow-first, deterministically.
-	first, second := listAllow, listDeny
-	firstSet, secondSet := allow, deny
-	if mode == apiv1.PolicyMode_POLICY_MODE_DENYLIST {
-		first, second = listDeny, listAllow
-		firstSet, secondSet = deny, allow
+	effectiveMode := apiModeToFilterMode(mode)
+	if held {
+		effectiveMode = filter.ModeBlockAll
 	}
+	if err := reg.reconcileAuthoritative(ebpfFilter, effectiveMode, allow, deny, s.now()); err != nil {
+		return false, errors.Join(err, s.enterPolicyDegradedAdmitted(id, state, policyDegradedAuthoritative, err))
+	}
+	if held {
+		return true, nil
+	}
+	return false, s.commitAuthoritativePolicyAdmitted(id, state, mode)
+}
 
-	firstErr := reg.reconcileCP(ebpfFilter, first, firstSet, s.now())
-	modeErr := s.setFilterModeAdmitted(id, state, mode)
-	secondErr := reg.reconcileCP(ebpfFilter, second, secondSet, s.now())
-	return errors.Join(firstErr, modeErr, secondErr)
+// holdAuthoritativeRecoveryIfNeededAdmitted closes the otherwise
+// indistinguishable crash gap for intentional BLOCK_ALL: before the first map
+// mutation, persist an in-progress marker while enforcement is already proven
+// closed. Existing degradation remains held. Non-BLOCK_ALL healthy policies do
+// not pay this store write and retain the ordinary window-free update path.
+func (s *Server) holdAuthoritativeRecoveryIfNeededAdmitted(id string, state *attachmentState) (bool, error) {
+	s.mu.RLock()
+	if s.attachments[id] != state {
+		s.mu.RUnlock()
+		return false, fmt.Errorf("attachment changed while preparing authoritative recovery hold: %s", id)
+	}
+	reason := state.info.PolicyDegradedReason
+	mode := state.info.Mode
+	row := cloneAttachment(state.info)
+	s.mu.RUnlock()
+	if reason != "" {
+		if err := setAndProveFilterMode(state.filter, filter.ModeBlockAll); err != nil {
+			return false, errors.Join(err, s.enterPolicyDegradedAdmitted(id, state, policyDegradedAuthoritative, err))
+		}
+		return true, nil
+	}
+	if mode != apiv1.PolicyMode_POLICY_MODE_BLOCK_ALL.String() {
+		return false, nil
+	}
+	if err := setAndProveFilterMode(state.filter, filter.ModeBlockAll); err != nil {
+		return false, errors.Join(err, s.enterPolicyDegradedAdmitted(id, state, policyDegradedAuthoritative, err))
+	}
+	row.Mode = apiv1.PolicyMode_POLICY_MODE_BLOCK_ALL.String()
+	row.PolicyDegradedReason = policyMutationInProgress
+	if err := s.saveAttachment(row); err != nil {
+		persistErr := fmt.Errorf("persisting authoritative in-progress BLOCK_ALL marker: %w", err)
+		return false, errors.Join(persistErr, s.enterPolicyDegradedAdmitted(id, state, policyDegradedAuthoritative, persistErr))
+	}
+	s.mu.Lock()
+	if s.attachments[id] != state {
+		s.mu.Unlock()
+		return false, fmt.Errorf("attachment changed after persisting authoritative recovery hold: %s", id)
+	}
+	state.info.Mode = row.Mode
+	state.info.PolicyDegradedReason = policyMutationInProgress
+	s.mu.Unlock()
+	return true, nil
+}
+
+func (s *Server) activateAuthoritativePolicyAdmitted(id string, state *attachmentState, mode apiv1.PolicyMode) error {
+	if err := setAndProveFilterMode(state.filter, apiModeToFilterMode(mode)); err != nil {
+		return errors.Join(err, s.enterPolicyDegradedAdmitted(id, state, policyDegradedAuthoritative, err))
+	}
+	return s.commitAuthoritativePolicyAdmitted(id, state, mode)
 }
 
 func validatePolicyMode(mode apiv1.PolicyMode) error {
@@ -2735,16 +3264,16 @@ func validateDNSMode(mode apiv1.DnsMode) error {
 // filterAndRegistry snapshots an attachment's filter and TTL registry under
 // s.mu. Callers then operate under the registry's own lock only, so s.mu is
 // never held across filter syscalls.
-func (s *Server) filterAndRegistry(id string) (filter.Filter, *ttlRegistry, func(), error) {
+func (s *Server) filterAndRegistry(id string) (*attachmentState, filter.Filter, *ttlRegistry, func(), error) {
 	state, done, err := s.beginAttachmentMutation(id)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	if state.filter == nil {
 		done()
-		return nil, nil, nil, fmt.Errorf("attachment %s filter is unavailable", id)
+		return nil, nil, nil, nil, fmt.Errorf("attachment %s filter is unavailable", id)
 	}
-	return state.filter, state.ttls, done, nil
+	return state, state.filter, state.ttls, done, nil
 }
 
 func (s *Server) allocatePort() (int, error) {

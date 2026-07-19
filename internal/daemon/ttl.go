@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -19,6 +20,8 @@ const (
 	listAllow ruleList = iota
 	listDeny
 )
+
+var errProtectedAllowRemoval = errors.New("protected allow removal failed")
 
 func (l ruleList) String() string {
 	if l == listAllow {
@@ -105,6 +108,26 @@ type ttlRegistry struct {
 	// mapFullDrops counts adds dropped because the filter's rule map was at
 	// capacity. Cumulative; surfaced via AttachmentStats.map_full_drops.
 	mapFullDrops atomic.Uint64
+
+	allowedIPv4HighWater    atomic.Uint32
+	allowedIPv6HighWater    atomic.Uint32
+	deniedIPv4HighWater     atomic.Uint32
+	deniedIPv6HighWater     atomic.Uint32
+	protectedCurrent        protectedRuleCurrent
+	lastProtectedOccupancy  filter.ProtectedRuleOccupancy
+	protectedOccupancyValid bool
+	lastProtectedStatsWarn  time.Time
+}
+
+// protectedRuleCurrent tracks physical keys represented by the registry.
+// It is maintained under ttlRegistry.mu so observing a successful add is O(1)
+// instead of rescanning every entry. In particular, seeding four full maps on
+// pinned restore must remain O(N), not O(N^2).
+type protectedRuleCurrent struct {
+	allow4 uint32
+	allow6 uint32
+	deny4  uint32
+	deny6  uint32
 }
 
 func newTTLRegistry() *ttlRegistry {
@@ -125,6 +148,19 @@ func (r *ttlRegistry) addCP(f filter.Filter, cidr *net.IPNet, list ruleList, ttl
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.addSourceLocked(f, cidr, list, sourceCP, ttl, now)
+}
+
+// needsPhysicalAdd reports whether addCP would issue a map syscall. Callers
+// use it only while holding mutationSerialMu, so the registry cannot change
+// before the following addCP acquires r.mu.
+func (r *ttlRegistry) needsPhysicalAdd(cidr *net.IPNet, list ruleList) bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	entry, ok := r.entries[ttlKey{cidr: cidr.String(), list: list}]
+	return !ok || !entry.inFilter
 }
 
 // addSystem installs a permanent daemon-owned entry. It is used for
@@ -152,6 +188,10 @@ func (r *ttlRegistry) removeSystem(f filter.Filter, cidr *net.IPNet, list ruleLi
 		r.entries[key] = entry
 		return nil
 	}
+	if !entry.inFilter {
+		delete(r.entries, key)
+		return nil
+	}
 	var err error
 	if f != nil {
 		if list == listAllow {
@@ -164,6 +204,7 @@ func (r *ttlRegistry) removeSystem(f filter.Filter, cidr *net.IPNet, list ruleLi
 		r.entries[key] = entry
 		return err
 	}
+	r.decrementProtectedCurrentLocked(entry.cidr, list)
 	delete(r.entries, key)
 	return nil
 }
@@ -194,6 +235,7 @@ func (r *ttlRegistry) addSourceLocked(f filter.Filter, cidr *net.IPNet, list rul
 		entry.systemLive = true
 	}
 
+	becamePhysical := false
 	if f != nil && !entry.inFilter {
 		var err error
 		if list == listAllow {
@@ -210,9 +252,13 @@ func (r *ttlRegistry) addSourceLocked(f filter.Filter, cidr *net.IPNet, list rul
 			return err
 		}
 		entry.inFilter = true
+		becamePhysical = true
 	}
 
 	r.entries[key] = entry
+	if becamePhysical {
+		r.incrementProtectedCurrentLocked(cidr, list)
+	}
 	return nil
 }
 
@@ -272,10 +318,261 @@ func (r *ttlRegistry) reconcileCP(f filter.Filter, list ruleList, desired []pars
 			r.entries[key] = entry
 			continue
 		}
+		if entry.inFilter {
+			r.decrementProtectedCurrentLocked(entry.cidr, list)
+		}
 		delete(r.entries, key)
 	}
 
 	return errors.Join(errs...)
+}
+
+// seedAdopted records a complete physical inventory read from pinned maps as
+// provisional permanent control-plane ownership. The inventory is already the
+// kernel truth, so restore must not upsert every key back into the same maps.
+// Building the registry and its four current/high-water counters is one O(N)
+// pass; a later authoritative update replaces the provisional lifetimes.
+func (r *ttlRegistry) seedAdopted(allowed, denied []*net.IPNet) error {
+	if r == nil {
+		return fmt.Errorf("protected rule registry is unavailable")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	seeded := make(map[ttlKey]ttlEntry, len(allowed)+len(denied))
+	var seededAllowed, seededDenied []*net.IPNet
+	seedList := func(list ruleList, cidrs []*net.IPNet) error {
+		for _, cidr := range cidrs {
+			if cidr == nil {
+				return fmt.Errorf("adopted %s inventory contains a nil CIDR", list)
+			}
+			key := ttlKey{cidr: cidr.String(), list: list}
+			if _, exists := seeded[key]; exists {
+				continue
+			}
+			seeded[key] = ttlEntry{
+				cidr:     cidr,
+				cpLive:   true,
+				inFilter: true,
+			}
+			if list == listAllow {
+				seededAllowed = append(seededAllowed, cidr)
+			} else {
+				seededDenied = append(seededDenied, cidr)
+			}
+		}
+		return nil
+	}
+	if err := seedList(listAllow, allowed); err != nil {
+		return err
+	}
+	if err := seedList(listDeny, denied); err != nil {
+		return err
+	}
+
+	r.entries = seeded
+	r.setProtectedCurrentLocked(seededAllowed, seededDenied)
+	return nil
+}
+
+// reconcileAuthoritative projects both complete CP lists together with every
+// daemon-system owner, then asks the filter to replace all four physical LPM
+// maps and the packet mode as one rollback-safe transaction. Registry
+// lifetimes are committed only after the filter proves success, so a capacity,
+// snapshot, forward-mutation, mode, or rollback failure leaves the complete
+// userspace graph unchanged. The caller deliberately enters durable BLOCK_ALL
+// on every such valid-authoritative failure.
+func (r *ttlRegistry) reconcileAuthoritative(f filter.Filter, mode filter.PolicyMode, allow, deny []parsedCIDR, now time.Time) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	projected := make(map[ttlKey]ttlEntry, len(allow)+len(deny)+len(r.entries))
+	// System ownership is outside CP desired state and must survive every
+	// replacement. Source-less retry entries and old CP-only entries disappear
+	// from the projection; the physical transaction removes them on success.
+	for key, current := range r.entries {
+		if !current.systemLive {
+			continue
+		}
+		current.cpLive = false
+		current.cpDeadline = time.Time{}
+		projected[key] = current
+	}
+	projectList := func(list ruleList, desired []parsedCIDR) {
+		for _, d := range desired {
+			key := ttlKey{cidr: d.cidr.String(), list: list}
+			entry, exists := projected[key]
+			if !exists {
+				entry = ttlEntry{cidr: d.cidr}
+			}
+			entry.cpLive = true
+			if d.ttl <= 0 {
+				entry.cpDeadline = time.Time{}
+			} else {
+				entry.cpDeadline = now.Add(d.ttl)
+			}
+			projected[key] = entry
+		}
+	}
+	projectList(listAllow, allow)
+	projectList(listDeny, deny)
+
+	allowed := make([]*net.IPNet, 0, len(projected))
+	denied := make([]*net.IPNet, 0, len(projected))
+	for key, entry := range projected {
+		if !entry.systemLive && !entry.cpLive {
+			continue
+		}
+		if key.list == listAllow {
+			allowed = append(allowed, entry.cidr)
+		} else {
+			denied = append(denied, entry.cidr)
+		}
+	}
+	sort.Slice(allowed, func(i, j int) bool { return allowed[i].String() < allowed[j].String() })
+	sort.Slice(denied, func(i, j int) bool { return denied[i].String() < denied[j].String() })
+
+	if err := f.ReplaceProtectedRules(allowed, denied, mode); err != nil {
+		if errors.Is(err, filter.ErrProtectedRuleCapacity) || isMapFull(err) {
+			r.mapFullDrops.Add(1)
+		}
+		return err
+	}
+	for key, entry := range projected {
+		entry.inFilter = true
+		projected[key] = entry
+	}
+	r.entries = projected
+	r.setProtectedCurrentLocked(allowed, denied)
+	return nil
+}
+
+type protectedRuleStats struct {
+	occupancy       filter.ProtectedRuleOccupancy
+	allow4HighWater uint32
+	allow6HighWater uint32
+	deny4HighWater  uint32
+	deny6HighWater  uint32
+}
+
+func updateUint32HighWater(dst *atomic.Uint32, value uint32) {
+	for old := dst.Load(); value > old; old = dst.Load() {
+		if dst.CompareAndSwap(old, value) {
+			return
+		}
+	}
+}
+
+func countProtectedFamilies(cidrs []*net.IPNet) (v4, v6 uint32) {
+	for _, cidr := range cidrs {
+		if cidr.IP.To4() != nil && len(cidr.Mask) == net.IPv4len {
+			v4++
+		} else {
+			v6++
+		}
+	}
+	return
+}
+
+func isProtectedIPv4(cidr *net.IPNet) bool {
+	return cidr != nil && cidr.IP.To4() != nil && len(cidr.Mask) == net.IPv4len
+}
+
+func (r *ttlRegistry) observeProtectedCurrentLocked() {
+	updateUint32HighWater(&r.allowedIPv4HighWater, r.protectedCurrent.allow4)
+	updateUint32HighWater(&r.allowedIPv6HighWater, r.protectedCurrent.allow6)
+	updateUint32HighWater(&r.deniedIPv4HighWater, r.protectedCurrent.deny4)
+	updateUint32HighWater(&r.deniedIPv6HighWater, r.protectedCurrent.deny6)
+}
+
+func (r *ttlRegistry) incrementProtectedCurrentLocked(cidr *net.IPNet, list ruleList) {
+	switch {
+	case list == listAllow && isProtectedIPv4(cidr):
+		r.protectedCurrent.allow4++
+	case list == listAllow:
+		r.protectedCurrent.allow6++
+	case isProtectedIPv4(cidr):
+		r.protectedCurrent.deny4++
+	default:
+		r.protectedCurrent.deny6++
+	}
+	r.observeProtectedCurrentLocked()
+}
+
+func (r *ttlRegistry) decrementProtectedCurrentLocked(cidr *net.IPNet, list ruleList) {
+	var current *uint32
+	switch {
+	case list == listAllow && isProtectedIPv4(cidr):
+		current = &r.protectedCurrent.allow4
+	case list == listAllow:
+		current = &r.protectedCurrent.allow6
+	case isProtectedIPv4(cidr):
+		current = &r.protectedCurrent.deny4
+	default:
+		current = &r.protectedCurrent.deny6
+	}
+	if *current > 0 {
+		*current = *current - 1
+	}
+}
+
+func (r *ttlRegistry) setProtectedCurrentLocked(allowed, denied []*net.IPNet) {
+	r.protectedCurrent.allow4, r.protectedCurrent.allow6 = countProtectedFamilies(allowed)
+	r.protectedCurrent.deny4, r.protectedCurrent.deny6 = countProtectedFamilies(denied)
+	r.observeProtectedCurrentLocked()
+}
+
+func (r *ttlRegistry) setProtectedCurrentFromOccupancyLocked(occupancy filter.ProtectedRuleOccupancy) {
+	r.protectedCurrent = protectedRuleCurrent{
+		allow4: occupancy.AllowedIPv4.Entries,
+		allow6: occupancy.AllowedIPv6.Entries,
+		deny4:  occupancy.DeniedIPv4.Entries,
+		deny6:  occupancy.DeniedIPv6.Entries,
+	}
+	r.observeProtectedCurrentLocked()
+}
+
+// protectedStats snapshots physical occupancy/capacity and observes adopted
+// pins for generation-local high-water telemetry. A failed inventory is
+// surfaced to the caller rather than guessed.
+func (r *ttlRegistry) protectedStats(f filter.Filter) (protectedRuleStats, error) {
+	if r == nil || f == nil {
+		return protectedRuleStats{}, fmt.Errorf("protected rule registry/filter is unavailable")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	occupancy, err := f.ProtectedRuleOccupancy()
+	if err != nil {
+		return protectedRuleStats{
+			occupancy:       r.lastProtectedOccupancy,
+			allow4HighWater: r.allowedIPv4HighWater.Load(),
+			allow6HighWater: r.allowedIPv6HighWater.Load(),
+			deny4HighWater:  r.deniedIPv4HighWater.Load(),
+			deny6HighWater:  r.deniedIPv6HighWater.Load(),
+		}, err
+	}
+	r.lastProtectedOccupancy = occupancy
+	r.protectedOccupancyValid = true
+	r.setProtectedCurrentFromOccupancyLocked(occupancy)
+	return protectedRuleStats{
+		occupancy:       occupancy,
+		allow4HighWater: r.allowedIPv4HighWater.Load(),
+		allow6HighWater: r.allowedIPv6HighWater.Load(),
+		deny4HighWater:  r.deniedIPv4HighWater.Load(),
+		deny6HighWater:  r.deniedIPv6HighWater.Load(),
+	}, nil
+}
+
+func (r *ttlRegistry) protectedStatsWarningAllowed(now time.Time) bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.lastProtectedStatsWarn.IsZero() && now.Sub(r.lastProtectedStatsWarn) < 30*time.Second {
+		return false
+	}
+	r.lastProtectedStatsWarn = now
+	return true
 }
 
 // replaceCPSourceLocked applies one entry from an authoritative full desired
@@ -297,6 +594,7 @@ func (r *ttlRegistry) replaceCPSourceLocked(f filter.Filter, cidr *net.IPNet, li
 		entry.cpDeadline = now.Add(ttl)
 	}
 
+	becamePhysical := false
 	if f != nil && !entry.inFilter {
 		var err error
 		if list == listAllow {
@@ -313,9 +611,13 @@ func (r *ttlRegistry) replaceCPSourceLocked(f filter.Filter, cidr *net.IPNet, li
 			return err
 		}
 		entry.inFilter = true
+		becamePhysical = true
 	}
 
 	r.entries[key] = entry
+	if becamePhysical {
+		r.incrementProtectedCurrentLocked(cidr, list)
+	}
 	return nil
 }
 
@@ -334,9 +636,17 @@ func (r *ttlRegistry) remove(f filter.Filter, cidr *net.IPNet, list ruleList) er
 	defer r.mu.Unlock()
 
 	key := ttlKey{cidr: cidr.String(), list: list}
-	if entry, ok := r.entries[key]; ok && entry.systemLive {
+	entry, ok := r.entries[key]
+	if !ok {
+		return nil
+	}
+	if entry.systemLive {
 		entry.cpLive, entry.cpDeadline = false, time.Time{}
 		r.entries[key] = entry
+		return nil
+	}
+	if !entry.inFilter {
+		delete(r.entries, key)
 		return nil
 	}
 
@@ -351,8 +661,22 @@ func (r *ttlRegistry) remove(f filter.Filter, cidr *net.IPNet, list ruleList) er
 			return err
 		}
 	}
+	r.decrementProtectedCurrentLocked(entry.cidr, list)
 	delete(r.entries, key)
 	return nil
+}
+
+// needsPhysicalRemove reports whether remove will issue a map syscall. A
+// missing entry, a system-owned alias, or bookkeeping that never reached the
+// filter is an exact physical no-op and must not churn the crash journal.
+func (r *ttlRegistry) needsPhysicalRemove(cidr *net.IPNet, list ruleList) bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	entry, ok := r.entries[ttlKey{cidr: cidr.String(), list: list}]
+	return ok && !entry.systemLive && entry.inFilter
 }
 
 // clear removes ordinary filter rules as a delta while preserving daemon-owned
@@ -372,6 +696,10 @@ func (r *ttlRegistry) clear(f filter.Filter) error {
 			continue
 		}
 		entry.cpLive, entry.cpDeadline = false, time.Time{}
+		if !entry.inFilter {
+			delete(r.entries, key)
+			continue
+		}
 		var err error
 		if f != nil {
 			if key.list == listAllow {
@@ -382,9 +710,14 @@ func (r *ttlRegistry) clear(f filter.Filter) error {
 		}
 		if err != nil {
 			r.entries[key] = entry
-			errs = append(errs, fmt.Errorf("removing %s: %w", key.cidr, err))
+			wrapped := fmt.Errorf("removing %s: %w", key.cidr, err)
+			if key.list == listAllow {
+				wrapped = fmt.Errorf("%w: %w", errProtectedAllowRemoval, wrapped)
+			}
+			errs = append(errs, wrapped)
 			continue
 		}
+		r.decrementProtectedCurrentLocked(entry.cidr, key.list)
 		delete(r.entries, key)
 	}
 	return errors.Join(errs...)
@@ -401,6 +734,7 @@ func (r *ttlRegistry) purge() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.entries = make(map[ttlKey]ttlEntry)
+	r.protectedCurrent = protectedRuleCurrent{}
 }
 
 // len reports the total number of tracked entries.
@@ -422,6 +756,46 @@ func (r *ttlRegistry) pendingLen() int {
 		}
 	}
 	return n
+}
+
+// hasRemovableAllow reports whether clear would physically remove at least
+// one ordinary allow entry. The caller may use this read-only pre-scan while
+// holding the attachment mutationSerialMu to decide whether an intentional
+// BLOCK_ALL operation needs a durable crash journal; no registry mutation can
+// race between this check and clear in that admitted section.
+func (r *ttlRegistry) hasRemovableAllow() bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for key, entry := range r.entries {
+		if key.list == listAllow && !entry.systemLive && entry.inFilter {
+			return true
+		}
+	}
+	return false
+}
+
+// hasExpiredRemovableAllow reports whether expire will attempt to remove an
+// allow from the physical map. It includes source-less entries retained after
+// an earlier failed removal as well as CP entries whose deadline is due.
+// mutationSerialMu makes this pre-scan stable until the following expire.
+func (r *ttlRegistry) hasExpiredRemovableAllow(now time.Time) bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for key, entry := range r.entries {
+		if key.list != listAllow || entry.systemLive || !entry.inFilter {
+			continue
+		}
+		if !entry.cpLive || (!entry.cpDeadline.IsZero() && !entry.cpDeadline.After(now)) {
+			return true
+		}
+	}
+	return false
 }
 
 // mapFullCount returns the cumulative number of adds dropped because the
@@ -465,6 +839,11 @@ func (r *ttlRegistry) expire(f filter.Filter, now time.Time) []sweptEntry {
 			}
 			continue
 		}
+		if !entry.inFilter {
+			delete(r.entries, key)
+			swept = append(swept, sweptEntry{cidr: key.cidr, list: key.list})
+			continue
+		}
 
 		var err error
 		if f != nil {
@@ -475,6 +854,7 @@ func (r *ttlRegistry) expire(f filter.Filter, now time.Time) []sweptEntry {
 			}
 		}
 		if err == nil {
+			r.decrementProtectedCurrentLocked(entry.cidr, key.list)
 			delete(r.entries, key)
 		} else {
 			r.entries[key] = entry

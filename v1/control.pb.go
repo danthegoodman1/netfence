@@ -416,7 +416,11 @@ func (x *Attachment) GetTcDirection() TcDirection {
 // ack applies completely. It always follows the fresh SyncRequest (which may
 // already list the same attachment). The control plane acknowledges
 // Subscribed, not SyncRequest; it MUST answer each effective declaration with
-// a complete fresh SubscribedAck.
+// a complete fresh SubscribedAck. One exception is operational, not an
+// idempotency relaxation: after a zero-timeout new attachment consumes an ack
+// that leaves protected policy durably degraded, the daemon reports that state
+// in Heartbeat but does not automatically re-drive Subscribed before restart.
+// The control plane must send a complete BulkUpdate to recover it.
 type Subscribed struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Unique identifier for this attachment
@@ -683,8 +687,40 @@ type AttachmentStats struct {
 	// map_full_drops because rejection is due to a rolling mutation/attempt
 	// allowance, not inability to represent the state or a raw map insertion.
 	DnsBudgetThrottles uint64 `protobuf:"varint,16,opt,name=dns_budget_throttles,json=dnsBudgetThrottles,proto3" json:"dns_budget_throttles,omitempty"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	// Current physical occupancy/capacity and daemon-generation high-water
+	// values for each protected, non-evictable authoritative/system LPM map.
+	// The DNS listener bootstrap is included in protected allow occupancy;
+	// adopted pinned entries initialize high-water for the new daemon process.
+	// A transient inventory failure retains the last proven snapshot and emits
+	// a rate-limited daemon warning rather than publishing guessed counts.
+	ProtectedAllowIpv4Entries   uint32 `protobuf:"varint,17,opt,name=protected_allow_ipv4_entries,json=protectedAllowIpv4Entries,proto3" json:"protected_allow_ipv4_entries,omitempty"`
+	ProtectedAllowIpv4Capacity  uint32 `protobuf:"varint,18,opt,name=protected_allow_ipv4_capacity,json=protectedAllowIpv4Capacity,proto3" json:"protected_allow_ipv4_capacity,omitempty"`
+	ProtectedAllowIpv4HighWater uint32 `protobuf:"varint,19,opt,name=protected_allow_ipv4_high_water,json=protectedAllowIpv4HighWater,proto3" json:"protected_allow_ipv4_high_water,omitempty"`
+	ProtectedAllowIpv6Entries   uint32 `protobuf:"varint,20,opt,name=protected_allow_ipv6_entries,json=protectedAllowIpv6Entries,proto3" json:"protected_allow_ipv6_entries,omitempty"`
+	ProtectedAllowIpv6Capacity  uint32 `protobuf:"varint,21,opt,name=protected_allow_ipv6_capacity,json=protectedAllowIpv6Capacity,proto3" json:"protected_allow_ipv6_capacity,omitempty"`
+	ProtectedAllowIpv6HighWater uint32 `protobuf:"varint,22,opt,name=protected_allow_ipv6_high_water,json=protectedAllowIpv6HighWater,proto3" json:"protected_allow_ipv6_high_water,omitempty"`
+	ProtectedDenyIpv4Entries    uint32 `protobuf:"varint,23,opt,name=protected_deny_ipv4_entries,json=protectedDenyIpv4Entries,proto3" json:"protected_deny_ipv4_entries,omitempty"`
+	ProtectedDenyIpv4Capacity   uint32 `protobuf:"varint,24,opt,name=protected_deny_ipv4_capacity,json=protectedDenyIpv4Capacity,proto3" json:"protected_deny_ipv4_capacity,omitempty"`
+	ProtectedDenyIpv4HighWater  uint32 `protobuf:"varint,25,opt,name=protected_deny_ipv4_high_water,json=protectedDenyIpv4HighWater,proto3" json:"protected_deny_ipv4_high_water,omitempty"`
+	ProtectedDenyIpv6Entries    uint32 `protobuf:"varint,26,opt,name=protected_deny_ipv6_entries,json=protectedDenyIpv6Entries,proto3" json:"protected_deny_ipv6_entries,omitempty"`
+	ProtectedDenyIpv6Capacity   uint32 `protobuf:"varint,27,opt,name=protected_deny_ipv6_capacity,json=protectedDenyIpv6Capacity,proto3" json:"protected_deny_ipv6_capacity,omitempty"`
+	ProtectedDenyIpv6HighWater  uint32 `protobuf:"varint,28,opt,name=protected_deny_ipv6_high_water,json=protectedDenyIpv6HighWater,proto3" json:"protected_deny_ipv6_high_water,omitempty"`
+	// policy_degraded is true while a protected-policy safety record is nonempty;
+	// configured BLOCK_ALL alone is healthy and reports false. The
+	// protected_policy_mutation_in_progress reason is a transient crash journal:
+	// its owning live operation clears it on success and may publish the intended
+	// mode before that final clear. Startup that finds it first proves BLOCK_ALL
+	// and converts it to protected_policy_mutation_interrupted. That interrupted
+	// code and authoritative_protected_policy_failed,
+	// incremental_deny_install_failed, incremental_allow_removal_failed, and
+	// incremental_mode_change_failed are stable degraded reasons (never raw
+	// errors): they hold proven BLOCK_ALL, reject protected incrementals, and
+	// require a complete authoritative LPM+DNS reconcile. Independent DNS
+	// mutation and expiry may continue but cannot reactivate packet policy.
+	PolicyDegraded       bool   `protobuf:"varint,29,opt,name=policy_degraded,json=policyDegraded,proto3" json:"policy_degraded,omitempty"`
+	PolicyDegradedReason string `protobuf:"bytes,30,opt,name=policy_degraded_reason,json=policyDegradedReason,proto3" json:"policy_degraded_reason,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *AttachmentStats) Reset() {
@@ -827,6 +863,104 @@ func (x *AttachmentStats) GetDnsBudgetThrottles() uint64 {
 		return x.DnsBudgetThrottles
 	}
 	return 0
+}
+
+func (x *AttachmentStats) GetProtectedAllowIpv4Entries() uint32 {
+	if x != nil {
+		return x.ProtectedAllowIpv4Entries
+	}
+	return 0
+}
+
+func (x *AttachmentStats) GetProtectedAllowIpv4Capacity() uint32 {
+	if x != nil {
+		return x.ProtectedAllowIpv4Capacity
+	}
+	return 0
+}
+
+func (x *AttachmentStats) GetProtectedAllowIpv4HighWater() uint32 {
+	if x != nil {
+		return x.ProtectedAllowIpv4HighWater
+	}
+	return 0
+}
+
+func (x *AttachmentStats) GetProtectedAllowIpv6Entries() uint32 {
+	if x != nil {
+		return x.ProtectedAllowIpv6Entries
+	}
+	return 0
+}
+
+func (x *AttachmentStats) GetProtectedAllowIpv6Capacity() uint32 {
+	if x != nil {
+		return x.ProtectedAllowIpv6Capacity
+	}
+	return 0
+}
+
+func (x *AttachmentStats) GetProtectedAllowIpv6HighWater() uint32 {
+	if x != nil {
+		return x.ProtectedAllowIpv6HighWater
+	}
+	return 0
+}
+
+func (x *AttachmentStats) GetProtectedDenyIpv4Entries() uint32 {
+	if x != nil {
+		return x.ProtectedDenyIpv4Entries
+	}
+	return 0
+}
+
+func (x *AttachmentStats) GetProtectedDenyIpv4Capacity() uint32 {
+	if x != nil {
+		return x.ProtectedDenyIpv4Capacity
+	}
+	return 0
+}
+
+func (x *AttachmentStats) GetProtectedDenyIpv4HighWater() uint32 {
+	if x != nil {
+		return x.ProtectedDenyIpv4HighWater
+	}
+	return 0
+}
+
+func (x *AttachmentStats) GetProtectedDenyIpv6Entries() uint32 {
+	if x != nil {
+		return x.ProtectedDenyIpv6Entries
+	}
+	return 0
+}
+
+func (x *AttachmentStats) GetProtectedDenyIpv6Capacity() uint32 {
+	if x != nil {
+		return x.ProtectedDenyIpv6Capacity
+	}
+	return 0
+}
+
+func (x *AttachmentStats) GetProtectedDenyIpv6HighWater() uint32 {
+	if x != nil {
+		return x.ProtectedDenyIpv6HighWater
+	}
+	return 0
+}
+
+func (x *AttachmentStats) GetPolicyDegraded() bool {
+	if x != nil {
+		return x.PolicyDegraded
+	}
+	return false
+}
+
+func (x *AttachmentStats) GetPolicyDegradedReason() string {
+	if x != nil {
+		return x.PolicyDegradedReason
+	}
+	return ""
 }
 
 // ControlCommand represents commands sent from the control plane to the daemon.
@@ -1214,7 +1348,11 @@ func (*SyncAck) Descriptor() ([]byte, []int) {
 // delta: unchanged CIDRs remain installed, stale CIDRs are removed, new CIDRs
 // are added, and control-plane TTLs are replaced exactly. The restore remains
 // pending after any validation or apply failure and is retried after a later
-// connection.
+// connection. For a zero-timeout new attachment, however, a protected-policy
+// apply failure consumes this ack and is signaled by degraded Heartbeat fields;
+// it emits no CommandResult or error Unsubscribed and is not re-driven before
+// restart. Recover that live attachment with a complete BulkUpdate, preferably
+// carrying command_id for an explicit outcome.
 //
 // Design note: This is sent over the bidirectional stream (rather than a separate
 // unary RPC) to ensure the same control plane node that holds the stream connection
@@ -1340,7 +1478,10 @@ func (x *SetMode) GetMode() PolicyMode {
 
 // BulkUpdate sets the complete authoritative state for an attachment. The
 // daemon reconciles by delta; an unchanged CIDR is not removed/re-added, and
-// its control-plane TTL is replaced exactly by the provided lifetime.
+// its control-plane TTL is replaced exactly by the provided lifetime. This is
+// also the live recovery operation for protected-policy degradation: maps and
+// DNS must both apply before the requested mode activates and the durable
+// marker clears. Use command_id when the outcome must be observed.
 type BulkUpdate struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Complete desired IP filter policy mode. Must be a known non-UNSPECIFIED value.
@@ -1921,7 +2062,7 @@ const file_v1_control_proto_rawDesc = "" +
 	"\x06reason\x18\x02 \x01(\x0e2\x1e.netfence.v1.UnsubscribeReasonR\x06reason\x12\x14\n" +
 	"\x05error\x18\x03 \x01(\tR\x05error\"?\n" +
 	"\tHeartbeat\x122\n" +
-	"\x05stats\x18\x01 \x03(\v2\x1c.netfence.v1.AttachmentStatsR\x05stats\"\x87\x06\n" +
+	"\x05stats\x18\x01 \x03(\v2\x1c.netfence.v1.AttachmentStatsR\x05stats\"\x82\r\n" +
 	"\x0fAttachmentStats\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12'\n" +
 	"\x0fpackets_allowed\x18\x02 \x01(\x04R\x0epacketsAllowed\x12'\n" +
@@ -1939,7 +2080,21 @@ const file_v1_control_proto_rawDesc = "" +
 	"\x19dns_exact_ipv6_high_water\x18\r \x01(\rR\x15dnsExactIpv6HighWater\x12*\n" +
 	"\x11dns_lru_evictions\x18\x0e \x01(\x04R\x0fdnsLruEvictions\x124\n" +
 	"\x16dns_admission_failures\x18\x0f \x01(\x04R\x14dnsAdmissionFailures\x120\n" +
-	"\x14dns_budget_throttles\x18\x10 \x01(\x04R\x12dnsBudgetThrottles\"\xa4\x05\n" +
+	"\x14dns_budget_throttles\x18\x10 \x01(\x04R\x12dnsBudgetThrottles\x12?\n" +
+	"\x1cprotected_allow_ipv4_entries\x18\x11 \x01(\rR\x19protectedAllowIpv4Entries\x12A\n" +
+	"\x1dprotected_allow_ipv4_capacity\x18\x12 \x01(\rR\x1aprotectedAllowIpv4Capacity\x12D\n" +
+	"\x1fprotected_allow_ipv4_high_water\x18\x13 \x01(\rR\x1bprotectedAllowIpv4HighWater\x12?\n" +
+	"\x1cprotected_allow_ipv6_entries\x18\x14 \x01(\rR\x19protectedAllowIpv6Entries\x12A\n" +
+	"\x1dprotected_allow_ipv6_capacity\x18\x15 \x01(\rR\x1aprotectedAllowIpv6Capacity\x12D\n" +
+	"\x1fprotected_allow_ipv6_high_water\x18\x16 \x01(\rR\x1bprotectedAllowIpv6HighWater\x12=\n" +
+	"\x1bprotected_deny_ipv4_entries\x18\x17 \x01(\rR\x18protectedDenyIpv4Entries\x12?\n" +
+	"\x1cprotected_deny_ipv4_capacity\x18\x18 \x01(\rR\x19protectedDenyIpv4Capacity\x12B\n" +
+	"\x1eprotected_deny_ipv4_high_water\x18\x19 \x01(\rR\x1aprotectedDenyIpv4HighWater\x12=\n" +
+	"\x1bprotected_deny_ipv6_entries\x18\x1a \x01(\rR\x18protectedDenyIpv6Entries\x12?\n" +
+	"\x1cprotected_deny_ipv6_capacity\x18\x1b \x01(\rR\x19protectedDenyIpv6Capacity\x12B\n" +
+	"\x1eprotected_deny_ipv6_high_water\x18\x1c \x01(\rR\x1aprotectedDenyIpv6HighWater\x12'\n" +
+	"\x0fpolicy_degraded\x18\x1d \x01(\bR\x0epolicyDegraded\x124\n" +
+	"\x16policy_degraded_reason\x18\x1e \x01(\tR\x14policyDegradedReason\"\xa4\x05\n" +
 	"\x0eControlCommand\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x121\n" +
 	"\bsync_ack\x18\x02 \x01(\v2\x14.netfence.v1.SyncAckH\x00R\asyncAck\x121\n" +

@@ -93,6 +93,160 @@ type bpfExactDNSBackend struct {
 	ipv6 *ebpf.Map
 }
 
+type bpfProtectedRuleBackend struct {
+	allowedIPv4 *ebpf.Map
+	allowedIPv6 *ebpf.Map
+	deniedIPv4  *ebpf.Map
+	deniedIPv6  *ebpf.Map
+	policyMode  *ebpf.Map
+}
+
+func (b bpfProtectedRuleBackend) mapFor(bucket protectedRuleBucket) (*ebpf.Map, error) {
+	var m *ebpf.Map
+	switch bucket {
+	case protectedAllowedIPv4:
+		m = b.allowedIPv4
+	case protectedAllowedIPv6:
+		m = b.allowedIPv6
+	case protectedDeniedIPv4:
+		m = b.deniedIPv4
+	case protectedDeniedIPv6:
+		m = b.deniedIPv6
+	default:
+		return nil, fmt.Errorf("unsupported protected rule bucket %d", bucket)
+	}
+	if m == nil {
+		return nil, fmt.Errorf("%s map handle is closed", bucket)
+	}
+	return m, nil
+}
+
+func (b bpfProtectedRuleBackend) keys(bucket protectedRuleBucket) ([]protectedRuleKey, error) {
+	m, err := b.mapFor(bucket)
+	if err != nil {
+		return nil, err
+	}
+	var value uint8
+	var out []protectedRuleKey
+	if bucket == protectedAllowedIPv4 || bucket == protectedDeniedIPv4 {
+		var raw IPv4LPMKey
+		iter := m.Iterate()
+		for iter.Next(&raw, &value) {
+			key := protectedRuleKey{bucket: bucket, prefixLen: raw.Prefixlen}
+			binary.LittleEndian.PutUint32(key.addr[:4], raw.Addr)
+			out = append(out, key)
+		}
+		if err := iter.Err(); err != nil {
+			return nil, err
+		}
+	} else {
+		var raw IPv6LPMKey
+		iter := m.Iterate()
+		for iter.Next(&raw, &value) {
+			key := protectedRuleKey{bucket: bucket, prefixLen: raw.Prefixlen}
+			for i := range raw.Addr {
+				binary.LittleEndian.PutUint32(key.addr[i*4:(i+1)*4], raw.Addr[i])
+			}
+			out = append(out, key)
+		}
+		if err := iter.Err(); err != nil {
+			return nil, err
+		}
+	}
+	sortProtectedRuleKeys(out)
+	return out, nil
+}
+
+func (b bpfProtectedRuleBackend) count(bucket protectedRuleBucket) (uint32, error) {
+	m, err := b.mapFor(bucket)
+	if err != nil {
+		return 0, err
+	}
+	var value uint8
+	var count uint64
+	if bucket == protectedAllowedIPv4 || bucket == protectedDeniedIPv4 {
+		var key IPv4LPMKey
+		iter := m.Iterate()
+		for iter.Next(&key, &value) {
+			count++
+		}
+		if err := iter.Err(); err != nil {
+			return 0, err
+		}
+	} else {
+		var key IPv6LPMKey
+		iter := m.Iterate()
+		for iter.Next(&key, &value) {
+			count++
+		}
+		if err := iter.Err(); err != nil {
+			return 0, err
+		}
+	}
+	if count > uint64(^uint32(0)) {
+		return 0, fmt.Errorf("%s entry count overflows uint32", bucket)
+	}
+	return uint32(count), nil
+}
+
+func (b bpfProtectedRuleBackend) capacity(bucket protectedRuleBucket) (uint32, error) {
+	m, err := b.mapFor(bucket)
+	if err != nil {
+		return 0, err
+	}
+	info, err := m.Info()
+	if err != nil {
+		return 0, err
+	}
+	return info.MaxEntries, nil
+}
+
+func (b bpfProtectedRuleBackend) put(key protectedRuleKey) error {
+	m, err := b.mapFor(key.bucket)
+	if err != nil {
+		return err
+	}
+	if key.bucket == protectedAllowedIPv4 || key.bucket == protectedDeniedIPv4 {
+		return m.Put(ipv4CIDRToKey(key.cidr()), uint8(1))
+	}
+	return m.Put(ipv6CIDRToKey(key.cidr()), uint8(1))
+}
+
+func (b bpfProtectedRuleBackend) delete(key protectedRuleKey) error {
+	m, err := b.mapFor(key.bucket)
+	if err != nil {
+		return err
+	}
+	var deleteErr error
+	if key.bucket == protectedAllowedIPv4 || key.bucket == protectedDeniedIPv4 {
+		deleteErr = m.Delete(ipv4CIDRToKey(key.cidr()))
+	} else {
+		deleteErr = m.Delete(ipv6CIDRToKey(key.cidr()))
+	}
+	if deleteErr != nil && !errors.Is(deleteErr, ebpf.ErrKeyNotExist) {
+		return deleteErr
+	}
+	return nil
+}
+
+func (b bpfProtectedRuleBackend) mode() (PolicyMode, error) {
+	if b.policyMode == nil {
+		return ModeDisabled, fmt.Errorf("policy mode map handle is closed")
+	}
+	var mode uint8
+	if err := b.policyMode.Lookup(uint32(0), &mode); err != nil {
+		return ModeDisabled, err
+	}
+	return PolicyMode(mode), nil
+}
+
+func (b bpfProtectedRuleBackend) setMode(mode PolicyMode) error {
+	if b.policyMode == nil {
+		return fmt.Errorf("policy mode map handle is closed")
+	}
+	return b.policyMode.Put(uint32(0), uint8(mode))
+}
+
 func (b bpfExactDNSBackend) mapFor(family exactIPFamily) (*ebpf.Map, error) {
 	var m *ebpf.Map
 	switch family {

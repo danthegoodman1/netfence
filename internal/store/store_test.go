@@ -515,6 +515,7 @@ func TestAttachmentCleanupTombstoneAndPinIdentityRoundTrip(t *testing.T) {
 	a.CleanupNeeded = true
 	a.PinDir = "/sys/fs/bpf/netfence/cleanup-row"
 	a.PinPathKnown = true
+	a.PolicyDegradedReason = "protected_policy_mutation_interrupted"
 	require.NoError(t, st.SaveAttachment(a))
 
 	got, err := st.GetAttachment(a.ID)
@@ -522,6 +523,7 @@ func TestAttachmentCleanupTombstoneAndPinIdentityRoundTrip(t *testing.T) {
 	assert.True(t, got.CleanupNeeded)
 	assert.Equal(t, a.PinDir, got.PinDir)
 	assert.True(t, got.PinPathKnown)
+	assert.Equal(t, a.PolicyDegradedReason, got.PolicyDegradedReason)
 
 	all, err := st.GetAllAttachments()
 	require.NoError(t, err)
@@ -529,6 +531,14 @@ func TestAttachmentCleanupTombstoneAndPinIdentityRoundTrip(t *testing.T) {
 	assert.True(t, all[0].CleanupNeeded)
 	assert.Equal(t, a.PinDir, all[0].PinDir)
 	assert.True(t, all[0].PinPathKnown)
+	assert.Equal(t, a.PolicyDegradedReason, all[0].PolicyDegradedReason)
+
+	page, next, total, err := st.ListAttachments(10, "")
+	require.NoError(t, err)
+	assert.Empty(t, next)
+	assert.Equal(t, 1, total)
+	require.Len(t, page, 1)
+	assert.Equal(t, a.PolicyDegradedReason, page[0].PolicyDegradedReason)
 }
 
 func TestCleanupAndPinIdentityMigrationDefaultsLegacyRowsSafely(t *testing.T) {
@@ -564,6 +574,7 @@ func TestCleanupAndPinIdentityMigrationDefaultsLegacyRowsSafely(t *testing.T) {
 	assert.False(t, got.CleanupNeeded)
 	assert.Empty(t, got.PinDir)
 	assert.False(t, got.PinPathKnown, "legacy empty pin identity remains explicitly unknown")
+	assert.Empty(t, got.PolicyDegradedReason, "legacy rows migrate as healthy, without an invented degradation")
 }
 
 func TestDaemonIDStableAcrossReopen(t *testing.T) {

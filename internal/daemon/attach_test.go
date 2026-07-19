@@ -718,7 +718,7 @@ func TestZeroTimeoutInvalidSubscribedAckQuarantinesCommittedAttachment(t *testin
 	assertQueuedErrorUnsubscribed(t, cp, resp.Id)
 }
 
-func TestZeroTimeoutSubscribedAckApplyFailureQuarantinesPartialDenylist(t *testing.T) {
+func TestZeroTimeoutSubscribedAckProtectedFailureStaysRetryableAndRecovers(t *testing.T) {
 	env := newAttachTestEnv(t, 12175)
 	cp := NewControlPlaneClient("", env.server, zerolog.Nop(), nil, 0, nil)
 	env.server.SetControlPlaneClient(cp)
@@ -736,13 +736,130 @@ func TestZeroTimeoutSubscribedAckApplyFailureQuarantinesPartialDenylist(t *testi
 	assert.Equal(t, filter.ModeBlockAll, mode, "partial DENYLIST apply is forced back to fail-closed")
 	assert.Empty(t, denied)
 	events := ff.eventLog()
-	assert.Less(t,
-		indexOfEvent(t, events, "set-mode "+filter.ModeDenylist.String()),
-		indexOfEvent(t, events, "set-mode "+filter.ModeBlockAll.String()))
+	assert.NotContains(t, events, "set-mode "+filter.ModeDenylist.String(), "failed transaction never activates the target mode")
+	assert.Contains(t, events, "set-mode "+filter.ModeBlockAll.String())
 	row, err := env.st.GetAttachment(resp.Id)
 	require.NoError(t, err)
 	assert.Equal(t, apiv1.PolicyMode_POLICY_MODE_BLOCK_ALL.String(), row.Mode)
-	assertQueuedErrorUnsubscribed(t, cp, resp.Id)
+	assert.Equal(t, policyDegradedAuthoritative, row.PolicyDegradedReason)
+	env.server.mu.RLock()
+	state := env.server.attachments[resp.Id]
+	require.NotNil(t, state)
+	assert.False(t, state.mutationsClosed, "durable protected degradation remains retryable")
+	env.server.mu.RUnlock()
+	require.ErrorIs(t, env.server.SetFilterMode(resp.Id, apiv1.PolicyMode_POLICY_MODE_DISABLED), errPolicyDegraded)
+
+	ff.setDenyErr(nil)
+	require.NoError(t, cp.applyBulkUpdate(resp.Id, &apiv1.BulkUpdate{
+		Mode:      apiv1.PolicyMode_POLICY_MODE_DENYLIST,
+		DenyCidrs: []*apiv1.CIDREntry{{Cidr: "198.51.100.0/24"}},
+	}))
+	mode, _, denied, _ = ff.snapshot()
+	assert.Equal(t, filter.ModeDenylist, mode)
+	assert.Equal(t, []string{"198.51.100.0/24"}, denied)
+	row, err = env.st.GetAttachment(resp.Id)
+	require.NoError(t, err)
+	assert.Empty(t, row.PolicyDegradedReason)
+	select {
+	case outbound := <-cp.sendCh:
+		t.Fatalf("protected initial-ack pressure must not unsubscribe the retained attachment or invent a command result: %T", outbound.event.GetEvent())
+	default:
+	}
+}
+
+func TestBoundedSubscribedAckProtectedFailureReturnsErrorRetainsAndRecovers(t *testing.T) {
+	env := newAttachTestEnv(t, 12182)
+	cp := NewControlPlaneClient("", env.server, zerolog.Nop(), nil, time.Second, nil)
+	env.server.SetControlPlaneClient(cp)
+
+	type attachResult struct {
+		resp *apiv1.AttachResponse
+		err  error
+	}
+	done := make(chan attachResult, 1)
+	go func() {
+		resp, err := env.server.Attach(context.Background(), attachInterfaceReq("bounded-apply-if0"))
+		done <- attachResult{resp: resp, err: err}
+	}()
+
+	var id string
+	require.Eventually(t, func() bool {
+		cp.pendingAcksMu.Lock()
+		defer cp.pendingAcksMu.Unlock()
+		for pendingID := range cp.pendingAcks {
+			id = pendingID
+			return true
+		}
+		return false
+	}, time.Second, time.Millisecond)
+	filters := env.createdFilters()
+	require.Len(t, filters, 1)
+	ff := filters[0]
+	ff.setDenyErr(errors.New("injected bounded deny-map admission failure"))
+	dispatchAttachAck(t, cp, id, 1, &apiv1.SubscribedAck{
+		Mode:      apiv1.PolicyMode_POLICY_MODE_DENYLIST,
+		DenyCidrs: []*apiv1.CIDREntry{{Cidr: "203.0.113.0/24"}},
+	})
+
+	select {
+	case result := <-done:
+		require.Error(t, result.err)
+		assert.Nil(t, result.resp)
+		assert.Contains(t, result.err.Error(), "left retained attachment "+id+" safely degraded for authoritative retry")
+	case <-time.After(5 * time.Second):
+		t.Fatal("Attach did not return its bounded protected-policy apply result")
+	}
+
+	attachments, targets := env.attachmentCounts()
+	assert.Equal(t, 1, attachments, "safely degraded attachment remains registered for authoritative recovery")
+	assert.Equal(t, 1, targets)
+	assert.True(t, env.portInUse(), "retained attachment keeps its DNS endpoint")
+	assert.Zero(t, ff.detachCallCount(), "bounded protected pressure is not destructive")
+	assert.Zero(t, ff.closeCallCount(), "bounded protected pressure keeps the live filter owned")
+	mode, _, denied, _ := ff.snapshot()
+	assert.Equal(t, filter.ModeBlockAll, mode)
+	assert.Empty(t, denied)
+	listed, err := env.server.List(context.Background(), &apiv1.ListRequest{})
+	require.NoError(t, err)
+	require.Len(t, listed.Attachments, 1)
+	assert.Equal(t, id, listed.Attachments[0].Id)
+	assert.Equal(t, "bounded-apply-if0", listed.Attachments[0].Target,
+		"callers can discover the committed-error attachment by target")
+	row, err := env.st.GetAttachment(id)
+	require.NoError(t, err)
+	assert.Equal(t, apiv1.PolicyMode_POLICY_MODE_BLOCK_ALL.String(), row.Mode)
+	assert.Equal(t, policyDegradedAuthoritative, row.PolicyDegradedReason)
+	env.server.mu.RLock()
+	state := env.server.attachments[id]
+	require.NotNil(t, state)
+	assert.False(t, state.mutationsClosed, "durably degraded attachment remains open to complete authoritative recovery")
+	assert.False(t, state.needsResync, "needsResync is reserved for restored attachment handshakes")
+	env.server.mu.RUnlock()
+	stats := env.server.GetAttachmentStats()
+	require.Len(t, stats, 1)
+	assert.True(t, stats[0].PolicyDegraded)
+	assert.Equal(t, policyDegradedAuthoritative, stats[0].PolicyDegradedReason)
+	select {
+	case outbound := <-cp.sendCh:
+		t.Fatalf("protected initial-ack pressure must retain the subscription without an error Unsubscribed: %T", outbound.event.GetEvent())
+	default:
+	}
+
+	ff.setDenyErr(nil)
+	require.NoError(t, cp.applyBulkUpdate(id, &apiv1.BulkUpdate{
+		Mode:      apiv1.PolicyMode_POLICY_MODE_DENYLIST,
+		DenyCidrs: []*apiv1.CIDREntry{{Cidr: "198.51.100.0/24"}},
+	}))
+	mode, _, denied, _ = ff.snapshot()
+	assert.Equal(t, filter.ModeDenylist, mode)
+	assert.Equal(t, []string{"198.51.100.0/24"}, denied)
+	row, err = env.st.GetAttachment(id)
+	require.NoError(t, err)
+	assert.Empty(t, row.PolicyDegradedReason)
+	stats = env.server.GetAttachmentStats()
+	require.Len(t, stats, 1)
+	assert.False(t, stats[0].PolicyDegraded)
+	assert.Empty(t, stats[0].PolicyDegradedReason)
 }
 
 func TestCommittedAttachmentDNSListenerDeathQuarantinesBlockAll(t *testing.T) {

@@ -604,6 +604,40 @@ func (f *TCFilter) RemoveDeniedIP(cidr *net.IPNet) error {
 	return nil
 }
 
+func (f *TCFilter) protectedRuleBackendLocked() (protectedRuleBackend, error) {
+	if f.objs == nil || f.objs.AllowedIpv4 == nil || f.objs.AllowedIpv6 == nil ||
+		f.objs.DeniedIpv4 == nil || f.objs.DeniedIpv6 == nil || f.objs.PolicyMode == nil {
+		return nil, fmt.Errorf("filter handles are closed")
+	}
+	return bpfProtectedRuleBackend{
+		allowedIPv4: f.objs.AllowedIpv4,
+		allowedIPv6: f.objs.AllowedIpv6,
+		deniedIPv4:  f.objs.DeniedIpv4,
+		deniedIPv6:  f.objs.DeniedIpv6,
+		policyMode:  f.objs.PolicyMode,
+	}, nil
+}
+
+func (f *TCFilter) ReplaceProtectedRules(allowed, denied []*net.IPNet, mode PolicyMode) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	b, err := f.protectedRuleBackendLocked()
+	if err != nil {
+		return err
+	}
+	return replaceProtectedRules(b, allowed, denied, mode)
+}
+
+func (f *TCFilter) ProtectedRuleOccupancy() (ProtectedRuleOccupancy, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	b, err := f.protectedRuleBackendLocked()
+	if err != nil {
+		return ProtectedRuleOccupancy{}, err
+	}
+	return protectedRuleOccupancy(b)
+}
+
 func (f *TCFilter) exactDNSBackendLocked() (exactDNSBackend, error) {
 	if f.objs == nil || f.objs.DnsAllowedIpv4 == nil || f.objs.DnsAllowedIpv6 == nil {
 		return nil, fmt.Errorf("filter handles are closed")

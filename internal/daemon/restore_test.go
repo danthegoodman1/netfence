@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -502,6 +503,18 @@ func (e *restoreEnv) persistPinIdentity(t *testing.T, pinDir string, cleanupNeed
 	require.NoError(t, e.st.SaveAttachment(row))
 }
 
+func (e *restoreEnv) persistProtectedPolicyState(t *testing.T, mode apiv1.PolicyMode, reason string) {
+	t.Helper()
+	e.server.mu.Lock()
+	state := e.server.attachments[e.id]
+	require.NotNil(t, state)
+	state.info.Mode = mode.String()
+	state.info.PolicyDegradedReason = reason
+	row := cloneAttachment(state.info)
+	e.server.mu.Unlock()
+	require.NoError(t, e.st.SaveAttachment(row))
+}
+
 func assertRestoreDurableOwnershipRetained(t *testing.T, env *restoreEnv, before *store.Attachment) {
 	t.Helper()
 	after, err := env.st.GetAttachment(env.id)
@@ -570,6 +583,18 @@ func TestRestoreReadoptsPinsAndReconcileRemovesStale(t *testing.T) {
 	require.NotNil(t, state)
 	assert.Same(t, filter.Filter(env.adopted), state.filter)
 	assert.Equal(t, 3, state.ttls.len(), "adopted rules and DNS bootstrap must be tracked")
+	stats := env.server.GetAttachmentStats()
+	require.Len(t, stats, 1)
+	assert.Equal(t, uint32(3), stats[0].ProtectedAllowIpv4Entries)
+	assert.Equal(t, uint32(3), stats[0].ProtectedAllowIpv4HighWater,
+		"generation-local high-water initializes from adopted physical pins, including bootstrap")
+	preReconcileEvents := env.adopted.eventLog()
+	assert.NotContains(t, preReconcileEvents, "allow "+cidrA.String(),
+		"adopted inventory seeding must not redundantly rewrite existing map keys")
+	assert.NotContains(t, preReconcileEvents, "allow "+cidrB.String(),
+		"adopted inventory seeding must not redundantly rewrite existing map keys")
+	assert.Equal(t, []string{"allow " + testDNSBootstrapCIDR}, preReconcileEvents,
+		"the DNS bootstrap is the only physical protected write during adopted startup")
 
 	// Control-plane resync (BulkUpdate) now declares {A, C}.
 	require.NoError(t, env.server.ReconcileCIDRs(env.id, apiv1.PolicyMode_POLICY_MODE_ALLOWLIST,
@@ -604,6 +629,175 @@ func TestRestoreStoreModeLagsPinnedMode(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, apiv1.PolicyMode_POLICY_MODE_ALLOWLIST.String(), row.Mode,
 		"store row must be corrected to the live (pinned) mode")
+}
+
+func TestRestoreInterruptedProtectedMutationLogsAndRecoversOnlyByFullUpdate(t *testing.T) {
+	env := newRestoreEnv(t, 12380, apiv1.PolicyMode_POLICY_MODE_BLOCK_ALL)
+	stubRestoreWatcher(env.server)
+	env.adopted = &fakeFilter{mode: filter.ModeBlockAll}
+	env.mkPinDir(t)
+	env.persistProtectedPolicyState(t, apiv1.PolicyMode_POLICY_MODE_BLOCK_ALL, policyMutationInProgress)
+	var logs bytes.Buffer
+	env.server.logger = zerolog.New(&logs)
+
+	require.NoError(t, env.server.Start())
+	t.Cleanup(env.server.Stop)
+	row, err := env.st.GetAttachment(env.id)
+	require.NoError(t, err)
+	assert.Equal(t, policyMutationInterrupted, row.PolicyDegradedReason)
+	assert.Equal(t, apiv1.PolicyMode_POLICY_MODE_BLOCK_ALL.String(), row.Mode)
+	assert.Equal(t, 1, bytes.Count(logs.Bytes(), []byte("attachment protected policy degraded after an interrupted mutation")))
+	assert.Contains(t, logs.String(), `"degraded_reason":"`+policyMutationInterrupted+`"`)
+
+	cidr := mustCIDR(t, "198.51.100.0/24")
+	require.ErrorIs(t, env.server.AllowCIDR(env.id, cidr, 0), errPolicyDegraded)
+	require.ErrorIs(t, env.server.DenyCIDR(env.id, cidr, 0), errPolicyDegraded)
+	require.ErrorIs(t, env.server.RemoveAllowedCIDR(env.id, cidr), errPolicyDegraded)
+	require.ErrorIs(t, env.server.RemoveDeniedCIDR(env.id, cidr), errPolicyDegraded)
+	require.ErrorIs(t, env.server.ClearRules(env.id), errPolicyDegraded)
+	require.ErrorIs(t, env.server.SetFilterMode(env.id, apiv1.PolicyMode_POLICY_MODE_DISABLED), errPolicyDegraded)
+	require.ErrorIs(t, env.server.ReconcileCIDRs(env.id, apiv1.PolicyMode_POLICY_MODE_DENYLIST,
+		nil, []parsedCIDR{{cidr: cidr}}), errPolicyDegraded)
+	row, err = env.st.GetAttachment(env.id)
+	require.NoError(t, err)
+	assert.Equal(t, policyMutationInterrupted, row.PolicyDegradedReason)
+
+	client := NewControlPlaneClient("", env.server, zerolog.Nop(), nil, 0, nil)
+	require.NoError(t, client.applyBulkUpdate(env.id, &apiv1.BulkUpdate{
+		Mode:      apiv1.PolicyMode_POLICY_MODE_DENYLIST,
+		DenyCidrs: []*apiv1.CIDREntry{{Cidr: cidr.String()}},
+		Dns:       &apiv1.DnsConfig{Mode: apiv1.DnsMode_DNS_MODE_DISABLED},
+	}))
+	row, err = env.st.GetAttachment(env.id)
+	require.NoError(t, err)
+	assert.Empty(t, row.PolicyDegradedReason)
+	assert.Equal(t, apiv1.PolicyMode_POLICY_MODE_DENYLIST.String(), row.Mode)
+	assert.Equal(t, 1, bytes.Count(logs.Bytes(), []byte("attachment protected policy recovered after authoritative reconciliation")))
+}
+
+func TestRestoreInfersInterruptedLiveBlockAllAndLogsTransition(t *testing.T) {
+	env := newRestoreEnv(t, 12381, apiv1.PolicyMode_POLICY_MODE_ALLOWLIST)
+	stubRestoreWatcher(env.server)
+	env.adopted = &fakeFilter{mode: filter.ModeBlockAll}
+	env.mkPinDir(t)
+	var logs bytes.Buffer
+	env.server.logger = zerolog.New(&logs)
+
+	require.NoError(t, env.server.Start())
+	t.Cleanup(env.server.Stop)
+	row, err := env.st.GetAttachment(env.id)
+	require.NoError(t, err)
+	assert.Equal(t, policyMutationInterrupted, row.PolicyDegradedReason)
+	assert.Equal(t, apiv1.PolicyMode_POLICY_MODE_BLOCK_ALL.String(), row.Mode)
+	assert.Equal(t, 1, bytes.Count(logs.Bytes(), []byte("attachment protected policy degraded after an interrupted mutation")))
+}
+
+func TestRestoreAdoptedAllFamilyHighWaterSurvivesSmallerReconcile(t *testing.T) {
+	env := newRestoreEnv(t, 12385, apiv1.PolicyMode_POLICY_MODE_ALLOWLIST)
+	stubRestoreWatcher(env.server)
+	env.adopted = &fakeFilter{
+		mode:    filter.ModeAllowlist,
+		allowed: []string{"192.0.2.1/32", "2001:db8::1/128"},
+		denied:  []string{"198.51.100.1/32", "2001:db9::1/128"},
+	}
+	env.mkPinDir(t)
+
+	require.NoError(t, env.server.Start())
+	t.Cleanup(env.server.Stop)
+	stats := env.server.GetAttachmentStats()
+	require.Len(t, stats, 1)
+	assert.Equal(t, uint32(2), stats[0].ProtectedAllowIpv4Entries, "adopted v4 allow plus DNS bootstrap")
+	assert.Equal(t, uint32(1), stats[0].ProtectedAllowIpv6Entries)
+	assert.Equal(t, uint32(1), stats[0].ProtectedDenyIpv4Entries)
+	assert.Equal(t, uint32(1), stats[0].ProtectedDenyIpv6Entries)
+	assert.Equal(t, uint32(2), stats[0].ProtectedAllowIpv4HighWater)
+	assert.Equal(t, uint32(1), stats[0].ProtectedAllowIpv6HighWater)
+	assert.Equal(t, uint32(1), stats[0].ProtectedDenyIpv4HighWater)
+	assert.Equal(t, uint32(1), stats[0].ProtectedDenyIpv6HighWater)
+
+	require.NoError(t, env.server.ReconcileCIDRs(env.id, apiv1.PolicyMode_POLICY_MODE_ALLOWLIST, nil, nil))
+	stats = env.server.GetAttachmentStats()
+	require.Len(t, stats, 1)
+	assert.Equal(t, uint32(1), stats[0].ProtectedAllowIpv4Entries, "system bootstrap survives authoritative empty CP state")
+	assert.Zero(t, stats[0].ProtectedAllowIpv6Entries)
+	assert.Zero(t, stats[0].ProtectedDenyIpv4Entries)
+	assert.Zero(t, stats[0].ProtectedDenyIpv6Entries)
+	assert.Equal(t, uint32(2), stats[0].ProtectedAllowIpv4HighWater)
+	assert.Equal(t, uint32(1), stats[0].ProtectedAllowIpv6HighWater)
+	assert.Equal(t, uint32(1), stats[0].ProtectedDenyIpv4HighWater)
+	assert.Equal(t, uint32(1), stats[0].ProtectedDenyIpv6HighWater)
+}
+
+func TestRestoreProtectedJournalProofFailuresCloseAdoptedPins(t *testing.T) {
+	for i, tc := range []struct {
+		name string
+		prep func(*fakeFilter)
+	}{
+		{name: "force_write", prep: func(f *fakeFilter) {
+			f.mode = filter.ModeAllowlist
+			f.setSetModeErr(syscall.EIO)
+		}},
+		{name: "readback", prep: func(f *fakeFilter) {
+			f.mode = filter.ModeBlockAll
+			f.setGetModeErr(syscall.EIO)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newRestoreEnv(t, 12382+i, apiv1.PolicyMode_POLICY_MODE_BLOCK_ALL)
+			stubRestoreWatcher(env.server)
+			env.adopted = &fakeFilter{}
+			tc.prep(env.adopted)
+			env.mkPinDir(t)
+			env.persistProtectedPolicyState(t, apiv1.PolicyMode_POLICY_MODE_BLOCK_ALL, policyMutationInProgress)
+			before, err := env.st.GetAttachment(env.id)
+			require.NoError(t, err)
+
+			err = env.server.Start()
+			require.ErrorContains(t, err, "forcing restored degraded attachment")
+			assert.Equal(t, 1, env.adopted.closeCallCount())
+			assert.Zero(t, env.adopted.detachCallCount())
+			assert.DirExists(t, filepath.Join(env.pinRoot, env.id))
+			assertRestoreDurableOwnershipRetained(t, env, before)
+		})
+	}
+}
+
+func TestRestoreProtectedJournalConversionSaveFailureRetainsPinsAndRetries(t *testing.T) {
+	env := newRestoreEnv(t, 12384, apiv1.PolicyMode_POLICY_MODE_BLOCK_ALL)
+	stubRestoreWatcher(env.server)
+	env.adopted = &fakeFilter{mode: filter.ModeBlockAll}
+	env.mkPinDir(t)
+	env.persistProtectedPolicyState(t, apiv1.PolicyMode_POLICY_MODE_BLOCK_ALL, policyMutationInProgress)
+	before, err := env.st.GetAttachment(env.id)
+	require.NoError(t, err)
+	originalSave := env.server.saveAttachment
+	env.server.saveAttachment = func(row *store.Attachment) error {
+		if row.PolicyDegradedReason == policyMutationInterrupted {
+			return syscall.EIO
+		}
+		return originalSave(row)
+	}
+
+	err = env.server.Start()
+	require.ErrorContains(t, err, "persisting restored degraded attachment")
+	assert.Equal(t, 1, env.adopted.closeCallCount())
+	assert.Zero(t, env.adopted.detachCallCount())
+	assert.DirExists(t, filepath.Join(env.pinRoot, env.id))
+	assertRestoreDurableOwnershipRetained(t, env, before)
+	env.server.mu.RLock()
+	assert.Equal(t, policyMutationInProgress, env.server.attachments[env.id].info.PolicyDegradedReason,
+		"failed candidate persistence must leave the retryable in-progress state published")
+	env.server.mu.RUnlock()
+
+	// A clean retry re-adopts a fresh userspace handle for the same pins and
+	// completes the durable interrupted-state conversion.
+	env.server.saveAttachment = originalSave
+	env.adopted = &fakeFilter{mode: filter.ModeBlockAll}
+	require.NoError(t, env.server.Start())
+	t.Cleanup(env.server.Stop)
+	row, err := env.st.GetAttachment(env.id)
+	require.NoError(t, err)
+	assert.Equal(t, policyMutationInterrupted, row.PolicyDegradedReason)
 }
 
 // TestRestoreFallsBackWithoutPins: no pin dir (detach_on_stop prior run or

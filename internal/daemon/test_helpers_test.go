@@ -1,8 +1,11 @@
 package daemon
 
 import (
+	"math"
 	"net"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -19,43 +22,51 @@ import (
 const testDNSBootstrapCIDR = "127.0.0.1/32"
 
 type fakeFilter struct {
-	mu                   sync.Mutex
-	mode                 filter.PolicyMode
-	allowed              []string
-	denied               []string
-	dnsAllowed           []string
-	dnsAddCalls          int
-	dnsRemoveCalls       int
-	dnsReplaceCalls      int
-	dnsAddErr            error
-	dnsRemoveErr         error
-	dnsReplaceErr        error
-	dnsCapacity4         uint32
-	dnsCapacity6         uint32
-	dnsListOverride      []net.IP
-	dnsOccupancyOverride *filter.DNSAllowOccupancy
-	dnsAddEntered        chan struct{}
-	dnsAddRelease        <-chan struct{}
-	dnsAddOnce           sync.Once
-	clearCalls           int
-	stats                filter.Stats
-	setModeCalls         int
-	allowCalls           int
-	closeCalls           int
-	detachCalls          int
-	setModeErr           error
-	closeErr             error
-	detachErr            error
-	detachErrs           []error
-	allowErr             error // when set, AllowIP fails with this error
-	denyErr              error
-	rulesErr             error // when set, adopted-map inventory fails
-	removeAllowErr       error
-	removeDenyErr        error
-	setModeEntered       chan struct{}
-	setModeRelease       <-chan struct{}
-	setModeOnce          sync.Once
-	mutationsAfterClose  int
+	mu                      sync.Mutex
+	mode                    filter.PolicyMode
+	allowed                 []string
+	denied                  []string
+	dnsAllowed              []string
+	dnsAddCalls             int
+	dnsRemoveCalls          int
+	dnsReplaceCalls         int
+	dnsAddErr               error
+	dnsRemoveErr            error
+	dnsReplaceErr           error
+	dnsCapacity4            uint32
+	dnsCapacity6            uint32
+	dnsListOverride         []net.IP
+	dnsOccupancyOverride    *filter.DNSAllowOccupancy
+	dnsAddEntered           chan struct{}
+	dnsAddRelease           <-chan struct{}
+	dnsAddOnce              sync.Once
+	clearCalls              int
+	stats                   filter.Stats
+	setModeCalls            int
+	getModeCalls            int
+	allowCalls              int
+	denyCalls               int
+	closeCalls              int
+	detachCalls             int
+	setModeErr              error
+	getModeErr              error
+	closeErr                error
+	detachErr               error
+	detachErrs              []error
+	allowErr                error // when set, AllowIP fails with this error
+	denyErr                 error
+	rulesErr                error // when set, adopted-map inventory fails
+	removeAllowErr          error
+	removeDenyErr           error
+	ruleCapacity4           uint32
+	ruleCapacity6           uint32
+	protectedReplaceErr     error
+	protectedOccupancyErr   error
+	protectedOccupancyCalls int
+	setModeEntered          chan struct{}
+	setModeRelease          <-chan struct{}
+	setModeOnce             sync.Once
+	mutationsAfterClose     int
 	// removedAllowed/removedDenied record every Remove call (even for CIDRs
 	// not present, mirroring the real filter's idempotent removes), so tests
 	// can prove a surviving rule was NEVER removed during a transition.
@@ -97,6 +108,12 @@ func (f *fakeFilter) setSetModeErr(err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.setModeErr = err
+}
+
+func (f *fakeFilter) setGetModeErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.getModeErr = err
 }
 
 func (f *fakeFilter) blockSetMode(entered chan struct{}, release <-chan struct{}) {
@@ -147,11 +164,18 @@ func (f *fakeFilter) DenyIP(cidr *net.IPNet) error {
 		f.mutationsAfterClose++
 	}
 	f.events = append(f.events, "deny "+cidr.String())
+	f.denyCalls++
 	if f.denyErr != nil {
 		return f.denyErr
 	}
 	f.denied = appendUnique(f.denied, cidr.String())
 	return nil
+}
+
+func (f *fakeFilter) denyCallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.denyCalls
 }
 
 func (f *fakeFilter) setDenyErr(err error) {
@@ -188,6 +212,230 @@ func (f *fakeFilter) RemoveDeniedIP(cidr *net.IPNet) error {
 	}
 	f.denied = removeString(f.denied, cidr.String())
 	return nil
+}
+
+func (f *fakeFilter) ReplaceProtectedRules(allowed, denied []*net.IPNet, mode filter.PolicyMode) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.protectedReplaceErr != nil {
+		return f.protectedReplaceErr
+	}
+	canonical := func(cidrs []*net.IPNet) []string {
+		seen := make(map[string]struct{}, len(cidrs))
+		for _, cidr := range cidrs {
+			seen[cidr.String()] = struct{}{}
+		}
+		out := make([]string, 0, len(seen))
+		for raw := range seen {
+			out = append(out, raw)
+		}
+		sort.Strings(out)
+		return out
+	}
+	wantAllowed, wantDenied := canonical(allowed), canonical(denied)
+	cap4, cap6 := f.ruleCapacity4, f.ruleCapacity6
+	if cap4 == 0 {
+		cap4 = math.MaxUint32
+	}
+	if cap6 == 0 {
+		cap6 = math.MaxUint32
+	}
+	count := func(values []string) (v4, v6 uint32) {
+		for _, raw := range values {
+			if strings.Contains(raw, ":") {
+				v6++
+			} else {
+				v4++
+			}
+		}
+		return
+	}
+	allow4, allow6 := count(wantAllowed)
+	deny4, deny6 := count(wantDenied)
+	if allow4 > cap4 || deny4 > cap4 || allow6 > cap6 || deny6 > cap6 {
+		return filter.ErrProtectedRuleCapacity
+	}
+	beforeAllowed := append([]string(nil), f.allowed...)
+	beforeDenied := append([]string(nil), f.denied...)
+	beforeMode := f.mode
+	contains := func(values []string, target string) bool {
+		for _, value := range values {
+			if value == target {
+				return true
+			}
+		}
+		return false
+	}
+	rollback := func(err error) error {
+		f.allowed, f.denied, f.mode = beforeAllowed, beforeDenied, beforeMode
+		return err
+	}
+	setMode := func(target filter.PolicyMode) error {
+		if f.mode == target {
+			return nil
+		}
+		entered, release := f.setModeEntered, f.setModeRelease
+		f.mu.Unlock()
+		if entered != nil {
+			f.setModeOnce.Do(func() { close(entered) })
+		}
+		if release != nil {
+			<-release
+		}
+		f.mu.Lock()
+		f.events = append(f.events, "set-mode "+target.String())
+		f.setModeCalls++
+		if f.setModeErr != nil {
+			return f.setModeErr
+		}
+		f.mode = target
+		return nil
+	}
+	applyAllowed := func() error {
+		for _, raw := range wantAllowed {
+			if !contains(beforeAllowed, raw) {
+				f.events = append(f.events, "allow "+raw)
+				f.allowCalls++
+				if f.allowErr != nil {
+					return f.allowErr
+				}
+				f.allowed = appendUnique(f.allowed, raw)
+			}
+		}
+		for _, raw := range beforeAllowed {
+			if !contains(wantAllowed, raw) {
+				f.events = append(f.events, "remove-allow "+raw)
+				f.removedAllowed = append(f.removedAllowed, raw)
+				if f.removeAllowErr != nil {
+					return f.removeAllowErr
+				}
+				f.allowed = removeString(f.allowed, raw)
+			}
+		}
+		return nil
+	}
+	applyDenied := func() error {
+		for _, raw := range wantDenied {
+			if !contains(beforeDenied, raw) {
+				f.events = append(f.events, "deny "+raw)
+				if f.denyErr != nil {
+					return f.denyErr
+				}
+				f.denied = appendUnique(f.denied, raw)
+			}
+		}
+		for _, raw := range beforeDenied {
+			if !contains(wantDenied, raw) {
+				f.events = append(f.events, "remove-deny "+raw)
+				f.removedDenied = append(f.removedDenied, raw)
+				if f.removeDenyErr != nil {
+					return f.removeDenyErr
+				}
+				f.denied = removeString(f.denied, raw)
+			}
+		}
+		return nil
+	}
+	applyOrRollback := func(apply func() error) error {
+		if err := apply(); err != nil {
+			return rollback(err)
+		}
+		return nil
+	}
+	switch {
+	case beforeMode == mode && mode == filter.ModeAllowlist:
+		if err := applyOrRollback(applyDenied); err != nil {
+			return err
+		}
+		if err := applyOrRollback(applyAllowed); err != nil {
+			return err
+		}
+	case beforeMode == mode && mode == filter.ModeDenylist:
+		if err := applyOrRollback(applyAllowed); err != nil {
+			return err
+		}
+		if err := applyOrRollback(applyDenied); err != nil {
+			return err
+		}
+	case mode == filter.ModeAllowlist:
+		if err := applyOrRollback(applyAllowed); err != nil {
+			return err
+		}
+		if err := setMode(mode); err != nil {
+			return rollback(err)
+		}
+		if err := applyOrRollback(applyDenied); err != nil {
+			return err
+		}
+	case mode == filter.ModeDenylist:
+		if err := applyOrRollback(applyDenied); err != nil {
+			return err
+		}
+		if err := setMode(mode); err != nil {
+			return rollback(err)
+		}
+		if err := applyOrRollback(applyAllowed); err != nil {
+			return err
+		}
+	default:
+		if err := setMode(mode); err != nil {
+			return rollback(err)
+		}
+		if err := applyOrRollback(applyAllowed); err != nil {
+			return err
+		}
+		if err := applyOrRollback(applyDenied); err != nil {
+			return err
+		}
+	}
+	f.allowed, f.denied = wantAllowed, wantDenied
+	return nil
+}
+
+func (f *fakeFilter) ProtectedRuleOccupancy() (filter.ProtectedRuleOccupancy, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.protectedOccupancyCalls++
+	if f.protectedOccupancyErr != nil {
+		return filter.ProtectedRuleOccupancy{}, f.protectedOccupancyErr
+	}
+	cap4, cap6 := f.ruleCapacity4, f.ruleCapacity6
+	if cap4 == 0 {
+		cap4 = math.MaxUint32
+	}
+	if cap6 == 0 {
+		cap6 = math.MaxUint32
+	}
+	var out filter.ProtectedRuleOccupancy
+	out.AllowedIPv4.Capacity, out.DeniedIPv4.Capacity = cap4, cap4
+	out.AllowedIPv6.Capacity, out.DeniedIPv6.Capacity = cap6, cap6
+	for _, raw := range f.allowed {
+		if strings.Contains(raw, ":") {
+			out.AllowedIPv6.Entries++
+		} else {
+			out.AllowedIPv4.Entries++
+		}
+	}
+	for _, raw := range f.denied {
+		if strings.Contains(raw, ":") {
+			out.DeniedIPv6.Entries++
+		} else {
+			out.DeniedIPv4.Entries++
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeFilter) protectedOccupancyCallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.protectedOccupancyCalls
+}
+
+func (f *fakeFilter) setProtectedOccupancyErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.protectedOccupancyErr = err
 }
 
 func (f *fakeFilter) AddDNSAllowedIPs(ips []net.IP) error {
@@ -311,6 +559,12 @@ func (f *fakeFilter) setRemoveAllowedErr(err error) {
 	f.removeAllowErr = err
 }
 
+func (f *fakeFilter) setRemoveDeniedErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.removeDenyErr = err
+}
+
 func (f *fakeFilter) removeCalls() (removedAllowed, removedDenied []string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -353,7 +607,17 @@ func (f *fakeFilter) GetStats() (filter.Stats, error) {
 func (f *fakeFilter) GetMode() (filter.PolicyMode, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.getModeCalls++
+	if f.getModeErr != nil {
+		return filter.ModeDisabled, f.getModeErr
+	}
 	return f.mode, nil
+}
+
+func (f *fakeFilter) modeCallCounts() (set, get int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.setModeCalls, f.getModeCalls
 }
 
 func (f *fakeFilter) Close() error {
