@@ -44,12 +44,17 @@ func (d TCDirection) String() string {
 
 // TCFilter manages the TC-based BPF filter
 type TCFilter struct {
-	mu        sync.Mutex
-	objs      *tcObjects
-	ifaceName string
-	direction TCDirection
-	pinDir    string
-	tcLink    link.Link
+	mu           sync.Mutex
+	objs         *tcObjects
+	ifaceName    string
+	direction    TCDirection
+	pinDir       string
+	tcLink       link.Link
+	removePinDir func(string) error
+	// closeHandlesForTest is nil in production. See CgroupFilter.
+	closeHandlesForTest   func() error
+	handlesCloseAttempted bool
+	handlesCloseErr       error
 }
 
 // NewTCFilter creates a new TC-based filter attached to the specified
@@ -114,11 +119,12 @@ func NewTCFilterWithOptions(ifaceName string, mode PolicyMode, direction TCDirec
 	}
 
 	f := &TCFilter{
-		objs:      objs,
-		ifaceName: ifaceName,
-		direction: direction,
-		pinDir:    opts.PinDir,
-		tcLink:    tcLink,
+		objs:         objs,
+		ifaceName:    ifaceName,
+		direction:    direction,
+		pinDir:       opts.PinDir,
+		tcLink:       tcLink,
+		removePinDir: os.RemoveAll,
 	}
 
 	// Pin link + maps last, once everything is attached: a crash before this
@@ -146,16 +152,13 @@ func NewTCFilterWithOptions(ifaceName string, mode PolicyMode, direction TCDirec
 // place for the caller to inspect or remove.
 func LoadPinnedTCFilter(ifaceName string, direction TCDirection, pinDir string) (_ *TCFilter, retErr error) {
 	f := &TCFilter{
-		objs:      &tcObjects{},
-		ifaceName: ifaceName,
-		direction: direction,
-		pinDir:    pinDir,
+		objs:         &tcObjects{},
+		ifaceName:    ifaceName,
+		direction:    direction,
+		pinDir:       pinDir,
+		removePinDir: os.RemoveAll,
 	}
-	defer func() {
-		if retErr != nil {
-			_ = f.closeHandles()
-		}
-	}()
+	defer closePinnedLoadOnError(&retErr, f.closeHandles)
 
 	if err := loadPinnedMaps(pinDir, map[string]**ebpf.Map{
 		pinAllowedIPv4: &f.objs.AllowedIpv4,
@@ -170,7 +173,7 @@ func LoadPinnedTCFilter(ifaceName string, direction TCDirection, pinDir string) 
 
 	l, err := link.LoadPinnedLink(filepath.Join(pinDir, pinLinkTCX), nil)
 	if err != nil {
-		return nil, fmt.Errorf("loading pinned link %s: %w", pinLinkTCX, err)
+		return nil, pinnedObjectLoadError("link", pinLinkTCX, err)
 	}
 	f.tcLink = l
 
@@ -226,7 +229,11 @@ func (f *TCFilter) Detach() error {
 	// Removing the bpffs entries IS the unpin: once the pin files are gone,
 	// our fds hold the only references and closeHandles drops them.
 	if f.pinDir != "" {
-		if err := os.RemoveAll(f.pinDir); err != nil {
+		remove := f.removePinDir
+		if remove == nil {
+			remove = os.RemoveAll
+		}
+		if err := remove(f.pinDir); err != nil {
 			errs = append(errs, fmt.Errorf("removing pin dir %s: %w", f.pinDir, err))
 		}
 	}
@@ -241,17 +248,31 @@ func (f *TCFilter) Detach() error {
 
 // closeHandles closes all fds. Callers hold f.mu (or have exclusive access
 // during construction).
-func (f *TCFilter) closeHandles() error {
+func (f *TCFilter) closeHandles() (retErr error) {
+	if f.handlesCloseAttempted {
+		return f.handlesCloseErr
+	}
+	f.handlesCloseAttempted = true
+	defer func() { f.handlesCloseErr = retErr }()
+	if f.closeHandlesForTest != nil {
+		closeFn := f.closeHandlesForTest
+		f.closeHandlesForTest = nil
+		return closeFn()
+	}
 	var errs []error
 
 	if f.tcLink != nil {
-		if err := f.tcLink.Close(); err != nil {
+		l := f.tcLink
+		f.tcLink = nil
+		if err := l.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("closing TC link: %w", err))
 		}
 	}
 
 	if f.objs != nil {
-		if err := f.objs.Close(); err != nil {
+		objs := f.objs
+		f.objs = nil
+		if err := objs.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("closing eBPF objects: %w", err))
 		}
 	}
@@ -266,6 +287,9 @@ func (f *TCFilter) closeHandles() error {
 func (f *TCFilter) SetMode(mode PolicyMode) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.objs == nil || f.objs.PolicyMode == nil {
+		return fmt.Errorf("filter handles are closed")
+	}
 	return f.objs.PolicyMode.Put(uint32(0), uint8(mode))
 }
 
@@ -370,6 +394,9 @@ func (f *TCFilter) GetStats() (Stats, error) {
 	defer f.mu.Unlock()
 
 	var stats Stats
+	if f.objs == nil || f.objs.Stats == nil {
+		return stats, fmt.Errorf("filter handles are closed")
+	}
 	allowed, err := sumPerCPUCounter(f.objs.Stats, 0)
 	if err != nil {
 		return stats, fmt.Errorf("reading allowed count: %w", err)

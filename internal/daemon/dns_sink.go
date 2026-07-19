@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"fmt"
 	"net"
 	"sync/atomic"
 	"time"
@@ -29,6 +30,7 @@ const mapFullWarnInterval = 30 * time.Second
 // expires them) with the configured minimum filter TTL applied.
 type dnsFilterSink struct {
 	server *Server
+	id     string
 	filter filter.Filter
 	reg    *ttlRegistry
 	logger zerolog.Logger
@@ -40,6 +42,7 @@ type dnsFilterSink struct {
 func (s *Server) newDNSFilterSink(id string, f filter.Filter, reg *ttlRegistry) *dnsFilterSink {
 	return &dnsFilterSink{
 		server: s,
+		id:     id,
 		filter: f,
 		reg:    reg,
 		logger: s.logger.With().Str("id", id).Logger(),
@@ -47,10 +50,20 @@ func (s *Server) newDNSFilterSink(id string, f filter.Filter, reg *ttlRegistry) 
 }
 
 func (s *dnsFilterSink) AllowIPWithTTL(cidr *net.IPNet, ttl time.Duration) error {
+	state, done, err := s.server.beginAttachmentMutation(s.id)
+	if err != nil {
+		return err
+	}
+	defer done()
+	// A sink is lifecycle-bound to one exact filter/registry pair. Reject a
+	// stale server instance even if an attachment ID was later reused.
+	if state.filter != s.filter {
+		return fmt.Errorf("attachment DNS filter sink is stale")
+	}
 	if floor := s.server.dnsMinFilterTTL; ttl < floor {
 		ttl = floor
 	}
-	err := s.reg.addDNS(s.filter, cidr, listAllow, ttl, s.server.now())
+	err = s.reg.addDNS(s.filter, cidr, listAllow, ttl, s.server.now())
 	if err == nil {
 		return nil
 	}

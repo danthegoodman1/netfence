@@ -3,6 +3,7 @@
 package filter
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -46,6 +47,33 @@ func mustParse(t *testing.T, s string) *net.IPNet {
 		t.Fatal(err)
 	}
 	return cidr
+}
+
+func TestPinnedObjectLoadErrorOnlyClassifiesMissingObjectsAsStructural(t *testing.T) {
+	missing := pinnedObjectLoadError("map", pinPolicyMode, os.ErrNotExist)
+	if !errors.Is(missing, ErrPinnedStateInvalid) || !errors.Is(missing, os.ErrNotExist) {
+		t.Fatalf("missing pin must retain both classifications: %v", missing)
+	}
+	for _, ambiguous := range []error{unix.EIO, unix.EACCES, unix.ENOMEM} {
+		err := pinnedObjectLoadError("map", pinPolicyMode, ambiguous)
+		if errors.Is(err, ErrPinnedStateInvalid) {
+			t.Fatalf("ambiguous load error %v was incorrectly made discardable: %v", ambiguous, err)
+		}
+		if !errors.Is(err, ambiguous) {
+			t.Fatalf("ambiguous load cause %v was lost: %v", ambiguous, err)
+		}
+	}
+}
+
+func TestPinnedLoadCloseFailureVetoesDiscardablePrimaryError(t *testing.T) {
+	loadErr := fmt.Errorf("%w: required map missing", ErrPinnedStateInvalid)
+	closePinnedLoadOnError(&loadErr, func() error { return unix.EIO })
+	if !errors.Is(loadErr, ErrPinnedStateInvalid) {
+		t.Fatalf("primary structural classification was lost: %v", loadErr)
+	}
+	if !errors.Is(loadErr, ErrPinnedStateCloseFailed) || !errors.Is(loadErr, unix.EIO) {
+		t.Fatalf("partial-close ambiguity was not propagated: %v", loadErr)
+	}
 }
 
 func cidrStrings(cidrs []*net.IPNet) []string {
@@ -350,6 +378,9 @@ func TestCgroupPinnedLinkReincarnationRejected(t *testing.T) {
 		n := queryCgroupProgCount(t, cgroupPath, ebpf.AttachCGroupInet4Connect)
 		t.Fatalf("LoadPinnedCgroupFilter adopted a defunct link for a recreated cgroup (err=nil, connect4 programs on RECREATED cgroup=%d) — the recreated cgroup is unfiltered while the daemon believes it is enforcing", n)
 	}
+	if !errors.Is(err, ErrPinnedTargetMismatch) {
+		t.Fatalf("expected typed pinned-target mismatch, got %v", err)
+	}
 	t.Logf("correctly refused defunct link: %v", err)
 }
 
@@ -387,6 +418,9 @@ func TestTCPinnedLinkReincarnationRejected(t *testing.T) {
 	if err == nil {
 		_ = restored.Detach()
 		t.Fatal("LoadPinnedTCFilter adopted a defunct TCX link for a recreated interface — the recreated interface is unfiltered while the daemon believes it is enforcing")
+	}
+	if !errors.Is(err, ErrPinnedTargetMismatch) {
+		t.Fatalf("expected typed pinned-target mismatch, got %v", err)
 	}
 	t.Logf("correctly refused defunct link: %v", err)
 }

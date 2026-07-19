@@ -55,3 +55,14 @@ func onBpffs(path string) (bool, error) {
 	}
 	return uint32(st.Type) == uint32(unix.BPF_FS_MAGIC), nil
 }
+
+func validateExistingBPFPinRoot(path string) error {
+	ok, err := onBpffs(path)
+	if err != nil {
+		return fmt.Errorf("checking filesystem of persisted BPF pin root %s: %w", path, err)
+	}
+	if !ok {
+		return fmt.Errorf("persisted BPF pin root %s is not on bpffs", path)
+	}
+	return nil
+}

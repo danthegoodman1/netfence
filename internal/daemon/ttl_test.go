@@ -60,6 +60,46 @@ func removeCidrCmd(id, cidr string) *apiv1.ControlCommand {
 	return &apiv1.ControlCommand{Id: id, Command: &apiv1.ControlCommand_RemoveCidr{RemoveCidr: cidr}}
 }
 
+func TestSystemOwnedDNSBootstrapSurvivesAuthoritativeStateTTLRemoveAndClear(t *testing.T) {
+	ff := &fakeFilter{}
+	reg := newTTLRegistry()
+	clock := newFakeClock()
+	bootstrap := mustCIDR(t, testDNSBootstrapCIDR)
+
+	require.NoError(t, reg.addSystem(ff, bootstrap, listAllow))
+	require.NoError(t, reg.addCP(ff, bootstrap, listAllow, time.Second, clock.Now()))
+	require.NoError(t, reg.addDNS(ff, bootstrap, listAllow, time.Second, clock.Now()))
+	require.NoError(t, reg.reconcileCP(ff, listAllow, nil, clock.Now()))
+
+	clock.Advance(time.Hour)
+	assert.Empty(t, reg.expire(ff, clock.Now()))
+	require.NoError(t, reg.remove(ff, bootstrap, listAllow))
+	_, allowed, _, _ := ff.snapshot()
+	assert.Equal(t, []string{testDNSBootstrapCIDR}, allowed)
+	removed, _ := ff.removeCalls()
+	assert.Empty(t, removed, "control-plane removal must not issue a kernel remove for the system route")
+
+	ordinary := mustCIDR(t, "192.0.2.55/32")
+	require.NoError(t, reg.addCP(ff, ordinary, listAllow, 0, clock.Now()))
+	ff.setRemoveAllowedErr(syscall.EIO)
+	require.Error(t, reg.clear(ff))
+	_, allowed, _, clearCalls := ff.snapshot()
+	assert.ElementsMatch(t, []string{testDNSBootstrapCIDR, ordinary.String()}, allowed)
+	assert.Zero(t, clearCalls, "protected clear must never call the physical all-map clear")
+	assert.Equal(t, 2, reg.len(), "failed ordinary removal and protected bootstrap remain retry-accurate")
+
+	ff.setRemoveAllowedErr(nil)
+	require.NoError(t, reg.clear(ff))
+	_, allowed, _, clearCalls = ff.snapshot()
+	assert.Equal(t, []string{testDNSBootstrapCIDR}, allowed)
+	assert.Zero(t, clearCalls)
+	assert.Zero(t, reg.pendingLen(), "system ownership is permanent and not janitor work")
+	for _, event := range ff.eventLog() {
+		assert.NotEqual(t, "clear", event)
+		assert.NotEqual(t, "remove-allow "+testDNSBootstrapCIDR, event)
+	}
+}
+
 // registryLen reports the attachment's pending-expiry count: entries with a
 // finite deadline the janitor will eventually remove. Permanent entries are
 // tracked too (for aliasing pins and the 2C diff seam) but never expire, so

@@ -173,6 +173,10 @@ message AttachmentStats {
   // allows are NOT taking effect; raise filter.max_rule_entries or reduce
   // rule volume/TTLs.
   uint64 map_full_drops = 6;
+  // DNS queries that ended in SERVFAIL or another resolver/proxy/admission
+  // failure. Mutually exclusive with dns_queries_allowed (successfully
+  // answered policy-allowed queries) and dns_queries_blocked (policy REFUSED).
+  uint64 dns_queries_errors = 7;
 }
 
 // ControlCommand represents commands sent from the control plane to the daemon.
@@ -286,8 +290,12 @@ message DnsConfig {
   repeated DomainEntry allow_domains = 2;
   // Domains to deny (when mode is DENYLIST or to override in ALLOWLIST)
   repeated DomainEntry deny_domains = 3;
-  // Upstream DNS servers to use for resolution (optional, uses system default
-  // if empty)
+  // Ordered upstream DNS servers for this attachment. Entries are host:port;
+  // IPv6 literals must be bracketed. The daemon canonicalizes and de-duplicates
+  // them in first-seen order and accepts at most 8 unique servers. Empty uses
+  // the daemon-global dns.upstream fallback. Resolution tries each server in
+  // order; a truncated UDP reply is retried over TCP against that same server
+  // before failover continues.
   repeated string upstream_servers = 4;
 }
 

@@ -16,6 +16,8 @@ import (
 	apiv1 "github.com/danthegoodman1/netfence/v1"
 )
 
+const testDNSBootstrapCIDR = "127.0.0.1/32"
+
 type fakeFilter struct {
 	mu                  sync.Mutex
 	mode                filter.PolicyMode
@@ -27,7 +29,12 @@ type fakeFilter struct {
 	allowCalls          int
 	closeCalls          int
 	detachCalls         int
+	setModeErr          error
+	closeErr            error
+	detachErr           error
+	detachErrs          []error
 	allowErr            error // when set, AllowIP fails with this error
+	denyErr             error
 	rulesErr            error // when set, adopted-map inventory fails
 	removeAllowErr      error
 	removeDenyErr       error
@@ -63,10 +70,19 @@ func (f *fakeFilter) SetMode(mode filter.PolicyMode) error {
 	if f.closeCalls > 0 {
 		f.mutationsAfterClose++
 	}
-	f.mode = mode
 	f.setModeCalls++
 	f.events = append(f.events, "set-mode "+mode.String())
+	if f.setModeErr != nil {
+		return f.setModeErr
+	}
+	f.mode = mode
 	return nil
+}
+
+func (f *fakeFilter) setSetModeErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.setModeErr = err
 }
 
 func (f *fakeFilter) blockSetMode(entered chan struct{}, release <-chan struct{}) {
@@ -117,8 +133,17 @@ func (f *fakeFilter) DenyIP(cidr *net.IPNet) error {
 		f.mutationsAfterClose++
 	}
 	f.events = append(f.events, "deny "+cidr.String())
+	if f.denyErr != nil {
+		return f.denyErr
+	}
 	f.denied = appendUnique(f.denied, cidr.String())
 	return nil
+}
+
+func (f *fakeFilter) setDenyErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.denyErr = err
 }
 
 func (f *fakeFilter) RemoveAllowedIP(cidr *net.IPNet) error {
@@ -205,7 +230,13 @@ func (f *fakeFilter) Close() error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.closeCalls++
-	return nil
+	return f.closeErr
+}
+
+func (f *fakeFilter) setCloseErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.closeErr = err
 }
 
 // Detach mirrors the real filters: it is Close plus pin removal. It bumps
@@ -215,8 +246,28 @@ func (f *fakeFilter) Detach() error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.detachCalls++
-	f.closeCalls++
-	return nil
+	if f.closeCalls == 0 {
+		f.closeCalls++
+	}
+	f.events = append(f.events, "detach")
+	if len(f.detachErrs) > 0 {
+		err := f.detachErrs[0]
+		f.detachErrs = f.detachErrs[1:]
+		return err
+	}
+	return f.detachErr
+}
+
+func (f *fakeFilter) setDetachErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.detachErr = err
+}
+
+func (f *fakeFilter) setDetachErrors(errs ...error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.detachErrs = append([]error(nil), errs...)
 }
 
 // detachCallCount reports how many times Detach ran.

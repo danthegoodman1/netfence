@@ -38,9 +38,19 @@ type Attachment struct {
 	// Direction is the TC attach direction (a TcDirection enum name) for TC
 	// attachments. Empty for cgroup attachments and for rows written before
 	// the column existed; readers treat empty as EGRESS.
-	Direction  string            `json:"direction"`
-	Metadata   map[string]string `json:"metadata"`
-	AttachedAt time.Time         `json:"attached_at"`
+	Direction string `json:"direction"`
+	// CleanupNeeded is an internal durable tombstone. It marks an attachment
+	// whose enforcing resources are being destroyed but whose pin removal or
+	// row deletion has not yet been proven complete. The daemon must never
+	// restore or subscribe such a row as a live policy attachment.
+	CleanupNeeded bool `json:"cleanup_needed"`
+	// PinDir is the exact bpffs directory used by this attachment. Empty with
+	// PinPathKnown=true explicitly means pinning was disabled; false denotes a
+	// legacy row whose pin identity must be established before cleanup.
+	PinDir       string            `json:"pin_dir"`
+	PinPathKnown bool              `json:"pin_path_known"`
+	Metadata     map[string]string `json:"metadata"`
+	AttachedAt   time.Time         `json:"attached_at"`
 }
 
 func New(dbPath string) (*Store, error) {
@@ -95,7 +105,10 @@ func migrate(db *sql.DB) error {
 			dns_address TEXT NOT NULL,
 			metadata TEXT NOT NULL,
 				attached_at TEXT NOT NULL,
-				direction TEXT NOT NULL DEFAULT ''
+				direction TEXT NOT NULL DEFAULT '',
+				cleanup_needed INTEGER NOT NULL DEFAULT 0,
+				pin_dir TEXT NOT NULL DEFAULT '',
+				pin_path_known INTEGER NOT NULL DEFAULT 0
 			) STRICT, WITHOUT ROWID
 		`); err != nil {
 		return err
@@ -105,6 +118,23 @@ func migrate(db *sql.DB) error {
 	// error to keep the migration idempotent.
 	if _, err := db.Exec(`
 		ALTER TABLE attachments ADD COLUMN direction TEXT NOT NULL DEFAULT ''
+	`); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		return err
+	}
+	// Cleanup tombstones were added after direction. Existing rows are live
+	// attachments and therefore migrate to the safe false default.
+	if _, err := db.Exec(`
+		ALTER TABLE attachments ADD COLUMN cleanup_needed INTEGER NOT NULL DEFAULT 0
+	`); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		return err
+	}
+	if _, err := db.Exec(`
+		ALTER TABLE attachments ADD COLUMN pin_dir TEXT NOT NULL DEFAULT ''
+	`); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		return err
+	}
+	if _, err := db.Exec(`
+		ALTER TABLE attachments ADD COLUMN pin_path_known INTEGER NOT NULL DEFAULT 0
 	`); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 		return err
 	}
@@ -215,9 +245,9 @@ func (s *Store) SaveAttachment(a *Attachment) error {
 	}
 
 	_, err = s.db.Exec(`
-		INSERT OR REPLACE INTO attachments (id, target, type, mode, dns_mode, dns_address, direction, metadata, attached_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, a.ID, a.Target, a.Type, a.Mode, a.DnsMode, a.DnsAddress, a.Direction, string(metadata), a.AttachedAt.UTC().Format(attachedAtLayout))
+		INSERT OR REPLACE INTO attachments (id, target, type, mode, dns_mode, dns_address, direction, cleanup_needed, pin_dir, pin_path_known, metadata, attached_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, a.ID, a.Target, a.Type, a.Mode, a.DnsMode, a.DnsAddress, a.Direction, a.CleanupNeeded, a.PinDir, a.PinPathKnown, string(metadata), a.AttachedAt.UTC().Format(attachedAtLayout))
 	return err
 }
 
@@ -228,7 +258,7 @@ func (s *Store) DeleteAttachment(id string) error {
 
 func (s *Store) GetAttachment(id string) (*Attachment, error) {
 	row := s.db.QueryRow(`
-		SELECT id, target, type, mode, dns_mode, dns_address, direction, metadata, attached_at
+		SELECT id, target, type, mode, dns_mode, dns_address, direction, cleanup_needed, pin_dir, pin_path_known, metadata, attached_at
 		FROM attachments WHERE id = ?
 	`, id)
 
@@ -249,7 +279,7 @@ func (s *Store) ListAttachments(pageSize int, pageToken string) ([]Attachment, s
 	}
 
 	query := `
-		SELECT id, target, type, mode, dns_mode, dns_address, direction, metadata, attached_at
+		SELECT id, target, type, mode, dns_mode, dns_address, direction, cleanup_needed, pin_dir, pin_path_known, metadata, attached_at
 		FROM attachments
 		WHERE (attached_at, id) > (?, ?)
 		ORDER BY attached_at, id
@@ -291,7 +321,7 @@ func (s *Store) ListAttachments(pageSize int, pageToken string) ([]Attachment, s
 
 func (s *Store) GetAllAttachments() ([]Attachment, error) {
 	rows, err := s.db.Query(`
-		SELECT id, target, type, mode, dns_mode, dns_address, direction, metadata, attached_at
+		SELECT id, target, type, mode, dns_mode, dns_address, direction, cleanup_needed, pin_dir, pin_path_known, metadata, attached_at
 		FROM attachments ORDER BY attached_at, id
 	`)
 	if err != nil {
@@ -338,8 +368,9 @@ type scanner interface {
 
 func scanAttachment(s scanner) (*Attachment, error) {
 	var a Attachment
+	var cleanupNeeded, pinPathKnown int
 	var metadata, attachedAt string
-	err := s.Scan(&a.ID, &a.Target, &a.Type, &a.Mode, &a.DnsMode, &a.DnsAddress, &a.Direction, &metadata, &attachedAt)
+	err := s.Scan(&a.ID, &a.Target, &a.Type, &a.Mode, &a.DnsMode, &a.DnsAddress, &a.Direction, &cleanupNeeded, &a.PinDir, &pinPathKnown, &metadata, &attachedAt)
 	if err == sql.ErrNoRows {
 		return nil, sql.ErrNoRows
 	}
@@ -350,6 +381,8 @@ func scanAttachment(s scanner) (*Attachment, error) {
 	if err := json.Unmarshal([]byte(metadata), &a.Metadata); err != nil {
 		return nil, fmt.Errorf("unmarshaling metadata: %w", err)
 	}
+	a.CleanupNeeded = cleanupNeeded != 0
+	a.PinPathKnown = pinPathKnown != 0
 	// Parse with RFC3339Nano: it accepts the canonical fixed-width layout as
 	// well as any pre-migration value, keeping reads tolerant of old rows.
 	if a.AttachedAt, err = time.Parse(time.RFC3339Nano, attachedAt); err != nil {

@@ -7,7 +7,9 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -36,12 +38,16 @@ type Server struct {
 	mu          sync.RWMutex
 	stopping    bool
 	attachWG    sync.WaitGroup
+	commandWG   sync.WaitGroup
+	dnsWatchWG  sync.WaitGroup
 	portPool    map[int]bool
 	attachments map[string]*attachmentState
 	targetIndex map[string]string // target -> attachment ID (for reverse lookup on removal)
 
-	cpClient atomic.Pointer[ControlPlaneClient]
-	watcher  *TargetWatcher
+	cpClient     atomic.Pointer[ControlPlaneClient]
+	watcher      *TargetWatcher
+	startWatcher func() error
+	stopWatcher  func()
 
 	// TTL janitor state. now is injectable for deterministic tests.
 	now                func() time.Time
@@ -53,6 +59,13 @@ type Server struct {
 	// dnsMinFilterTTL floors the lifetime of DNS-resolved IPs in the filter
 	// (see config dns.min_filter_ttl).
 	dnsMinFilterTTL time.Duration
+	// dnsListenIP is the concrete, startup-resolved listener address returned
+	// to workloads and protected in each attachment's allow map. Wildcard
+	// listeners are rejected because they are not usable resolver endpoints.
+	dnsListenIP string
+	// defaultDNSUpstream is the validated/canonical daemon-global fallback for
+	// attachments whose authoritative DNS config has no overrides.
+	defaultDNSUpstream string
 	// maxRuleEntries sizes each eBPF rule map at filter load time
 	// (see config filter.max_rule_entries; 0 = compiled-in default).
 	maxRuleEntries uint32
@@ -77,18 +90,49 @@ type Server struct {
 	// ensurePinRoot prepares pinRoot on bpffs (production: ensureBPFPinRoot;
 	// a seam so unit tests can use plain temp directories).
 	ensurePinRoot func(pinRoot string) error
-	// targetExists reports whether an attachment target is still present
+	// targetPresence reports whether an attachment target is still present
 	// (production: targetPresent; a seam so unit tests can restore
 	// attachments whose fake targets never existed).
-	targetExists func(attachType apiv1.AttachmentType, target string) bool
+	targetPresence func(attachType apiv1.AttachmentType, target string) (bool, error)
 	// targetIdentity resolves the kernel object an attachment name/path
 	// currently denotes (ifindex or cgroup id). Attach validates this identity
 	// across filter construction and watcher registration so a same-name/path
 	// replacement can never bind the filter and watcher to different objects.
 	targetIdentity func(attachType apiv1.AttachmentType, target string) (uint64, error)
+	// watchTarget registers the exact target identity with the shared watcher.
+	// Keeping this boundary injectable lets restore tests distinguish ambiguous
+	// registration I/O from a typed identity change on every build platform.
+	watchTarget func(attachType apiv1.AttachmentType, target string, identity uint64) (watchToken, error)
+	// resolveDNSListenIP canonicalizes configured/persisted listener hostnames
+	// once per attachment restore. It is a seam for deterministic dual-stack
+	// and DNS-change tests; production uses resolveConcreteDNSListenIP.
+	resolveDNSListenIP func(string) (string, error)
+	// bindDNSServer and serveDNSServer keep restore/attach rollback tests able
+	// to exercise each half of the dual-protocol listener lifecycle without
+	// weakening DNSServer's concrete production implementation.
+	bindDNSServer  func(*DNSServer) error
+	serveDNSServer func(*DNSServer) error
+	// Attachment-store seams let rollback tests inject a one-shot primary
+	// failure while keeping degraded-state persistence available. Production
+	// always uses the Store methods directly through these fields.
+	saveAttachment   func(*store.Attachment) error
+	deleteAttachment func(string) error
+	// removePinDir is the restart cleanup primitive for durable tombstones.
+	// Removing every bpffs entry drops the persistent kernel references even
+	// though the userspace handles belonged to the previous process.
+	removePinDir    func(string) error
+	readPinRoot     func(string) ([]os.DirEntry, error)
+	validatePinRoot func(string) error
 }
 
 type attachmentState struct {
+	// mutationMu is the exact-state admission/drain barrier. Ordinary filter,
+	// DNS, TTL, and stats work holds it for reading after revalidating live
+	// ownership. Teardown first closes admission under Server.mu, then takes it
+	// for writing to drain all earlier work before closing filter handles.
+	mutationMu      sync.RWMutex
+	mutationsClosed bool // guarded by Server.mu
+
 	info   *store.Attachment
 	dns    *DNSServer
 	filter filter.Filter
@@ -112,6 +156,257 @@ type attachmentState struct {
 	// ttls tracks expiry deadlines for this attachment's TTL'd CIDR entries
 	// and serializes its CIDR-rule mutations. See ttlRegistry.
 	ttls *ttlRegistry
+	// Fresh Attach keeps the staged filter BLOCK_ALL until setup commits.
+	// A fire-and-forget attach-purpose SubscribedAck waits on setupDone before
+	// it may mutate policy; teardown closes it with setupCommitted false.
+	setupDone      chan struct{}
+	setupDoneOnce  sync.Once
+	setupCommitted atomic.Bool
+	dnsWatchOnce   sync.Once
+	// cleanupNeeded marks a failed Attach/Detach whose target, port, and
+	// durable BLOCK_ALL row are deliberately retained until destructive
+	// cleanup can be retried. Ordinary policy/DNS commands must reject it.
+	cleanupNeeded bool // guarded by Server.mu
+}
+
+func (s *attachmentState) finishSetup(committed bool) {
+	if s == nil || s.setupDone == nil {
+		return
+	}
+	if committed {
+		s.setupCommitted.Store(true)
+	}
+	s.setupDoneOnce.Do(func() { close(s.setupDone) })
+}
+
+// beginAttachmentMutation admits one exact-state operation and returns a
+// release callback. The double check around mutationMu closes the snapshot
+// race with teardown: once teardown publishes mutationsClosed, no waiter can
+// pass the second check, while already-admitted readers are drained before
+// any filter/DNS handle is closed.
+func (s *Server) beginAttachmentMutation(id string) (*attachmentState, func(), error) {
+	s.mu.RLock()
+	state := s.attachments[id]
+	allowStopping := attachmentSetupApplyInProgress(state)
+	if s.stopping && !allowStopping {
+		s.mu.RUnlock()
+		return nil, nil, fmt.Errorf("daemon is stopping")
+	}
+	if state == nil {
+		s.mu.RUnlock()
+		return nil, nil, fmt.Errorf("attachment not found: %s", id)
+	}
+	if state.cleanupNeeded || state.mutationsClosed {
+		s.mu.RUnlock()
+		return nil, nil, fmt.Errorf("attachment %s is not accepting mutations", id)
+	}
+	s.mu.RUnlock()
+
+	state.mutationMu.RLock()
+	s.mu.RLock()
+	live := (!s.stopping || attachmentSetupApplyInProgress(state)) && s.attachments[id] == state && !state.cleanupNeeded && !state.mutationsClosed
+	s.mu.RUnlock()
+	if !live {
+		state.mutationMu.RUnlock()
+		return nil, nil, fmt.Errorf("attachment %s is not accepting mutations", id)
+	}
+	return state, state.mutationMu.RUnlock, nil
+}
+
+func (s *Server) beginControlCommand(_ string) (func(), bool) {
+	s.mu.Lock()
+	if s.stopping {
+		s.mu.Unlock()
+		return nil, false
+	}
+	s.commandWG.Add(1)
+	s.mu.Unlock()
+	return func() {
+		s.commandWG.Done()
+	}, true
+}
+
+func attachmentSetupApplyInProgress(state *attachmentState) bool {
+	if state == nil || state.setupDone == nil || !state.setupCommitted.Load() {
+		return false
+	}
+	select {
+	case <-state.setupDone:
+		return false
+	default:
+		return true
+	}
+}
+
+func (s *Server) startDNSLifecycleWatch(id string, state *attachmentState) {
+	if state == nil || state.dns == nil || state.dns.Done() == nil {
+		return
+	}
+	state.dnsWatchOnce.Do(func() {
+		s.dnsWatchWG.Add(1)
+		go func(dnsServer *DNSServer) {
+			defer s.dnsWatchWG.Done()
+			<-dnsServer.Done()
+			fatalErr := dnsServer.Err()
+			if fatalErr == nil {
+				return // intentional Stop/cleanup
+			}
+
+			state.reconcileMu.Lock()
+			defer state.reconcileMu.Unlock()
+			s.mu.RLock()
+			live := !s.stopping && s.attachments[id] == state && state.dns == dnsServer && !state.cleanupNeeded && !state.mutationsClosed
+			s.mu.RUnlock()
+			if !live {
+				return
+			}
+			quarantineErr := s.quarantineAttachment(id, state)
+			s.logger.Error().Err(errors.Join(fatalErr, quarantineErr)).Str("id", id).
+				Msg("attachment DNS listener died; attachment quarantined block-all")
+			if cpClient := s.cpClient.Load(); cpClient != nil {
+				cpClient.SendUnsubscribed(&apiv1.Unsubscribed{
+					Id: id, Reason: apiv1.UnsubscribeReason_UNSUBSCRIBE_REASON_ERROR,
+					Error: "attachment DNS listener died",
+				})
+			}
+		}(state.dns)
+	})
+}
+
+func dnsServerSetupError(dnsServer *DNSServer) error {
+	if dnsServer == nil || dnsServer.Done() == nil {
+		return nil
+	}
+	select {
+	case <-dnsServer.Done():
+		if err := dnsServer.Err(); err != nil {
+			return err
+		}
+		return fmt.Errorf("DNS server stopped during attachment setup")
+	default:
+		return nil
+	}
+}
+
+type restoreStartResource struct {
+	id                   string
+	state                *attachmentState
+	filter               filter.Filter
+	dns                  *DNSServer
+	adopted              bool
+	bootstrap            *net.IPNet
+	bootstrapInstalled   bool
+	watch                watchToken
+	originalDNSAddress   string
+	originalPinDir       string
+	originalPinPathKnown bool
+	canonicalDNSAddress  string
+	addressPersisted     bool
+	pinIdentityChanged   bool
+}
+
+// rollbackRestoreStart unwinds every userspace resource acquired by this
+// Start invocation. Adopted filters are only Closed (pins/links remain), while
+// recreated staged filters are Detached. Called with Server.mu held.
+func (s *Server) rollbackRestoreStart(resources []*restoreStartResource) error {
+	var rollbackErrs []error
+	persistBlockAll := func(resource *restoreStartResource, cause string) {
+		resource.state.info.Mode = apiv1.PolicyMode_POLICY_MODE_BLOCK_ALL.String()
+		if saveErr := s.saveAttachment(cloneAttachment(resource.state.info)); saveErr != nil {
+			rollbackErrs = append(rollbackErrs, fmt.Errorf("persisting block-all for %s after %s: %w", resource.id, cause, saveErr))
+		}
+	}
+	persistCleanup := func(resource *restoreStartResource, cause string) {
+		resource.state.info.Mode = apiv1.PolicyMode_POLICY_MODE_BLOCK_ALL.String()
+		resource.state.info.CleanupNeeded = true
+		resource.state.cleanupNeeded = true
+		if saveErr := s.saveAttachment(cloneAttachment(resource.state.info)); saveErr != nil {
+			rollbackErrs = append(rollbackErrs, fmt.Errorf("persisting cleanup tombstone for %s after %s: %w", resource.id, cause, saveErr))
+		}
+	}
+	forceBlockAll := func(resource *restoreStartResource, cause string) {
+		if modeErr := resource.filter.SetMode(filter.ModeBlockAll); modeErr != nil {
+			rollbackErrs = append(rollbackErrs, fmt.Errorf("forcing %s block-all after %s: %w", resource.id, cause, modeErr))
+			s.logger.Error().Err(modeErr).Str("id", resource.id).Msg("failed to force block-all during startup rollback")
+		}
+		// Persist the desired fail-closed recovery state even when the immediate
+		// map write failed; the returned error makes that ambiguity observable.
+		persistBlockAll(resource, cause)
+	}
+	for i := len(resources) - 1; i >= 0; i-- {
+		resource := resources[i]
+		if resource.watch.valid() {
+			switch parseAttachmentType(resource.state.info.Type) {
+			case apiv1.AttachmentType_ATTACHMENT_TYPE_TC:
+				s.watcher.UnwatchInterface(resource.watch)
+			case apiv1.AttachmentType_ATTACHMENT_TYPE_CGROUP:
+				s.watcher.UnwatchCgroup(resource.watch)
+			}
+		}
+		if resource.dns != nil {
+			if err := resource.dns.Stop(); err != nil {
+				s.logger.Warn().Err(err).Str("id", resource.id).Msg("failed to stop DNS during startup rollback")
+				rollbackErrs = append(rollbackErrs, fmt.Errorf("stopping DNS for %s: %w", resource.id, err))
+			}
+		}
+		// Adopted maps survive rollback, so precisely remove the system rule
+		// added by this Start. Recreated maps are destroyed wholesale below;
+		// attempting a per-rule compensation first can spuriously persist
+		// BLOCK_ALL even when Detach cleanly removes all staged enforcement.
+		if resource.adopted && resource.bootstrapInstalled {
+			if err := resource.state.ttls.removeSystem(resource.filter, resource.bootstrap, listAllow); err != nil {
+				s.logger.Error().Err(err).Str("id", resource.id).Msg("failed to restore pre-start DNS bootstrap state")
+				rollbackErrs = append(rollbackErrs, fmt.Errorf("restoring bootstrap for %s: %w", resource.id, err))
+				// A failed removal would otherwise leave a newly broadened allowlist
+				// pinned after startup abort. Force the effective mode fail-closed.
+				forceBlockAll(resource, "bootstrap removal failure")
+			}
+		}
+		if resource.filter != nil {
+			if resource.adopted {
+				if err := resource.filter.Close(); err != nil {
+					s.logger.Warn().Err(err).Str("id", resource.id).Msg("failed to close adopted filter during startup rollback")
+					rollbackErrs = append(rollbackErrs, fmt.Errorf("closing adopted filter for %s: %w", resource.id, err))
+				}
+			} else {
+				// Detach may close map FDs even when unpinning fails, so stage the
+				// surviving map fail-closed while it is certainly still writable.
+				// A successful Detach discards this staged mode and preserves the
+				// original store row; only ambiguous cleanup is persisted BLOCK_ALL.
+				preDetachModeErr := resource.filter.SetMode(filter.ModeBlockAll)
+				if detachErr := resource.filter.Detach(); detachErr != nil {
+					s.logger.Warn().Err(detachErr).Str("id", resource.id).Msg("failed to detach recreated filter during startup rollback")
+					rollbackErrs = append(rollbackErrs, fmt.Errorf("detaching recreated filter for %s: %w", resource.id, detachErr))
+					if preDetachModeErr != nil {
+						rollbackErrs = append(rollbackErrs, fmt.Errorf("forcing %s block-all before failed detach: %w", resource.id, preDetachModeErr))
+					}
+					persistCleanup(resource, "recreated filter detach failure")
+				}
+				resource.state.ttls = newTTLRegistry()
+			}
+		}
+		resource.state.filter = nil
+		resource.state.dns = nil
+		resource.state.watch = watchToken{}
+		resource.state.needsResync = false
+		// A failed recreated Detach is now a durable cleanup tombstone and must
+		// retain the exact pin identity used by that failed attempt. Ordinary
+		// startup rollback restores the pre-Start row exactly.
+		if !resource.state.cleanupNeeded {
+			if resource.originalDNSAddress != "" {
+				resource.state.info.DnsAddress = resource.originalDNSAddress
+			}
+			resource.state.info.PinDir = resource.originalPinDir
+			resource.state.info.PinPathKnown = resource.originalPinPathKnown
+		}
+		if resource.addressPersisted && !resource.state.cleanupNeeded {
+			if err := s.saveAttachment(cloneAttachment(resource.state.info)); err != nil {
+				s.logger.Error().Err(err).Str("id", resource.id).Msg("failed to restore persisted attachment identity during startup rollback")
+				rollbackErrs = append(rollbackErrs, fmt.Errorf("restoring persisted attachment identity for %s: %w", resource.id, err))
+			}
+		}
+	}
+	return errors.Join(rollbackErrs...)
 }
 
 func NewServer(cfg *config.Config, st *store.Store, logger zerolog.Logger, version string) (*Server, error) {
@@ -139,6 +434,21 @@ func NewServer(cfg *config.Config, st *store.Store, logger zerolog.Logger, versi
 	if cfg.Filter.MaxRuleEntries > 0 {
 		maxRuleEntries = uint32(cfg.Filter.MaxRuleEntries)
 	}
+	dnsListenIP, err := resolveConcreteDNSListenIP(cfg.DNS.ListenAddr)
+	if err != nil {
+		return nil, fmt.Errorf("resolving dns.listen_addr: %w", err)
+	}
+	defaultUpstreams, err := normalizeUpstreamServers(nil, cfg.DNS.Upstream)
+	if err != nil {
+		return nil, fmt.Errorf("validating dns.upstream: %w", err)
+	}
+	pinRoot := cfg.Filter.BPFPinDir
+	if pinRoot != "" {
+		pinRoot, err = canonicalizeConfiguredPath(pinRoot)
+		if err != nil {
+			return nil, fmt.Errorf("canonicalizing filter.bpf_pin_dir: %w", err)
+		}
+	}
 
 	s := &Server{
 		cfg:                cfg,
@@ -154,17 +464,30 @@ func NewServer(cfg *config.Config, st *store.Store, logger zerolog.Logger, versi
 		ttlJanitorInterval: janitorInterval,
 		janitorStop:        make(chan struct{}),
 		dnsMinFilterTTL:    dnsMinFilterTTL,
+		dnsListenIP:        dnsListenIP,
+		defaultDNSUpstream: defaultUpstreams[0],
 		maxRuleEntries:     maxRuleEntries,
-		pinRoot:            cfg.Filter.BPFPinDir,
+		pinRoot:            pinRoot,
 		detachOnStop:       cfg.Filter.DetachOnStop,
 		newFilter:          createFilter,
 		loadPinnedFilter:   loadPinnedFilter,
 		ensurePinRoot:      ensureBPFPinRoot,
-		targetExists:       targetPresent,
+		targetPresence:     targetPresent,
 		targetIdentity:     currentTargetIdentity,
+		resolveDNSListenIP: resolveConcreteDNSListenIP,
+		bindDNSServer:      (*DNSServer).Bind,
+		serveDNSServer:     (*DNSServer).Serve,
+		saveAttachment:     st.SaveAttachment,
+		deleteAttachment:   st.DeleteAttachment,
+		removePinDir:       os.RemoveAll,
+		readPinRoot:        os.ReadDir,
+		validatePinRoot:    validateExistingBPFPinRoot,
 	}
 
 	s.watcher = NewTargetWatcher(logger, s.handleTargetRemoved)
+	s.startWatcher = s.watcher.Start
+	s.stopWatcher = s.watcher.Stop
+	s.watchTarget = s.registerTargetWatch
 
 	for port := cfg.DNS.PortMin; port <= cfg.DNS.PortMax; port++ {
 		s.portPool[port] = false
@@ -175,7 +498,11 @@ func NewServer(cfg *config.Config, st *store.Store, logger zerolog.Logger, versi
 		return nil, fmt.Errorf("loading existing attachments: %w", err)
 	}
 	for i := range existing {
-		s.attachments[existing[i].ID] = &attachmentState{info: &existing[i], ttls: newTTLRegistry()}
+		s.attachments[existing[i].ID] = &attachmentState{
+			info:          &existing[i],
+			ttls:          newTTLRegistry(),
+			cleanupNeeded: existing[i].CleanupNeeded,
+		}
 		s.targetIndex[existing[i].Target] = existing[i].ID
 		// Only mark ports that belong to the configured pool: a persisted
 		// port outside [PortMin, PortMax] (e.g. after a config change) must
@@ -190,8 +517,59 @@ func NewServer(cfg *config.Config, st *store.Store, logger zerolog.Logger, versi
 	return s, nil
 }
 
+// canonicalizeConfiguredPath resolves symlinks in the longest existing
+// prefix, then appends any not-yet-created suffix. This makes paths stable
+// before they are persisted (notably macOS /var -> /private/var) without
+// requiring the configured leaf to exist before Start prepares it.
+func canonicalizeConfiguredPath(path string) (string, error) {
+	abs, err := filepath.Abs(filepath.Clean(path))
+	if err != nil {
+		return "", err
+	}
+	existing := abs
+	var suffix []string
+	for {
+		if _, err := os.Lstat(existing); err == nil {
+			break
+		} else if !os.IsNotExist(err) {
+			return "", err
+		}
+		parent := filepath.Dir(existing)
+		if parent == existing {
+			return "", fmt.Errorf("no existing prefix for %s", abs)
+		}
+		suffix = append(suffix, filepath.Base(existing))
+		existing = parent
+	}
+	resolved, err := filepath.EvalSymlinks(existing)
+	if err != nil {
+		return "", err
+	}
+	for i := len(suffix) - 1; i >= 0; i-- {
+		resolved = filepath.Join(resolved, suffix[i])
+	}
+	return filepath.Clean(resolved), nil
+}
+
+func (s *Server) resetWatcher() {
+	watcher := NewTargetWatcher(s.logger, s.handleTargetRemoved)
+	watcher.setTargetIdentityResolver(s.targetIdentity)
+	s.watcher = watcher
+	s.startWatcher = watcher.Start
+	s.stopWatcher = watcher.Stop
+}
+
 func (s *Server) SetControlPlaneClient(cp *ControlPlaneClient) {
 	s.cpClient.Store(cp)
+}
+
+func (s *Server) enterTerminal(cause error) {
+	s.mu.Lock()
+	s.stopping = true
+	s.mu.Unlock()
+	if cpClient := s.cpClient.Load(); cpClient != nil {
+		cpClient.stopAdmission(cause)
+	}
 }
 
 // setTargetIdentityResolver is a test seam that keeps Server's lifecycle
@@ -208,15 +586,67 @@ func (s *Server) Start() error {
 			return fmt.Errorf("preparing BPF pin root: %w", err)
 		}
 	}
+	// Cleanup tombstones are never restored as policy attachments. They were
+	// durably written before a prior destructive detach became ambiguous, so
+	// complete that exact teardown before starting watchers, DNS, or control-
+	// plane resync. Ownership is released only after both pin removal and row
+	// deletion are proven; a failure leaves the tombstone retryable on the
+	// next Start/restart.
+	if err := s.retryDurableCleanup(); err != nil {
+		return err
+	}
+	// Start the shared watcher before any restored filter is mutated. A global
+	// watcher startup failure is therefore a zero-resource, exact-policy abort.
+	if err := s.startWatcher(); err != nil {
+		return fmt.Errorf("starting target watcher: %w", err)
+	}
 
 	s.mu.Lock()
 	var toRemove []string
-	for id, state := range s.attachments {
+	var resources []*restoreStartResource
+	abortStart := func(err error) error {
+		rollbackErr := s.rollbackRestoreStart(resources)
+		s.mu.Unlock()
+		s.stopWatcher()
+		s.resetWatcher()
+		return errors.Join(err, rollbackErr)
+	}
+	ids := make([]string, 0, len(s.attachments))
+	for id := range s.attachments {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		state := s.attachments[id]
+		originalPinDir := state.info.PinDir
+		originalPinPathKnown := state.info.PinPathKnown
+		pinDir := state.info.PinDir
+		pinIdentityChanged := false
+		// Legacy rows did not record pin identity. Establish it from the current
+		// configuration before creating/adopting anything. A known unpinned row
+		// may opt into newly-enabled pinning; a known non-empty path is retained
+		// even if config changed so old pinned enforcement is never orphaned.
+		if !state.info.PinPathKnown || (pinDir == "" && s.pinRoot != "") {
+			pinDir = s.pinDirFor(id)
+			state.info.PinDir = pinDir
+			state.info.PinPathKnown = true
+			pinIdentityChanged = true
+		}
+		if pinDir != "" {
+			validatedPinDir, err := s.validatedCleanupPinDir(id, state.info)
+			if err != nil {
+				return abortStart(fmt.Errorf("validating persisted pin identity for attachment %s: %w", id, err))
+			}
+			pinDir = validatedPinDir
+		}
 		attachType := parseAttachmentType(state.info.Type)
 		mode := parsePolicyMode(state.info.Mode)
 		direction := parseTcDirection(state.info.Direction)
 		expectedIdentity, err := s.targetIdentity(attachType, state.info.Target)
 		if err != nil {
+			if !isExplicitTargetNotFound(err) {
+				return abortStart(fmt.Errorf("resolving target identity for attachment %s: %w", id, err))
+			}
 			s.logger.Warn().Err(err).
 				Str("id", id).
 				Str("target", state.info.Target).
@@ -225,20 +655,33 @@ func (s *Server) Start() error {
 			continue
 		}
 
-		ebpfFilter, adopted, err := s.restoreFilter(id, state.info.Target, attachType, mode, direction)
+		ebpfFilter, adopted, err := s.restoreFilter(id, pinDir, state.info.Target, attachType, mode, direction)
 		if err != nil {
 			var abort *restoreAbortError
 			if errors.As(err, &abort) {
-				s.mu.Unlock()
-				return fmt.Errorf("restoring attachment %s: %w", id, abort.err)
+				return abortStart(fmt.Errorf("restoring attachment %s: %w", id, abort.err))
+			}
+			if !isExplicitTargetStale(err) {
+				return abortStart(fmt.Errorf("restoring attachment %s while target remains present: %w", id, err))
 			}
 			s.logger.Warn().Err(err).
 				Str("id", id).
 				Str("target", state.info.Target).
-				Msg("failed to restore filter, target may be gone")
+				Msg("target explicitly disappeared during filter restore; scheduling stale attachment cleanup")
 			toRemove = append(toRemove, id)
 			continue
 		}
+		resource := &restoreStartResource{
+			id:                   id,
+			state:                state,
+			filter:               ebpfFilter,
+			adopted:              adopted,
+			originalDNSAddress:   state.info.DnsAddress,
+			originalPinDir:       originalPinDir,
+			originalPinPathKnown: originalPinPathKnown,
+			pinIdentityChanged:   pinIdentityChanged,
+		}
+		resources = append(resources, resource)
 		if adopted {
 			if err := s.seedAdoptedState(id, state, ebpfFilter); err != nil {
 				// Inventory is required for an authoritative delta reconcile: if a
@@ -246,90 +689,150 @@ func (s *Server) Start() error {
 				// falsely report convergence while leaving stale enforcement behind.
 				// Abort startup and Close (not Detach) so the pins keep enforcing the
 				// last-known policy for a clean retry.
-				if closeErr := ebpfFilter.Close(); closeErr != nil {
-					s.logger.Warn().Err(closeErr).Str("id", id).Msg("failed to close adopted filter after inventory failure")
-				}
-				s.mu.Unlock()
-				return fmt.Errorf("inventorying re-adopted attachment %s: %w", id, err)
+				return abortStart(fmt.Errorf("inventorying re-adopted attachment %s: %w", id, err))
 			}
 		}
-
+		canonicalDNSAddress, bootstrapCIDR, setupErr := canonicalDNSListenerAddress(resource.originalDNSAddress, s.resolveDNSListenIP)
 		var proxyFunc DnsProxyFunc
 		if cpClient := s.cpClient.Load(); cpClient != nil {
 			proxyFunc = cpClient.MakeProxyFunc(id)
 		}
-		sink := s.newDNSFilterSink(id, ebpfFilter, state.ttls)
-		dnsServer := NewDNSServer(id, state.info.DnsAddress, s.cfg.DNS.Upstream, s.logger, sink, proxyFunc)
-		if err := dnsServer.Start(); err != nil {
-			s.logger.Warn().Err(err).
-				Str("id", id).
-				Str("target", state.info.Target).
-				Msg("failed to start DNS server on restore")
-			if ebpfFilter != nil {
-				// The attachment is being dropped for good: Detach (not
-				// Close) so its pinned state is destroyed too.
-				if err := ebpfFilter.Detach(); err != nil {
-					s.logger.Warn().Err(err).Str("id", id).Msg("error detaching filter after restore DNS failure")
-				}
+		dnsServer := NewDNSServer(id, canonicalDNSAddress, s.defaultDNSUpstream, s.logger,
+			s.newDNSFilterSink(id, ebpfFilter, state.ttls), proxyFunc)
+		// Domain rules and per-attachment upstream overrides are authoritative
+		// CP state and are not persisted. Restoring ALLOWLIST/DENYLIST/PROXY as
+		// constructor-default DISABLED would forward everything during an
+		// outage. Preserve explicit DISABLED, but hold every filtering mode in
+		// an empty ALLOWLIST (REFUSED) until the full SubscribedAck arrives.
+		if persistedDNSMode := parseDnsMode(state.info.DnsMode); persistedDNSMode != apiv1.DnsMode_DNS_MODE_DISABLED {
+			dnsServer.SetMode(apiv1.DnsMode_DNS_MODE_ALLOWLIST)
+		}
+		resource.dns = dnsServer
+		if setupErr == nil {
+			setupErr = s.bindDNSServer(dnsServer)
+		}
+		if setupErr == nil {
+			setupErr = s.serveDNSServer(dnsServer)
+		}
+		if setupErr != nil {
+			if adopted {
+				return abortStart(fmt.Errorf("starting DNS server for re-adopted attachment %s: %w", id, setupErr))
 			}
-			toRemove = append(toRemove, id)
-			continue
+			return abortStart(fmt.Errorf("starting DNS server for recreated attachment %s: %w", id, setupErr))
 		}
 
-		var (
-			token    watchToken
-			watchErr = s.validateTargetIdentity(attachType, state.info.Target, expectedIdentity)
-		)
+		watchErr := s.validateTargetIdentity(attachType, state.info.Target, expectedIdentity)
 		if watchErr == nil {
-			switch attachType {
-			case apiv1.AttachmentType_ATTACHMENT_TYPE_TC:
-				token, watchErr = s.watcher.WatchInterface(state.info.Target, expectedIdentity)
-			case apiv1.AttachmentType_ATTACHMENT_TYPE_CGROUP:
-				token, watchErr = s.watcher.WatchCgroup(state.info.Target, expectedIdentity)
-			}
+			resource.watch, watchErr = s.watchTarget(attachType, state.info.Target, expectedIdentity)
 		}
 		if watchErr != nil {
-			s.logger.Warn().Err(watchErr).
-				Str("id", id).
-				Str("target", state.info.Target).
-				Msg("failed to watch target on restore")
-			if err := dnsServer.Stop(); err != nil {
-				s.logger.Warn().Err(err).Str("id", id).Msg("error stopping DNS server after restore watch failure")
+			restoreKind := "recreated"
+			if adopted {
+				restoreKind = "re-adopted"
 			}
-			if ebpfFilter != nil {
-				// Dropped for good: Detach so pinned state goes too.
-				if err := ebpfFilter.Detach(); err != nil {
-					s.logger.Warn().Err(err).Str("id", id).Msg("error detaching filter after restore watch failure")
-				}
+			triggerErr := fmt.Errorf("watching %s attachment %s: %w", restoreKind, id, watchErr)
+			if !isExplicitTargetStale(watchErr) {
+				return abortStart(triggerErr)
+			}
+			// An exact identity change/not-found result proves this persisted
+			// attachment no longer names the object its filter targeted. Close or
+			// detach the staged resource, then route the durable row through the
+			// same tombstone-first stale cleanup as an initially missing target.
+			rollbackErr := s.rollbackRestoreStart(resources[len(resources)-1:])
+			resources = resources[:len(resources)-1]
+			if rollbackErr != nil {
+				return abortStart(errors.Join(triggerErr, rollbackErr))
 			}
 			toRemove = append(toRemove, id)
 			continue
 		}
-		state.watch = token
-		state.filter = ebpfFilter
-		state.dns = dnsServer
-		state.needsResync = true
 
+		resource.bootstrap = bootstrapCIDR
+		resource.canonicalDNSAddress = canonicalDNSAddress
+	}
+
+	// Prepare/commit boundary: every resolver is dual-protocol serving, every
+	// target has an exact watch, and every canonical endpoint is known before
+	// the first adopted map is changed. Store changes are reversible here.
+	for _, resource := range resources {
+		if resource.canonicalDNSAddress == resource.originalDNSAddress && !resource.pinIdentityChanged {
+			continue
+		}
+		resource.state.info.DnsAddress = resource.canonicalDNSAddress
+		if err := s.saveAttachment(cloneAttachment(resource.state.info)); err != nil {
+			return abortStart(fmt.Errorf("persisting concrete DNS address for attachment %s: %w", resource.id, err))
+		}
+		resource.addressPersisted = true
+	}
+	// Add-only commit. If a later add fails, rollback removes prior additions;
+	// an ambiguous removal failure is forced BLOCK_ALL by rollbackRestoreStart.
+	for i := 0; i < len(resources); {
+		resource := resources[i]
+		if err := resource.state.ttls.addSystem(resource.filter, resource.bootstrap, listAllow); err != nil {
+			if resource.adopted {
+				return abortStart(fmt.Errorf("installing protected DNS bootstrap route for attachment %s: %w", resource.id, err))
+			}
+			return abortStart(fmt.Errorf("installing protected DNS bootstrap route for recreated attachment %s: %w", resource.id, err))
+		}
+		resource.bootstrapInstalled = true
+		i++
+	}
+	for _, resource := range resources {
+		state := resource.state
+		if err := dnsServerSetupError(resource.dns); err != nil {
+			return abortStart(fmt.Errorf("DNS listener exited before restore commit for attachment %s: %w", resource.id, err))
+		}
+		state.info.DnsAddress = resource.canonicalDNSAddress
+		state.watch = resource.watch
+		state.filter = resource.filter
+		state.dns = resource.dns
+		state.needsResync = true
 		s.logger.Info().
-			Str("id", id).
+			Str("id", resource.id).
 			Str("target", state.info.Target).
-			Str("type", attachType.String()).
-			Bool("readopted_from_pins", adopted).
+			Str("type", state.info.Type).
+			Bool("readopted_from_pins", resource.adopted).
 			Msg("restored attachment")
 	}
 
 	for _, id := range toRemove {
 		state := s.attachments[id]
-		if state != nil {
-			delete(s.targetIndex, state.info.Target)
-			port := extractPort(state.info.DnsAddress)
-			if port > 0 {
-				s.releasePort(port)
+		if state == nil {
+			continue
+		}
+		// Persist the cleanup intent before deleting the row. If deletion is
+		// unavailable, retain target/port ownership and abort startup; the next
+		// Start sees the tombstone and retries cleanup instead of restoring it.
+		state.info.Mode = apiv1.PolicyMode_POLICY_MODE_BLOCK_ALL.String()
+		state.info.CleanupNeeded = true
+		state.cleanupNeeded = true
+		if !state.info.PinPathKnown {
+			// This case follows a recreated-resource rollback that restored the
+			// legacy row after successfully Detaching the exact current path.
+			state.info.PinDir = s.pinDirFor(id)
+			state.info.PinPathKnown = true
+		}
+		if err := s.saveAttachment(cloneAttachment(state.info)); err != nil {
+			return abortStart(fmt.Errorf("persisting stale attachment cleanup tombstone %s: %w", id, err))
+		}
+		pinDir, err := s.validatedCleanupPinDir(id, state.info)
+		if err != nil {
+			return abortStart(err)
+		}
+		if pinDir != "" {
+			if err := s.removePinDir(pinDir); err != nil {
+				return abortStart(fmt.Errorf("removing pinned state for stale attachment %s: %w", id, err))
 			}
 		}
+		if err := s.deleteAttachment(id); err != nil {
+			return abortStart(fmt.Errorf("deleting stale attachment %s: %w", id, err))
+		}
 		delete(s.attachments, id)
-		if err := s.store.DeleteAttachment(id); err != nil {
-			s.logger.Error().Err(err).Str("id", id).Msg("failed to delete stale attachment from store")
+		if s.targetIndex[state.info.Target] == id {
+			delete(s.targetIndex, state.info.Target)
+		}
+		if port := extractPort(state.info.DnsAddress); port > 0 {
+			s.releasePort(port)
 		}
 	}
 
@@ -338,35 +841,116 @@ func (s *Server) Start() error {
 	// above) is unowned — remove it so no stale enforcement or kernel
 	// objects leak.
 	if s.pinRoot != "" {
-		if entries, err := os.ReadDir(s.pinRoot); err != nil {
-			s.logger.Warn().Err(err).Msg("failed to scan BPF pin root for orphans")
-		} else {
-			for _, entry := range entries {
-				if !entry.IsDir() {
-					continue
-				}
-				if _, ok := s.attachments[entry.Name()]; ok {
-					continue
-				}
-				orphan := filepath.Join(s.pinRoot, entry.Name())
-				if err := os.RemoveAll(orphan); err != nil {
-					s.logger.Warn().Err(err).Str("pin_dir", orphan).Msg("failed to remove orphaned BPF pin dir")
-				} else {
-					s.logger.Info().Str("pin_dir", orphan).Msg("removed orphaned BPF pin dir (no matching attachment)")
+		entries, err := s.readPinRoot(s.pinRoot)
+		if err != nil {
+			return abortStart(fmt.Errorf("scanning BPF pin root for orphans: %w", err))
+		}
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				continue
+			}
+			orphan := filepath.Join(s.pinRoot, entry.Name())
+			owned := false
+			for _, state := range s.attachments {
+				if state.info.PinPathKnown && state.info.PinDir == orphan {
+					owned = true
+					break
 				}
 			}
+			if owned {
+				continue
+			}
+			if err := s.removePinDir(orphan); err != nil {
+				return abortStart(fmt.Errorf("removing orphaned BPF pin dir %s: %w", orphan, err))
+			}
+			s.logger.Info().Str("pin_dir", orphan).Msg("removed orphaned BPF pin dir (no matching attachment)")
 		}
 	}
 	s.mu.Unlock()
-
-	if err := s.watcher.Start(); err != nil {
-		return fmt.Errorf("starting target watcher: %w", err)
+	for _, resource := range resources {
+		s.startDNSLifecycleWatch(resource.id, resource.state)
 	}
 
 	s.janitorWG.Add(1)
 	go s.runTTLJanitor()
 
 	return nil
+}
+
+func (s *Server) retryDurableCleanup() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ids := make([]string, 0)
+	for id, state := range s.attachments {
+		if state.cleanupNeeded || state.info.CleanupNeeded {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		state := s.attachments[id]
+		if state == nil {
+			continue
+		}
+		pinDir, err := s.validatedCleanupPinDir(id, state.info)
+		if err != nil {
+			return err
+		}
+		if pinDir != "" {
+			if err := s.removePinDir(pinDir); err != nil {
+				return fmt.Errorf("removing pinned state for cleanup attachment %s: %w", id, err)
+			}
+		}
+		if err := s.deleteAttachment(id); err != nil {
+			return fmt.Errorf("deleting cleanup attachment %s: %w", id, err)
+		}
+		delete(s.attachments, id)
+		if s.targetIndex[state.info.Target] == id {
+			delete(s.targetIndex, state.info.Target)
+		}
+		if port := extractPort(state.info.DnsAddress); port > 0 {
+			s.releasePort(port)
+		}
+		s.logger.Info().Str("id", id).Msg("completed durable attachment cleanup during startup")
+	}
+	return nil
+}
+
+func (s *Server) validatedCleanupPinDir(id string, attachment *store.Attachment) (string, error) {
+	if attachment == nil || !attachment.PinPathKnown {
+		return "", fmt.Errorf("cleanup attachment %s has unknown original pin path", id)
+	}
+	pinDir := attachment.PinDir
+	if pinDir == "" {
+		return "", nil // explicitly persisted as unpinned
+	}
+	if !filepath.IsAbs(pinDir) || filepath.Clean(pinDir) != pinDir {
+		return "", fmt.Errorf("cleanup attachment %s has non-canonical pin path %q", id, pinDir)
+	}
+	if filepath.Base(pinDir) != id {
+		return "", fmt.Errorf("cleanup attachment %s pin path %q is not its attachment leaf", id, pinDir)
+	}
+	root := filepath.Dir(pinDir)
+	if root == string(filepath.Separator) || root == "." || root == pinDir {
+		return "", fmt.Errorf("cleanup attachment %s has unsafe pin root %q", id, root)
+	}
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", fmt.Errorf("resolving cleanup attachment %s pin root %q: %w", id, root, err)
+	}
+	if resolvedRoot != root {
+		return "", fmt.Errorf("cleanup attachment %s pin root %q contains a symlink", id, root)
+	}
+	if info, err := os.Lstat(pinDir); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("cleanup attachment %s pin leaf %q is a symlink", id, pinDir)
+	} else if err != nil && !os.IsNotExist(err) {
+		return "", fmt.Errorf("checking cleanup attachment %s pin leaf %q: %w", id, pinDir, err)
+	}
+	if err := s.validatePinRoot(root); err != nil {
+		return "", fmt.Errorf("validating cleanup attachment %s pin root: %w", id, err)
+	}
+	return pinDir, nil
 }
 
 // pinDirFor returns the bpffs pin directory for an attachment, or "" when
@@ -395,8 +979,7 @@ func (e *restoreAbortError) Unwrap() error { return e.err }
 // after a detach_on_stop run or on data from a pre-pinning daemon — and the
 // caller's log line records which path was taken. adopted reports whether
 // the pinned path was used.
-func (s *Server) restoreFilter(id, target string, attachType apiv1.AttachmentType, mode apiv1.PolicyMode, direction apiv1.TcDirection) (_ filter.Filter, adopted bool, _ error) {
-	pinDir := s.pinDirFor(id)
+func (s *Server) restoreFilter(id, pinDir, target string, attachType apiv1.AttachmentType, mode apiv1.PolicyMode, direction apiv1.TcDirection) (_ filter.Filter, adopted bool, _ error) {
 	if pinDir != "" {
 		_, statErr := os.Stat(pinDir)
 		if statErr != nil && !os.IsNotExist(statErr) {
@@ -407,25 +990,59 @@ func (s *Server) restoreFilter(id, target string, attachType apiv1.AttachmentTyp
 			return nil, false, &restoreAbortError{err: fmt.Errorf("checking pin dir %s: %w", pinDir, statErr)}
 		}
 		if statErr == nil {
-			if !s.targetExists(attachType, target) {
+			present, presenceErr := s.targetPresence(attachType, target)
+			if presenceErr != nil {
+				return nil, false, &restoreAbortError{err: fmt.Errorf("checking target presence for %s: %w", target, presenceErr)}
+			}
+			if !present {
 				// The target vanished while the daemon was down, so the
-				// pinned links are defunct. Drop the pins and let the
-				// recreate path below fail against the missing target, which
-				// routes the attachment into the caller's cleanup.
+				// pinned links are defunct. Drop the pins and return a typed
+				// not-found result so the caller can authorize stale cleanup
+				// without probing a replacement filter against a gone target.
 				s.logger.Warn().Str("id", id).Str("target", target).
 					Msg("target gone while daemon was down; discarding pinned BPF state")
-				if rmErr := os.RemoveAll(pinDir); rmErr != nil {
-					s.logger.Warn().Err(rmErr).Str("id", id).Str("pin_dir", pinDir).Msg("failed to remove stale pin dir")
+				if rmErr := s.removePinDir(pinDir); rmErr != nil {
+					return nil, false, &restoreAbortError{err: fmt.Errorf("removing stale pin dir %s: %w", pinDir, rmErr)}
 				}
+				return nil, false, fmt.Errorf("target %s disappeared while daemon was down: %w", target, os.ErrNotExist)
 			} else {
 				restored, lerr := s.loadPinnedFilter(pinDir, target, attachType, direction)
 				if lerr == nil {
 					return restored, true, nil
 				}
+				// Production loaders close their own partially-opened handles,
+				// but keep this boundary defensive for alternate implementations
+				// and future loaders. A close ambiguity never authorizes unpinning.
+				if restored != nil {
+					if closeErr := restored.Close(); closeErr != nil {
+						return nil, false, &restoreAbortError{err: errors.Join(
+							fmt.Errorf("re-adopting pinned BPF state from %s: %w", pinDir, lerr),
+							fmt.Errorf("closing partially re-adopted BPF state from %s: %w", pinDir, closeErr),
+						)}
+					}
+				}
+				if errors.Is(lerr, filter.ErrPinnedStateCloseFailed) {
+					// A production loader could not prove all partial handles
+					// closed. That ambiguity vetoes every otherwise-discardable
+					// classification; preserve the exact pins for retry/inspection.
+					return nil, false, &restoreAbortError{err: fmt.Errorf("re-adopting pinned BPF state from %s: %w", pinDir, lerr)}
+				}
+				if isExplicitTargetNotFound(lerr) &&
+					!errors.Is(lerr, filter.ErrPinnedStateInvalid) {
+					// The target vanished during adoption. Let Start route the row
+					// through stale-target cleanup; do not attempt a replacement.
+					return nil, false, lerr
+				}
+				if !errors.Is(lerr, filter.ErrPinnedStateInvalid) &&
+					!errors.Is(lerr, filter.ErrPinnedTargetMismatch) {
+					// EACCES, EIO, ENOMEM, and every other untyped error leave the
+					// exact pins in place. They may still be the live enforcing state.
+					return nil, false, &restoreAbortError{err: fmt.Errorf("re-adopting pinned BPF state from %s: %w", pinDir, lerr)}
+				}
 				s.logger.Warn().Err(lerr).Str("id", id).Str("pin_dir", pinDir).
-					Msg("failed to re-adopt pinned BPF state; discarding pins and recreating empty filter")
-				if rmErr := os.RemoveAll(pinDir); rmErr != nil {
-					s.logger.Warn().Err(rmErr).Str("id", id).Str("pin_dir", pinDir).Msg("failed to remove unusable pin dir")
+					Msg("pinned BPF state is explicitly invalid or targets a replaced object; discarding pins and recreating empty filter")
+				if rmErr := s.removePinDir(pinDir); rmErr != nil {
+					return nil, false, &restoreAbortError{err: fmt.Errorf("removing unusable pin dir %s: %w", pinDir, rmErr)}
 				}
 			}
 		} else {
@@ -461,7 +1078,7 @@ func (s *Server) seedAdoptedState(id string, state *attachmentState, f filter.Fi
 			Str("live_mode", apiMode.String()).
 			Msg("store mode lagged pinned mode; trusting kernel state")
 		state.info.Mode = apiMode.String()
-		if err := s.store.SaveAttachment(cloneAttachment(state.info)); err != nil {
+		if err := s.saveAttachment(cloneAttachment(state.info)); err != nil {
 			s.logger.Warn().Err(err).Str("id", id).Msg("failed to persist re-adopted mode")
 			seedErr = errors.Join(seedErr, fmt.Errorf("persisting adopted mode: %w", err))
 		}
@@ -497,18 +1114,36 @@ func (s *Server) seedAdoptedState(id string, state *attachmentState, f filter.Fi
 	return seedErr
 }
 
-// targetPresent reports whether an attachment target still exists.
-func targetPresent(attachType apiv1.AttachmentType, target string) bool {
-	switch attachType {
-	case apiv1.AttachmentType_ATTACHMENT_TYPE_CGROUP:
-		_, err := os.Stat(target)
-		return err == nil
-	case apiv1.AttachmentType_ATTACHMENT_TYPE_TC:
-		_, err := net.InterfaceByName(target)
-		return err == nil
-	default:
-		return false
+// targetPresent distinguishes explicit target disappearance from ambiguous
+// permission/netlink/I/O failures. Only the former authorizes unpin/delete.
+func targetPresent(attachType apiv1.AttachmentType, target string) (bool, error) {
+	_, err := currentTargetIdentity(attachType, target)
+	if err == nil {
+		return true, nil
 	}
+	if isExplicitTargetNotFound(err) {
+		return false, nil
+	}
+	return false, err
+}
+
+func isExplicitTargetNotFound(err error) bool {
+	if errors.Is(err, os.ErrNotExist) {
+		return true
+	}
+	// net.InterfaceByName returns an unexported plain error on some platforms.
+	return strings.Contains(strings.ToLower(err.Error()), "no such network interface")
+}
+
+var errTargetIdentityChanged = errors.New("target identity changed")
+
+// isExplicitTargetStale is deliberately narrower than a generic setup error.
+// Destructive restore cleanup is authorized only when the target is proven
+// absent or when an exact identity comparison proves that the same name/path
+// now refers to a different object. Permission, capacity, and I/O failures are
+// ambiguous and must retain the durable attachment for a later retry.
+func isExplicitTargetStale(err error) bool {
+	return isExplicitTargetNotFound(err) || errors.Is(err, errTargetIdentityChanged)
 }
 
 func (s *Server) validateTargetIdentity(attachType apiv1.AttachmentType, target string, expected uint64) error {
@@ -517,9 +1152,20 @@ func (s *Server) validateTargetIdentity(attachType apiv1.AttachmentType, target 
 		return fmt.Errorf("resolving current target identity: %w", err)
 	}
 	if current != expected {
-		return fmt.Errorf("target identity changed during attachment setup: was %d, now %d", expected, current)
+		return fmt.Errorf("target identity changed during attachment setup: was %d, now %d: %w", expected, current, errTargetIdentityChanged)
 	}
 	return nil
+}
+
+func (s *Server) registerTargetWatch(attachType apiv1.AttachmentType, target string, identity uint64) (watchToken, error) {
+	switch attachType {
+	case apiv1.AttachmentType_ATTACHMENT_TYPE_TC:
+		return s.watcher.WatchInterface(target, identity)
+	case apiv1.AttachmentType_ATTACHMENT_TYPE_CGROUP:
+		return s.watcher.WatchCgroup(target, identity)
+	default:
+		return watchToken{}, fmt.Errorf("unsupported attachment type %s", attachType)
+	}
 }
 
 func (s *Server) Stop() {
@@ -530,17 +1176,26 @@ func (s *Server) Stop() {
 	s.mu.Lock()
 	s.stopping = true
 	s.mu.Unlock()
+	if cpClient := s.cpClient.Load(); cpClient != nil {
+		cpClient.stopAdmission(fmt.Errorf("daemon stopping"))
+	}
 	// Add is performed under the same mutex before an Attach begins, so once
 	// stopping is published no new Add can race this Wait. Let in-flight
 	// Attach calls commit or roll back before taking the terminal snapshot.
 	s.attachWG.Wait()
+	s.commandWG.Wait()
+	s.mu.Lock()
+	for _, state := range s.attachments {
+		state.mutationsClosed = true
+	}
+	s.mu.Unlock()
 
 	// Stop the janitor before closing filters so a sweep never races with
 	// wholesale filter teardown.
 	s.janitorStopOnce.Do(func() { close(s.janitorStop) })
 	s.janitorWG.Wait()
 
-	s.watcher.Stop()
+	s.stopWatcher()
 
 	s.mu.RLock()
 	attachments := make([]*attachmentState, 0, len(s.attachments))
@@ -558,6 +1213,7 @@ func (s *Server) Stop() {
 	}
 
 	for _, state := range attachments {
+		state.finishSetup(false)
 		if cpClient := s.cpClient.Load(); cpClient != nil {
 			cpClient.cancelSubscription(state.info.ID, fmt.Errorf("daemon stopping"))
 		}
@@ -569,6 +1225,7 @@ func (s *Server) Stop() {
 		if state.dns != nil {
 			state.dns.Stop()
 		}
+		state.mutationMu.Lock()
 		if state.filter != nil {
 			if s.detachOnStop {
 				if err := state.filter.Detach(); err != nil {
@@ -578,8 +1235,10 @@ func (s *Server) Stop() {
 				state.filter.Close()
 			}
 		}
+		state.mutationMu.Unlock()
 		state.reconcileMu.Unlock()
 	}
+	s.dnsWatchWG.Wait()
 }
 
 // runTTLJanitor periodically removes expired TTL'd CIDR entries across all
@@ -603,41 +1262,38 @@ func (s *Server) runTTLJanitor() {
 
 // sweepExpiredTTLs runs one janitor pass over every attachment. Split from
 // runTTLJanitor so tests can drive it deterministically with a fake clock.
-// Attachment state is snapshotted under s.mu, then each registry does its
-// own expiry under its leaf lock — s.mu is never held during filter calls,
-// and an attachment detached mid-scan just yields an already-purged registry
-// (or idempotent/failed removes on a closed filter, which are retried and
-// then dropped when the detach purge lands).
+// IDs are snapshotted under s.mu, then each expiry takes exact-state mutation
+// admission. Teardown closes admission and drains an already-running expiry
+// before closing handles; a stale snapshot is simply rejected.
 func (s *Server) sweepExpiredTTLs(now time.Time) {
-	type sweepTarget struct {
-		id     string
-		reg    *ttlRegistry
-		filter filter.Filter
-	}
-
 	s.mu.RLock()
-	targets := make([]sweepTarget, 0, len(s.attachments))
-	for id, state := range s.attachments {
-		targets = append(targets, sweepTarget{id: id, reg: state.ttls, filter: state.filter})
+	ids := make([]string, 0, len(s.attachments))
+	for id := range s.attachments {
+		ids = append(ids, id)
 	}
 	s.mu.RUnlock()
 
-	for _, t := range targets {
-		for _, swept := range t.reg.expire(t.filter, now) {
+	for _, id := range ids {
+		state, done, err := s.beginAttachmentMutation(id)
+		if err != nil {
+			continue
+		}
+		for _, swept := range state.ttls.expire(state.filter, now) {
 			if swept.err != nil {
 				s.logger.Warn().Err(swept.err).
-					Str("id", t.id).
+					Str("id", id).
 					Str("cidr", swept.cidr).
 					Str("list", swept.list.String()).
 					Msg("failed to remove expired CIDR, will retry")
 				continue
 			}
 			s.logger.Debug().
-				Str("id", t.id).
+				Str("id", id).
 				Str("cidr", swept.cidr).
 				Str("list", swept.list.String()).
 				Msg("removed expired CIDR")
 		}
+		done()
 	}
 }
 
@@ -658,55 +1314,26 @@ func (s *Server) handleTargetRemoved(token watchToken) {
 
 	state.reconcileMu.Lock()
 	defer state.reconcileMu.Unlock()
-	s.mu.Lock()
+	s.mu.RLock()
 	if s.stopping || s.targetIndex[target] != id || s.attachments[id] != state || state.watch != token {
-		s.mu.Unlock()
+		s.mu.RUnlock()
 		return
 	}
+	s.mu.RUnlock()
 
-	port := extractPort(state.info.DnsAddress)
-	if port > 0 {
-		s.releasePort(port)
-	}
-
-	switch parseAttachmentType(state.info.Type) {
-	case apiv1.AttachmentType_ATTACHMENT_TYPE_TC:
-		s.watcher.UnwatchInterface(token)
-	case apiv1.AttachmentType_ATTACHMENT_TYPE_CGROUP:
-		s.watcher.UnwatchCgroup(token)
-	}
-
-	delete(s.attachments, id)
-	delete(s.targetIndex, target)
-	s.mu.Unlock()
-
-	// A SubscribedAck that was in flight for this exact attachment is stale
-	// once ownership has been removed. Cancel it before tearing down the
-	// filter/DNS resources so a late ack cannot race the teardown.
-	if cpClient := s.cpClient.Load(); cpClient != nil {
-		cpClient.cancelSubscription(id, fmt.Errorf("attachment target was removed"))
-	}
-
-	// Drop TTL bookkeeping so an in-flight janitor sweep does not keep
-	// retrying removals against the filter we are about to close.
-	state.ttls.purge()
-
-	if state.dns != nil {
-		if err := state.dns.Stop(); err != nil {
-			s.logger.Warn().Err(err).Str("id", id).Msg("error stopping DNS server")
+	cleanupErr := s.cleanupAttachmentState(id, state, fmt.Errorf("attachment target was removed"))
+	s.mu.RLock()
+	_, retained := s.attachments[id]
+	s.mu.RUnlock()
+	if cleanupErr != nil && retained {
+		s.logger.Error().Err(cleanupErr).Str("id", id).Msg("target removal cleanup retained for retry")
+		if cpClient := s.cpClient.Load(); cpClient != nil {
+			cpClient.SendUnsubscribed(&apiv1.Unsubscribed{
+				Id: id, Reason: apiv1.UnsubscribeReason_UNSUBSCRIBE_REASON_ERROR,
+				Error: cleanupErr.Error(),
+			})
 		}
-	}
-
-	if state.filter != nil {
-		// Genuine removal: Detach (not Close) so the pinned BPF state is
-		// destroyed along with the kernel attachment.
-		if err := state.filter.Detach(); err != nil {
-			s.logger.Warn().Err(err).Str("id", id).Msg("error detaching eBPF filter")
-		}
-	}
-
-	if err := s.store.DeleteAttachment(id); err != nil {
-		s.logger.Error().Err(err).Str("id", id).Msg("error deleting attachment from store")
+		return
 	}
 
 	s.logger.Info().
@@ -720,9 +1347,12 @@ func (s *Server) handleTargetRemoved(token watchToken) {
 			Reason: apiv1.UnsubscribeReason_UNSUBSCRIBE_REASON_REMOVED,
 		})
 	}
+	if cleanupErr != nil {
+		s.logger.Warn().Err(cleanupErr).Str("id", id).Msg("target cleanup completed with DNS shutdown error")
+	}
 }
 
-func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (*apiv1.AttachResponse, error) {
+func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (resp *apiv1.AttachResponse, retErr error) {
 	var target string
 	var attachType apiv1.AttachmentType
 
@@ -747,6 +1377,7 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (*apiv1.A
 		}
 	}
 
+	id := uuid.Must(uuid.NewV7()).String()
 	s.mu.Lock()
 	if s.stopping {
 		s.mu.Unlock()
@@ -764,24 +1395,30 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (*apiv1.A
 		s.mu.Unlock()
 		return nil, err
 	}
+	// Reserve same-target setup before any kernel mutation. The id is the
+	// setup ownership token and becomes the live targetIndex value on commit;
+	// every rollback either releases it after proven Detach or retains it with
+	// an explicit degraded owner.
+	s.targetIndex[target] = id
 	s.mu.Unlock()
 
-	id := uuid.Must(uuid.NewV7()).String()
-	dnsAddr := net.JoinHostPort(s.cfg.DNS.ListenAddr, strconv.Itoa(port))
+	dnsAddr := net.JoinHostPort(s.dnsListenIP, strconv.Itoa(port))
 
 	// Always start in DISABLED mode - the control plane provides the initial
 	// configuration via SubscribedAck
 	mode := apiv1.PolicyMode_POLICY_MODE_DISABLED
 
 	attachment := &store.Attachment{
-		ID:         id,
-		Target:     target,
-		Type:       attachType.String(),
-		Mode:       mode.String(),
-		DnsMode:    apiv1.DnsMode_DNS_MODE_DISABLED.String(),
-		DnsAddress: dnsAddr,
-		Metadata:   req.Metadata,
-		AttachedAt: time.Now(),
+		ID:           id,
+		Target:       target,
+		Type:         attachType.String(),
+		Mode:         mode.String(),
+		DnsMode:      apiv1.DnsMode_DNS_MODE_DISABLED.String(),
+		DnsAddress:   dnsAddr,
+		Metadata:     req.Metadata,
+		AttachedAt:   time.Now(),
+		PinDir:       s.pinDirFor(id),
+		PinPathKnown: true,
 	}
 	if attachType == apiv1.AttachmentType_ATTACHMENT_TYPE_TC {
 		attachment.Direction = direction.String()
@@ -806,86 +1443,208 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (*apiv1.A
 		if committed {
 			return
 		}
+		var cleanupErrs []error
+		ownedState := registered
 		if registered != nil {
 			// The attachment was publicly visible, so a concurrent Detach or
 			// target removal (or a claimed SubscribedAck) may already own it.
-			// Wait for the exact state's reconcile lock WITHOUT Server.mu, then
-			// revalidate and claim ownership by removing the registration. If it
-			// is already gone,
-			// the remover tore down EVERYTHING (filter, DNS, port, store row,
-			// watch) and this rollback must be a no-op — anything else would
-			// double-free.
-			registered.reconcileMu.Lock()
-			defer registered.reconcileMu.Unlock()
-			s.mu.Lock()
-			if s.attachments[id] != registered {
-				s.mu.Unlock()
+			// Wait for the exact state's reconcile lock WITHOUT Server.mu and
+			// revalidate ownership. Keep the registration until destructive
+			// cleanup has definitely succeeded: an ambiguous Detach must remain
+			// an inspectable, target/port-owned degraded attachment.
+			ownedState.reconcileMu.Lock()
+			defer ownedState.reconcileMu.Unlock()
+			s.mu.RLock()
+			stillOwned := s.attachments[id] == ownedState
+			s.mu.RUnlock()
+			if !stillOwned {
+				ownedState.finishSetup(false)
 				return
 			}
-			delete(s.attachments, id)
-			delete(s.targetIndex, target)
-			s.releasePort(port)
-			switch attachType {
-			case apiv1.AttachmentType_ATTACHMENT_TYPE_TC:
-				s.watcher.UnwatchInterface(registered.watch)
-			case apiv1.AttachmentType_ATTACHMENT_TYPE_CGROUP:
-				s.watcher.UnwatchCgroup(registered.watch)
+			s.mu.Lock()
+			if s.attachments[id] == ownedState {
+				ownedState.mutationsClosed = true
+				ownedState.cleanupNeeded = true
+				ownedState.needsResync = false
 			}
 			s.mu.Unlock()
-			if cpClient := s.cpClient.Load(); cpClient != nil {
-				cpClient.cancelSubscription(id, fmt.Errorf("attachment setup rolled back"))
-			}
-
-			// Drop TTL bookkeeping so an in-flight janitor sweep does not
-			// keep retrying removals against the filter we are closing.
-			ttls.purge()
-
-			if err := dnsServer.Stop(); err != nil {
-				s.logger.Warn().Err(err).Str("id", id).Msg("error stopping DNS server during attach rollback")
-			}
-			// The rollback destroys the half-built attachment for good, so
-			// Detach: the pins this Attach created must not outlive it.
-			if err := ebpfFilter.Detach(); err != nil {
-				s.logger.Warn().Err(err).Str("id", id).Msg("error detaching eBPF filter during attach rollback")
-			}
-			if err := s.store.DeleteAttachment(id); err != nil {
-				s.logger.Error().Err(err).Str("id", id).Msg("error deleting attachment from store during attach rollback")
-			}
-
-			if notifyCP {
-				if cpClient := s.cpClient.Load(); cpClient != nil {
-					cpClient.SendUnsubscribed(&apiv1.Unsubscribed{
-						Id:     id,
-						Reason: apiv1.UnsubscribeReason_UNSUBSCRIBE_REASON_ERROR,
-						Error:  "control plane subscription failed",
-					})
-				}
-			}
-			return
 		}
 
-		// Pre-registration: nothing else can see these resources, so unwind
-		// whatever was staged, in reverse acquisition order.
+		if cpClient := s.cpClient.Load(); cpClient != nil {
+			cpClient.cancelSubscription(id, fmt.Errorf("attachment setup rolled back"))
+		}
 		if dnsServer != nil {
 			if err := dnsServer.Stop(); err != nil {
 				s.logger.Warn().Err(err).Str("id", id).Msg("error stopping DNS server during attach rollback")
+				cleanupErrs = append(cleanupErrs, fmt.Errorf("stopping DNS during attach rollback: %w", err))
 			}
 		}
+		if ownedState != nil {
+			ownedState.mutationMu.Lock()
+			defer ownedState.mutationMu.Unlock()
+		}
+		attachment.Mode = apiv1.PolicyMode_POLICY_MODE_BLOCK_ALL.String()
+		attachment.CleanupNeeded = true
+		if ownedState != nil {
+			ownedState.info.Mode = attachment.Mode
+			ownedState.info.CleanupNeeded = true
+		}
+		retainDegraded := func(retainedFilter filter.Filter) {
+			s.mu.Lock()
+			if ownedState == nil {
+				ownedState = &attachmentState{info: attachment, dns: dnsServer, filter: retainedFilter, ttls: ttls, mutationsClosed: true}
+				s.attachments[id] = ownedState
+			} else {
+				ownedState.info.Mode = attachment.Mode
+				ownedState.info.CleanupNeeded = true
+				ownedState.dns = dnsServer
+				ownedState.filter = retainedFilter
+			}
+			ownedState.cleanupNeeded = true
+			ownedState.mutationsClosed = true
+			if ownedState.watch.valid() {
+				switch attachType {
+				case apiv1.AttachmentType_ATTACHMENT_TYPE_TC:
+					s.watcher.UnwatchInterface(ownedState.watch)
+				case apiv1.AttachmentType_ATTACHMENT_TYPE_CGROUP:
+					s.watcher.UnwatchCgroup(ownedState.watch)
+				}
+				ownedState.watch = watchToken{}
+			}
+			if existingID, exists := s.targetIndex[target]; !exists || existingID == id {
+				s.targetIndex[target] = id
+			} else {
+				cleanupErrs = append(cleanupErrs, fmt.Errorf("retaining degraded attachment target ownership: target already owned by %s", existingID))
+			}
+			s.mu.Unlock()
+		}
+		enterTerminal := func(cause error) {
+			s.enterTerminal(cause)
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("durable fail-closed quarantine unavailable; daemon entered terminal state: %w", cause))
+		}
+
+		var preDetachModeErr error
 		if ebpfFilter != nil {
-			// Destroying the staged filter for good: Detach so its pins (if
-			// any were created) go with it.
-			if err := ebpfFilter.Detach(); err != nil {
-				s.logger.Warn().Err(err).Str("id", id).Msg("error detaching eBPF filter during attach rollback")
-			}
+			// Detach may close map FDs even when pin removal fails. Stage the
+			// still-writable map fail-closed before any destructive operation.
+			preDetachModeErr = ebpfFilter.SetMode(filter.ModeBlockAll)
 		}
+		// If a row already exists, durably change its recovery policy to
+		// BLOCK_ALL before either Detach or row deletion can become ambiguous.
+		quarantinePersisted := false
+		var quarantinePersistErr error
 		if rowSaved {
-			if err := s.store.DeleteAttachment(id); err != nil {
+			quarantinePersistErr = s.saveAttachment(cloneAttachment(attachment))
+			if quarantinePersistErr != nil {
+				// One immediate retry handles transient SQLite contention without
+				// proceeding destructively while recovery state is still stale.
+				firstErr := quarantinePersistErr
+				if retryErr := s.saveAttachment(cloneAttachment(attachment)); retryErr != nil {
+					quarantinePersistErr = errors.Join(firstErr, retryErr)
+				} else {
+					quarantinePersistErr = nil
+				}
+			}
+			quarantinePersisted = quarantinePersistErr == nil
+		}
+		if rowSaved && !quarantinePersisted {
+			retainDegraded(ebpfFilter)
+			if preDetachModeErr != nil {
+				cleanupErrs = append(cleanupErrs, fmt.Errorf("forcing block-all before attach rollback: %w", preDetachModeErr))
+			}
+			enterTerminal(fmt.Errorf("persisting block-all recovery policy before detach: %w", quarantinePersistErr))
+			ownedState.finishSetup(false)
+			resp = nil
+			retErr = errors.Join(retErr, errors.Join(cleanupErrs...))
+			return
+		}
+		var detachErr error
+		if ebpfFilter != nil {
+			detachErr = ebpfFilter.Detach()
+		}
+		if detachErr != nil {
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("detaching eBPF filter during attach rollback: %w", detachErr))
+			if preDetachModeErr != nil {
+				cleanupErrs = append(cleanupErrs, fmt.Errorf("forcing block-all before failed attach rollback detach: %w", preDetachModeErr))
+			}
+			retainDegraded(ebpfFilter)
+			if !quarantinePersisted {
+				if err := s.saveAttachment(cloneAttachment(ownedState.info)); err != nil {
+					if quarantinePersistErr != nil {
+						cleanupErrs = append(cleanupErrs, fmt.Errorf("preparing durable block-all rollback state: %w", quarantinePersistErr))
+					}
+					enterTerminal(fmt.Errorf("persisting degraded block-all attachment: %w", err))
+				} else {
+					rowSaved = true
+					quarantinePersisted = true
+				}
+			}
+			// Keep target registration, port ownership, TTL inventory, and any
+			// valid watch. A restart can re-adopt the surviving pins and retry
+			// cleanup; nothing becomes unowned or silently fail-open.
+			ownedState.finishSetup(false)
+			if notifyCP {
+				if cpClient := s.cpClient.Load(); cpClient != nil {
+					cpClient.SendUnsubscribed(&apiv1.Unsubscribed{Id: id, Reason: apiv1.UnsubscribeReason_UNSUBSCRIBE_REASON_ERROR, Error: "control plane subscription failed"})
+				}
+			}
+			resp = nil
+			retErr = errors.Join(retErr, errors.Join(cleanupErrs...))
+			return
+		}
+
+		// Detach proved the staged kernel resources are gone, but ownership is
+		// retained until durable row deletion also succeeds.
+		if rowSaved {
+			if err := s.deleteAttachment(id); err != nil {
 				s.logger.Error().Err(err).Str("id", id).Msg("error deleting attachment from store during attach rollback")
+				cleanupErrs = append(cleanupErrs, fmt.Errorf("deleting attachment during rollback: %w", err))
+				ttls.purge()
+				retainDegraded(nil)
+				if !quarantinePersisted {
+					if saveErr := s.saveAttachment(cloneAttachment(ownedState.info)); saveErr != nil {
+						if quarantinePersistErr != nil {
+							cleanupErrs = append(cleanupErrs, fmt.Errorf("preparing durable block-all rollback state: %w", quarantinePersistErr))
+						}
+						enterTerminal(fmt.Errorf("persisting cleanup-needed block-all attachment: %w", saveErr))
+					} else {
+						quarantinePersisted = true
+					}
+				}
+				ownedState.finishSetup(false)
+				resp = nil
+				retErr = errors.Join(retErr, errors.Join(cleanupErrs...))
+				return
 			}
 		}
+
+		// Both destructive steps succeeded; release every reservation.
+		ttls.purge()
 		s.mu.Lock()
+		if ownedState != nil && s.attachments[id] == ownedState {
+			ownedState.finishSetup(false)
+			if ownedState.watch.valid() {
+				switch attachType {
+				case apiv1.AttachmentType_ATTACHMENT_TYPE_TC:
+					s.watcher.UnwatchInterface(ownedState.watch)
+				case apiv1.AttachmentType_ATTACHMENT_TYPE_CGROUP:
+					s.watcher.UnwatchCgroup(ownedState.watch)
+				}
+			}
+			delete(s.attachments, id)
+		}
+		if s.targetIndex[target] == id {
+			delete(s.targetIndex, target)
+		}
 		s.releasePort(port)
 		s.mu.Unlock()
+		if notifyCP {
+			if cpClient := s.cpClient.Load(); cpClient != nil {
+				cpClient.SendUnsubscribed(&apiv1.Unsubscribed{Id: id, Reason: apiv1.UnsubscribeReason_UNSUBSCRIBE_REASON_ERROR, Error: "control plane subscription failed"})
+			}
+		}
+		resp = nil
+		retErr = errors.Join(retErr, errors.Join(cleanupErrs...))
 	}()
 
 	expectedIdentity, err := s.targetIdentity(attachType, target)
@@ -893,40 +1652,52 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (*apiv1.A
 		return nil, fmt.Errorf("resolving target identity before filter attachment: %w", err)
 	}
 
-	ebpfFilter, err = s.newFilter(s.pinDirFor(id), target, attachType, mode, direction, s.maxRuleEntries)
+	// Every staged fresh filter begins fail-closed. It is transitioned to the
+	// no-CP initial mode only at the final commit; a CP ack applies its desired
+	// mode itself. Thus even combined SetMode+Detach rollback failures cannot
+	// leave newly-created enforcement effective DISABLED.
+	ebpfFilter, err = s.newFilter(s.pinDirFor(id), target, attachType, apiv1.PolicyMode_POLICY_MODE_BLOCK_ALL, direction, s.maxRuleEntries)
 	if err != nil {
 		return nil, fmt.Errorf("creating eBPF filter: %w", err)
 	}
 	if err := s.validateTargetIdentity(attachType, target, expectedIdentity); err != nil {
 		return nil, err
 	}
-
 	var proxyFunc DnsProxyFunc
 	if cpClient := s.cpClient.Load(); cpClient != nil {
 		proxyFunc = cpClient.MakeProxyFunc(id)
 	}
 	sink := s.newDNSFilterSink(id, ebpfFilter, ttls)
-	dnsServer = NewDNSServer(id, dnsAddr, s.cfg.DNS.Upstream, s.logger, sink, proxyFunc)
-	if err := dnsServer.Start(); err != nil {
-		dnsServer = nil // never started; nothing to stop
+	dnsServer = NewDNSServer(id, dnsAddr, s.defaultDNSUpstream, s.logger, sink, proxyFunc)
+	if err := s.bindDNSServer(dnsServer); err != nil {
+		return nil, fmt.Errorf("binding DNS server: %w", err)
+	}
+	if err := s.serveDNSServer(dnsServer); err != nil {
 		return nil, fmt.Errorf("starting DNS server: %w", err)
+	}
+	bootstrapCIDR, err := dnsBootstrapCIDR(dnsAddr)
+	if err != nil {
+		return nil, fmt.Errorf("preparing DNS bootstrap route: %w", err)
+	}
+	if err := ttls.addSystem(ebpfFilter, bootstrapCIDR, listAllow); err != nil {
+		return nil, fmt.Errorf("installing protected DNS bootstrap route %s: %w", bootstrapCIDR, err)
 	}
 
 	// Persist only after the enforcing resources (filter + DNS) exist: a
 	// crash before this point leaves no store row, so restore never
 	// resurrects an attachment that was never enforcing.
-	if err := s.store.SaveAttachment(attachment); err != nil {
+	if err := s.saveAttachment(attachment); err != nil {
 		return nil, fmt.Errorf("saving attachment: %w", err)
 	}
 	rowSaved = true
 
-	state := &attachmentState{info: attachment, dns: dnsServer, filter: ebpfFilter, ttls: ttls}
+	state := &attachmentState{info: attachment, dns: dnsServer, filter: ebpfFilter, ttls: ttls, setupDone: make(chan struct{})}
 	s.mu.Lock()
 	if s.stopping {
 		s.mu.Unlock()
 		return nil, fmt.Errorf("daemon is stopping")
 	}
-	if existingID, ok := s.targetIndex[target]; ok {
+	if existingID, ok := s.targetIndex[target]; ok && existingID != id {
 		s.mu.Unlock()
 		return nil, fmt.Errorf("target already attached: %s (%s)", target, existingID)
 	}
@@ -941,15 +1712,21 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (*apiv1.A
 		watchErr = s.validateTargetIdentity(attachType, target, expectedIdentity)
 	)
 	if watchErr == nil {
+		token, watchErr = s.watchTarget(attachType, target, expectedIdentity)
+	}
+	if token.valid() && watchErr == nil {
+		state.watch = token
+	} else if token.valid() {
+		// Watch registration can publish a token and then fail its exact
+		// identity recheck. Remove that generation before Server.mu is released
+		// and never publish it on the state, so its queued removal callback
+		// cannot race rollback ownership.
 		switch attachType {
 		case apiv1.AttachmentType_ATTACHMENT_TYPE_TC:
-			token, watchErr = s.watcher.WatchInterface(target, expectedIdentity)
+			s.watcher.UnwatchInterface(token)
 		case apiv1.AttachmentType_ATTACHMENT_TYPE_CGROUP:
-			token, watchErr = s.watcher.WatchCgroup(target, expectedIdentity)
+			s.watcher.UnwatchCgroup(token)
 		}
-	}
-	if watchErr == nil {
-		state.watch = token
 	}
 	s.mu.Unlock()
 	if watchErr != nil {
@@ -967,12 +1744,16 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (*apiv1.A
 	}
 	logEvent.Msg("attached filter")
 
-	if cpClient := s.cpClient.Load(); cpClient != nil {
+	var subscribedAck *apiv1.SubscribedAck
+	attachmentCP := s.cpClient.Load()
+	if cpClient := attachmentCP; cpClient != nil {
 		sub := subscribedFromAttachment(attachment)
 
 		// s.mu is NOT held here: SubscribeAndWait can block for the full
 		// subscribe_ack_timeout.
-		if _, err := cpClient.SubscribeAndWait(ctx, sub); err != nil {
+		var err error
+		subscribedAck, err = cpClient.subscribeForAttachAndWait(ctx, sub)
+		if err != nil {
 			s.logger.Error().Err(err).Str("id", id).Msg("control plane subscription failed, detaching")
 			notifyCP = true
 			return nil, fmt.Errorf("control plane subscription failed: %w", err)
@@ -985,22 +1766,191 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (*apiv1.A
 	// caller an attachment that nothing is enforcing. The rollback above is
 	// a guaranteed no-op in that case (ownership check), so this error path
 	// never double-frees.
+	registered.reconcileMu.Lock()
 	s.mu.Lock()
 	if s.stopping {
 		s.mu.Unlock()
+		registered.reconcileMu.Unlock()
 		return nil, fmt.Errorf("daemon is stopping")
 	}
 	if s.attachments[id] != registered {
 		s.mu.Unlock()
+		registered.reconcileMu.Unlock()
 		return nil, fmt.Errorf("attachment was detached during setup: %s", id)
 	}
+	if err := dnsServerSetupError(dnsServer); err != nil {
+		s.mu.Unlock()
+		registered.reconcileMu.Unlock()
+		return nil, fmt.Errorf("DNS listener exited during attachment setup: %w", err)
+	}
+	if attachmentCP == nil {
+		if err := ebpfFilter.SetMode(filter.ModeDisabled); err != nil {
+			s.mu.Unlock()
+			registered.reconcileMu.Unlock()
+			return nil, fmt.Errorf("committing initial disabled filter mode: %w", err)
+		}
+	}
+	// From here ownership is committed even while a validated ack is being
+	// applied. A runtime apply failure is quarantined in-place; it must never
+	// fall back into destructive setup rollback after changing policy.
 	committed = true
+	registered.setupCommitted.Store(true)
 	s.mu.Unlock()
+	if subscribedAck != nil {
+		if err := attachmentCP.applySubscribedAck(id, subscribedAck); err != nil {
+			quarantineErr := s.quarantineAttachment(id, registered)
+			registered.finishSetup(true)
+			registered.reconcileMu.Unlock()
+			attachmentCP.SendUnsubscribed(&apiv1.Unsubscribed{Id: id, Reason: apiv1.UnsubscribeReason_UNSUBSCRIBE_REASON_ERROR, Error: "initial control-plane policy failed to apply"})
+			return nil, errors.Join(fmt.Errorf("applying initial control-plane policy: %w", err), quarantineErr)
+		}
+	}
+	registered.finishSetup(true)
+	registered.reconcileMu.Unlock()
+	s.startDNSLifecycleWatch(id, registered)
 
 	return &apiv1.AttachResponse{
 		Id:         id,
 		DnsAddress: dnsAddr,
 	}, nil
+}
+
+// quarantineAttachment retains an already-owned attachment but forces its
+// effective and persisted recovery policy to BLOCK_ALL. Any inability to do
+// both is terminal: new work is refused until an operator restarts after the
+// underlying map/store failure is resolved.
+func (s *Server) quarantineAttachment(id string, expected *attachmentState) error {
+	s.mu.Lock()
+	if expected == nil || s.attachments[id] != expected {
+		s.mu.Unlock()
+		return fmt.Errorf("attachment ownership changed during quarantine")
+	}
+	expected.mutationsClosed = true
+	expected.info.Mode = apiv1.PolicyMode_POLICY_MODE_BLOCK_ALL.String()
+	row := cloneAttachment(expected.info)
+	s.mu.Unlock()
+
+	expected.mutationMu.Lock()
+	defer expected.mutationMu.Unlock()
+	var quarantineErrs []error
+	if expected.filter == nil {
+		quarantineErrs = append(quarantineErrs, fmt.Errorf("attachment filter is unavailable"))
+	} else if err := expected.filter.SetMode(filter.ModeBlockAll); err != nil {
+		quarantineErrs = append(quarantineErrs, fmt.Errorf("forcing attachment block-all: %w", err))
+	}
+	if err := s.saveAttachment(row); err != nil {
+		quarantineErrs = append(quarantineErrs, fmt.Errorf("persisting attachment block-all: %w", err))
+	}
+	if len(quarantineErrs) != 0 {
+		s.enterTerminal(errors.Join(quarantineErrs...))
+	}
+	return errors.Join(quarantineErrs...)
+}
+
+// cleanupAttachmentState is the single live-process teardown state machine.
+// The caller owns state.reconcileMu. It closes mutation admission first,
+// stops DNS, drains every already-admitted filter/stats/TTL operation, then
+// establishes BLOCK_ALL + a durable cleanup tombstone before Detach. Target,
+// port, and row ownership are released only after both Detach and row deletion
+// have succeeded. Every intermediate error leaves the exact state retryable.
+func (s *Server) cleanupAttachmentState(id string, state *attachmentState, subscriptionErr error) error {
+	s.mu.Lock()
+	if s.attachments[id] != state {
+		s.mu.Unlock()
+		return fmt.Errorf("attachment not found: %s", id)
+	}
+	alreadyCleanup := state.cleanupNeeded || state.info.CleanupNeeded
+	state.mutationsClosed = true
+	state.cleanupNeeded = true
+	state.needsResync = false
+	state.info.Mode = apiv1.PolicyMode_POLICY_MODE_BLOCK_ALL.String()
+	state.info.CleanupNeeded = true
+	if !state.info.PinPathKnown {
+		state.info.PinDir = s.pinDirFor(id)
+		state.info.PinPathKnown = true
+	}
+	row := cloneAttachment(state.info)
+	watch := state.watch
+	state.watch = watchToken{}
+	attachType := parseAttachmentType(state.info.Type)
+	port := extractPort(state.info.DnsAddress)
+	target := state.info.Target
+	s.mu.Unlock()
+
+	state.finishSetup(false)
+	if cpClient := s.cpClient.Load(); cpClient != nil {
+		cpClient.cancelSubscription(id, subscriptionErr)
+	}
+	if watch.valid() {
+		switch attachType {
+		case apiv1.AttachmentType_ATTACHMENT_TYPE_TC:
+			s.watcher.UnwatchInterface(watch)
+		case apiv1.AttachmentType_ATTACHMENT_TYPE_CGROUP:
+			s.watcher.UnwatchCgroup(watch)
+		}
+	}
+
+	var cleanupErrs []error
+	if state.dns != nil {
+		// Stop waits for every handler/listener to finish even when it reports a
+		// cached shutdown error, so cleanup can safely continue and surface that
+		// error after filter/row convergence.
+		if err := state.dns.Stop(); err != nil {
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("stopping DNS server during cleanup: %w", err))
+		}
+	}
+
+	state.mutationMu.Lock()
+	defer state.mutationMu.Unlock()
+
+	var modeErr error
+	if !alreadyCleanup && state.filter != nil {
+		modeErr = state.filter.SetMode(filter.ModeBlockAll)
+		if modeErr != nil {
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("forcing attachment block-all before cleanup: %w", modeErr))
+		}
+	}
+	if err := s.saveAttachment(row); err != nil {
+		cleanupErrs = append(cleanupErrs, fmt.Errorf("persisting block-all cleanup tombstone: %w", err))
+		s.enterTerminal(errors.Join(cleanupErrs...))
+		return errors.Join(cleanupErrs...)
+	}
+
+	if state.filter != nil {
+		if err := state.filter.Detach(); err != nil {
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("detaching eBPF filter: %w", err))
+			if modeErr != nil {
+				s.enterTerminal(errors.Join(cleanupErrs...))
+			}
+			return errors.Join(cleanupErrs...)
+		}
+		s.mu.Lock()
+		if s.attachments[id] == state {
+			state.filter = nil
+		}
+		s.mu.Unlock()
+	}
+	state.ttls.purge()
+
+	if err := s.deleteAttachment(id); err != nil {
+		cleanupErrs = append(cleanupErrs, fmt.Errorf("deleting attachment from store: %w", err))
+		return errors.Join(cleanupErrs...)
+	}
+
+	s.mu.Lock()
+	if s.attachments[id] != state {
+		s.mu.Unlock()
+		return errors.Join(append(cleanupErrs, fmt.Errorf("attachment ownership changed during cleanup: %s", id))...)
+	}
+	delete(s.attachments, id)
+	if s.targetIndex[target] == id {
+		delete(s.targetIndex, target)
+	}
+	if port > 0 {
+		s.releasePort(port)
+	}
+	s.mu.Unlock()
+	return errors.Join(cleanupErrs...)
 }
 
 func (s *Server) Detach(ctx context.Context, req *apiv1.DetachRequest) (*emptypb.Empty, error) {
@@ -1016,59 +1966,23 @@ func (s *Server) Detach(ctx context.Context, req *apiv1.DetachRequest) (*emptypb
 	// state lock, revalidate registration before claiming teardown ownership.
 	state.reconcileMu.Lock()
 	defer state.reconcileMu.Unlock()
-	s.mu.Lock()
-	if s.stopping {
-		s.mu.Unlock()
-		return nil, fmt.Errorf("daemon is stopping")
-	}
-	if s.attachments[req.Id] != state {
-		s.mu.Unlock()
+	s.mu.RLock()
+	stopping := s.stopping
+	cleanupNeeded := state.cleanupNeeded
+	live := s.attachments[req.Id] == state
+	s.mu.RUnlock()
+	if !live {
 		return nil, fmt.Errorf("attachment not found: %s", req.Id)
 	}
-
-	port := extractPort(state.info.DnsAddress)
-	if port > 0 {
-		s.releasePort(port)
+	if stopping && !cleanupNeeded {
+		return nil, fmt.Errorf("daemon is stopping")
 	}
-
-	switch parseAttachmentType(state.info.Type) {
-	case apiv1.AttachmentType_ATTACHMENT_TYPE_TC:
-		s.watcher.UnwatchInterface(state.watch)
-	case apiv1.AttachmentType_ATTACHMENT_TYPE_CGROUP:
-		s.watcher.UnwatchCgroup(state.watch)
-	}
-
-	delete(s.attachments, req.Id)
-	delete(s.targetIndex, state.info.Target)
-	s.mu.Unlock()
-
-	// Remove any exact pending Subscribed handshake before resource teardown.
-	// The waiter (a new Attach) is unblocked with an error; a background
-	// restore attempt simply retains needsResync for a later connection.
-	if cpClient := s.cpClient.Load(); cpClient != nil {
-		cpClient.cancelSubscription(req.Id, fmt.Errorf("attachment detached"))
-	}
-
-	// Drop TTL bookkeeping so an in-flight janitor sweep does not keep
-	// retrying removals against the filter we are about to close.
-	state.ttls.purge()
-
-	if state.dns != nil {
-		if err := state.dns.Stop(); err != nil {
-			s.logger.Warn().Err(err).Str("id", req.Id).Msg("error stopping DNS server")
-		}
-	}
-
-	if state.filter != nil {
-		// Explicit detach destroys the attachment for good: unpin + close so
-		// no bpffs state or kernel links survive.
-		if err := state.filter.Detach(); err != nil {
-			s.logger.Warn().Err(err).Str("id", req.Id).Msg("error detaching eBPF filter")
-		}
-	}
-
-	if err := s.store.DeleteAttachment(req.Id); err != nil {
-		s.logger.Error().Err(err).Str("id", req.Id).Msg("error deleting attachment from store")
+	cleanupErr := s.cleanupAttachmentState(req.Id, state, fmt.Errorf("attachment detached"))
+	s.mu.RLock()
+	_, retained := s.attachments[req.Id]
+	s.mu.RUnlock()
+	if cleanupErr != nil && retained {
+		return nil, cleanupErr
 	}
 
 	s.logger.Info().
@@ -1082,6 +1996,9 @@ func (s *Server) Detach(ctx context.Context, req *apiv1.DetachRequest) (*emptypb
 			Reason: apiv1.UnsubscribeReason_UNSUBSCRIBE_REASON_DETACHED,
 		})
 	}
+	if cleanupErr != nil {
+		return nil, cleanupErr
+	}
 
 	return &emptypb.Empty{}, nil
 }
@@ -1092,18 +2009,12 @@ func (s *Server) List(ctx context.Context, req *apiv1.ListRequest) (*apiv1.ListR
 		return nil, fmt.Errorf("listing attachments: %w", err)
 	}
 
-	statsRefs := make(map[string]attachmentStatsRef, len(attachments))
-	s.mu.RLock()
+	statsByID := make(map[string]attachmentStatsSnapshot, len(attachments))
 	for _, a := range attachments {
-		if state := s.attachments[a.ID]; state != nil {
-			statsRefs[a.ID] = attachmentStatsRef{
-				id:     a.ID,
-				filter: state.filter,
-				dns:    state.dns,
-			}
+		if stats, ok := s.readAttachmentStats(a.ID); ok {
+			statsByID[a.ID] = stats
 		}
 	}
-	s.mu.RUnlock()
 
 	var infos []*apiv1.AttachmentInfo
 	for _, a := range attachments {
@@ -1120,16 +2031,12 @@ func (s *Server) List(ctx context.Context, req *apiv1.ListRequest) (*apiv1.ListR
 		if info.Type == apiv1.AttachmentType_ATTACHMENT_TYPE_TC {
 			info.TcDirection = parseTcDirection(a.Direction)
 		}
-		if refs, ok := statsRefs[a.ID]; ok {
-			if refs.filter != nil {
-				if stats, err := refs.filter.GetStats(); err == nil {
-					info.PacketsAllowed = stats.Allowed
-					info.PacketsBlocked = stats.Blocked
-				}
-			}
-			if refs.dns != nil {
-				info.DnsQueriesAllowed, info.DnsQueriesBlocked = refs.dns.Stats()
-			}
+		if stats, ok := statsByID[a.ID]; ok {
+			info.PacketsAllowed = stats.packetsAllowed
+			info.PacketsBlocked = stats.packetsBlocked
+			info.DnsQueriesAllowed = stats.dnsAllowed
+			info.DnsQueriesBlocked = stats.dnsBlocked
+			info.DnsQueriesErrors = stats.dnsErrors
 		}
 		infos = append(infos, info)
 	}
@@ -1168,6 +2075,9 @@ func (s *Server) GetSyncAttachments() []*apiv1.Attachment {
 
 	var attachments []*apiv1.Attachment
 	for _, state := range s.attachments {
+		if state.cleanupNeeded || state.mutationsClosed {
+			continue
+		}
 		a := state.info
 		att := &apiv1.Attachment{
 			Id:       a.ID,
@@ -1206,7 +2116,7 @@ func (s *Server) GetRestoreResyncSubscriptions() []restoreResyncSubscription {
 		return resyncs
 	}
 	for _, state := range s.attachments {
-		if !state.needsResync {
+		if state.cleanupNeeded || state.mutationsClosed || !state.needsResync {
 			continue
 		}
 		resyncs = append(resyncs, restoreResyncSubscription{
@@ -1223,13 +2133,18 @@ func (s *Server) getAttachmentState(id string) *attachmentState {
 	if s.stopping {
 		return nil
 	}
-	return s.attachments[id]
+	state := s.attachments[id]
+	if state != nil && (state.cleanupNeeded || state.mutationsClosed) {
+		return nil
+	}
+	return state
 }
 
 func (s *Server) attachmentStateStillLive(id string, expected *attachmentState) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return !s.stopping && expected != nil && s.attachments[id] == expected
+	state := s.attachments[id]
+	return !s.stopping && expected != nil && state == expected && !state.cleanupNeeded && !state.mutationsClosed
 }
 
 func (s *Server) attachmentStatePresent(id string, expected *attachmentState) bool {
@@ -1244,7 +2159,7 @@ func (s *Server) restoreResyncStillNeeded(id string, expected *attachmentState) 
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	state := s.attachments[id]
-	return !s.stopping && state == expected && state != nil && state.needsResync
+	return !s.stopping && state == expected && state != nil && !state.cleanupNeeded && !state.mutationsClosed && state.needsResync
 }
 
 // clearRestoreResync marks an authoritative restore ack complete only if the
@@ -1254,7 +2169,7 @@ func (s *Server) clearRestoreResync(id string, expected *attachmentState) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	state := s.attachments[id]
-	if s.stopping || state != expected || state == nil || !state.needsResync {
+	if s.stopping || state != expected || state == nil || state.cleanupNeeded || state.mutationsClosed || !state.needsResync {
 		return false
 	}
 	state.needsResync = false
@@ -1262,49 +2177,62 @@ func (s *Server) clearRestoreResync(id string, expected *attachmentState) bool {
 }
 
 func (s *Server) GetAttachmentStats() []*apiv1.AttachmentStats {
-	refs := s.snapshotAttachmentStats()
+	s.mu.RLock()
+	ids := make([]string, 0, len(s.attachments))
+	for id, state := range s.attachments {
+		if !state.cleanupNeeded && !state.mutationsClosed {
+			ids = append(ids, id)
+		}
+	}
+	s.mu.RUnlock()
+	sort.Strings(ids)
 
-	var stats []*apiv1.AttachmentStats
-	for _, ref := range refs {
-		stat := &apiv1.AttachmentStats{
-			Id: ref.id,
+	stats := make([]*apiv1.AttachmentStats, 0, len(ids))
+	for _, id := range ids {
+		snapshot, ok := s.readAttachmentStats(id)
+		if !ok {
+			continue
 		}
-		if ref.filter != nil {
-			if filterStats, err := ref.filter.GetStats(); err == nil {
-				stat.PacketsAllowed = filterStats.Allowed
-				stat.PacketsBlocked = filterStats.Blocked
-			}
-		}
-		if ref.dns != nil {
-			stat.DnsQueriesAllowed, stat.DnsQueriesBlocked = ref.dns.Stats()
-		}
-		stat.MapFullDrops = ref.ttls.mapFullCount()
-		stats = append(stats, stat)
+		stats = append(stats, &apiv1.AttachmentStats{
+			Id:                id,
+			PacketsAllowed:    snapshot.packetsAllowed,
+			PacketsBlocked:    snapshot.packetsBlocked,
+			DnsQueriesAllowed: snapshot.dnsAllowed,
+			DnsQueriesBlocked: snapshot.dnsBlocked,
+			DnsQueriesErrors:  snapshot.dnsErrors,
+			MapFullDrops:      snapshot.mapFullDrops,
+		})
 	}
 	return stats
 }
 
-type attachmentStatsRef struct {
-	id     string
-	filter filter.Filter
-	dns    *DNSServer
-	ttls   *ttlRegistry
+type attachmentStatsSnapshot struct {
+	packetsAllowed, packetsBlocked uint64
+	dnsAllowed, dnsBlocked         uint64
+	dnsErrors, mapFullDrops        uint64
 }
 
-func (s *Server) snapshotAttachmentStats() []attachmentStatsRef {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	refs := make([]attachmentStatsRef, 0, len(s.attachments))
-	for id, state := range s.attachments {
-		refs = append(refs, attachmentStatsRef{
-			id:     id,
-			filter: state.filter,
-			dns:    state.dns,
-			ttls:   state.ttls,
-		})
+func (s *Server) readAttachmentStats(id string) (attachmentStatsSnapshot, bool) {
+	state, done, err := s.beginAttachmentMutation(id)
+	if err != nil {
+		return attachmentStatsSnapshot{}, false
 	}
-	return refs
+	defer done()
+
+	var snapshot attachmentStatsSnapshot
+	if state.filter != nil {
+		if stats, err := state.filter.GetStats(); err == nil {
+			snapshot.packetsAllowed = stats.Allowed
+			snapshot.packetsBlocked = stats.Blocked
+		}
+	}
+	if state.dns != nil {
+		snapshot.dnsAllowed, snapshot.dnsBlocked, snapshot.dnsErrors = state.dns.Stats()
+	}
+	if state.ttls != nil {
+		snapshot.mapFullDrops = state.ttls.mapFullCount()
+	}
+	return snapshot, true
 }
 
 func (s *Server) DaemonID() string {
@@ -1316,159 +2244,156 @@ func (s *Server) Hostname() string {
 }
 
 func (s *Server) SetDnsMode(id string, mode apiv1.DnsMode) error {
-	s.mu.RLock()
-	state, ok := s.attachments[id]
-	if !ok {
-		s.mu.RUnlock()
-		return fmt.Errorf("attachment not found: %s", id)
+	if err := validateDNSMode(mode); err != nil {
+		return err
 	}
-	dnsServer := state.dns
-	s.mu.RUnlock()
+	state, done, err := s.beginAttachmentMutation(id)
+	if err != nil {
+		return err
+	}
+	defer done()
+	return s.setDNSModeAdmitted(id, state, mode)
+}
 
-	if dnsServer != nil {
-		dnsServer.SetMode(mode)
+func (s *Server) setDNSModeAdmitted(id string, state *attachmentState, mode apiv1.DnsMode) error {
+	if state.dns != nil {
+		state.dns.SetMode(mode)
 	}
 
 	s.mu.Lock()
-	state, ok = s.attachments[id]
-	if !ok {
+	if s.attachments[id] != state {
 		s.mu.Unlock()
-		return fmt.Errorf("attachment not found: %s", id)
+		return fmt.Errorf("attachment changed while setting DNS mode: %s", id)
 	}
 	state.info.DnsMode = mode.String()
 	attachment := cloneAttachment(state.info)
 	s.mu.Unlock()
 
-	if err := s.store.SaveAttachment(attachment); err != nil {
+	if err := s.saveAttachment(attachment); err != nil {
 		return fmt.Errorf("saving DNS mode: %w", err)
 	}
 	return nil
 }
 
 func (s *Server) AllowDomain(id string, domain string, includeSubdomains bool) error {
-	s.mu.RLock()
-	state, ok := s.attachments[id]
-	if !ok {
-		s.mu.RUnlock()
-		return fmt.Errorf("attachment not found: %s", id)
+	state, done, err := s.beginAttachmentMutation(id)
+	if err != nil {
+		return err
 	}
-	dnsServer := state.dns
-	s.mu.RUnlock()
-
-	if dnsServer != nil {
-		dnsServer.AllowDomain(domain, includeSubdomains)
+	defer done()
+	if state.dns != nil {
+		state.dns.AllowDomain(domain, includeSubdomains)
 	}
 	return nil
 }
 
 func (s *Server) DenyDomain(id string, domain string, includeSubdomains bool) error {
-	s.mu.RLock()
-	state, ok := s.attachments[id]
-	if !ok {
-		s.mu.RUnlock()
-		return fmt.Errorf("attachment not found: %s", id)
+	state, done, err := s.beginAttachmentMutation(id)
+	if err != nil {
+		return err
 	}
-	dnsServer := state.dns
-	s.mu.RUnlock()
-
-	if dnsServer != nil {
-		dnsServer.DenyDomain(domain, includeSubdomains)
+	defer done()
+	if state.dns != nil {
+		state.dns.DenyDomain(domain, includeSubdomains)
 	}
 	return nil
 }
 
 func (s *Server) RemoveDomain(id string, domain string) error {
-	s.mu.RLock()
-	state, ok := s.attachments[id]
-	if !ok {
-		s.mu.RUnlock()
-		return fmt.Errorf("attachment not found: %s", id)
+	state, done, err := s.beginAttachmentMutation(id)
+	if err != nil {
+		return err
 	}
-	dnsServer := state.dns
-	s.mu.RUnlock()
-
-	if dnsServer != nil {
-		dnsServer.RemoveDomain(domain)
+	defer done()
+	if state.dns != nil {
+		state.dns.RemoveDomain(domain)
 	}
 	return nil
 }
 
-func (s *Server) ReplaceDNSRules(id string, mode apiv1.DnsMode, allowDomains, denyDomains []*apiv1.DomainEntry) error {
-	s.mu.RLock()
-	state, ok := s.attachments[id]
-	if !ok {
-		s.mu.RUnlock()
-		return fmt.Errorf("attachment not found: %s", id)
+func (s *Server) ReplaceDNSRules(id string, mode apiv1.DnsMode, allowDomains, denyDomains []*apiv1.DomainEntry, upstreamOverride ...[]string) error {
+	if err := validateDNSMode(mode); err != nil {
+		return err
 	}
-	dnsServer := state.dns
-	s.mu.RUnlock()
+	if len(upstreamOverride) > 1 {
+		return fmt.Errorf("at most one DNS upstream server list may be supplied")
+	}
+	var upstreamServers []string
+	if len(upstreamOverride) == 1 {
+		upstreamServers = upstreamOverride[0]
+	}
+	state, done, err := s.beginAttachmentMutation(id)
+	if err != nil {
+		return err
+	}
+	defer done()
+	return s.replaceDNSRulesAdmitted(id, state, mode, allowDomains, denyDomains, upstreamServers)
+}
 
-	if dnsServer != nil {
-		dnsServer.ReplaceRules(mode, allowDomains, denyDomains)
+func (s *Server) replaceDNSRulesAdmitted(id string, state *attachmentState, mode apiv1.DnsMode, allowDomains, denyDomains []*apiv1.DomainEntry, upstreamServers []string) error {
+	if state.dns != nil {
+		if err := state.dns.ReplaceRules(mode, allowDomains, denyDomains, upstreamServers); err != nil {
+			return err
+		}
 	}
 
 	s.mu.Lock()
-	state, ok = s.attachments[id]
-	if !ok {
+	if s.attachments[id] != state {
 		s.mu.Unlock()
-		return fmt.Errorf("attachment not found: %s", id)
+		return fmt.Errorf("attachment changed while replacing DNS rules: %s", id)
 	}
 	state.info.DnsMode = mode.String()
 	attachment := cloneAttachment(state.info)
 	s.mu.Unlock()
 
-	if err := s.store.SaveAttachment(attachment); err != nil {
+	if err := s.saveAttachment(attachment); err != nil {
 		return fmt.Errorf("saving DNS rules: %w", err)
 	}
 	return nil
 }
 
 func (s *Server) ClearRules(id string) error {
-	s.mu.RLock()
-	state, ok := s.attachments[id]
-	if !ok {
-		s.mu.RUnlock()
-		return fmt.Errorf("attachment not found: %s", id)
+	ebpfFilter, reg, done, err := s.filterAndRegistry(id)
+	if err != nil {
+		return err
 	}
-	ebpfFilter := state.filter
-	reg := state.ttls
-	s.mu.RUnlock()
+	defer done()
 
-	// Clearing goes through the TTL registry so tracked entries (including
-	// DNS-populated IPs) are purged atomically with the filter wipe — the
-	// janitor must never "expire" an entry that a clear (e.g. bulk update)
-	// already removed or that a rebuild re-added as permanent, and cleared
-	// DNS IPs must be re-addable on the next resolution.
+	// Clearing goes through the TTL registry and delta-removes every ordinary
+	// CP/DNS-owned entry. It deliberately never invokes Filter.ClearRules:
+	// the system-owned DNS bootstrap route must remain reachable, while failed
+	// removals stay tracked for a later retry instead of being forgotten.
 	return reg.clear(ebpfFilter)
 }
 
 func (s *Server) SetFilterMode(id string, mode apiv1.PolicyMode) error {
-	s.mu.RLock()
-	state, ok := s.attachments[id]
-	if !ok {
-		s.mu.RUnlock()
-		return fmt.Errorf("attachment not found: %s", id)
+	if err := validatePolicyMode(mode); err != nil {
+		return err
 	}
-	ebpfFilter := state.filter
-	s.mu.RUnlock()
+	state, done, err := s.beginAttachmentMutation(id)
+	if err != nil {
+		return err
+	}
+	defer done()
+	return s.setFilterModeAdmitted(id, state, mode)
+}
 
-	if ebpfFilter != nil {
-		if err := ebpfFilter.SetMode(apiModeToFilterMode(mode)); err != nil {
+func (s *Server) setFilterModeAdmitted(id string, state *attachmentState, mode apiv1.PolicyMode) error {
+	if state.filter != nil {
+		if err := state.filter.SetMode(apiModeToFilterMode(mode)); err != nil {
 			return err
 		}
 	}
-
 	s.mu.Lock()
-	state, ok = s.attachments[id]
-	if !ok {
+	if s.attachments[id] != state {
 		s.mu.Unlock()
-		return fmt.Errorf("attachment not found: %s", id)
+		return fmt.Errorf("attachment changed while setting filter mode: %s", id)
 	}
 	state.info.Mode = mode.String()
 	attachment := cloneAttachment(state.info)
 	s.mu.Unlock()
 
-	if err := s.store.SaveAttachment(attachment); err != nil {
+	if err := s.saveAttachment(attachment); err != nil {
 		return fmt.Errorf("saving filter mode: %w", err)
 	}
 	return nil
@@ -1481,36 +2406,40 @@ func (s *Server) SetFilterMode(id string, mode apiv1.PolicyMode) error {
 // entry permanent, and a permanent entry is never demoted by a later TTL'd
 // re-add. Use RemoveAllowedCIDR to drop an entry early.
 func (s *Server) AllowCIDR(id string, cidr *net.IPNet, ttl time.Duration) error {
-	ebpfFilter, reg, err := s.filterAndRegistry(id)
+	ebpfFilter, reg, done, err := s.filterAndRegistry(id)
 	if err != nil {
 		return err
 	}
+	defer done()
 	return reg.addCP(ebpfFilter, cidr, listAllow, ttl, s.now())
 }
 
 // DenyCIDR adds the CIDR to the attachment's denylist. TTL semantics match
 // AllowCIDR.
 func (s *Server) DenyCIDR(id string, cidr *net.IPNet, ttl time.Duration) error {
-	ebpfFilter, reg, err := s.filterAndRegistry(id)
+	ebpfFilter, reg, done, err := s.filterAndRegistry(id)
 	if err != nil {
 		return err
 	}
+	defer done()
 	return reg.addCP(ebpfFilter, cidr, listDeny, ttl, s.now())
 }
 
 func (s *Server) RemoveAllowedCIDR(id string, cidr *net.IPNet) error {
-	ebpfFilter, reg, err := s.filterAndRegistry(id)
+	ebpfFilter, reg, done, err := s.filterAndRegistry(id)
 	if err != nil {
 		return err
 	}
+	defer done()
 	return reg.remove(ebpfFilter, cidr, listAllow)
 }
 
 func (s *Server) RemoveDeniedCIDR(id string, cidr *net.IPNet) error {
-	ebpfFilter, reg, err := s.filterAndRegistry(id)
+	ebpfFilter, reg, done, err := s.filterAndRegistry(id)
 	if err != nil {
 		return err
 	}
+	defer done()
 	return reg.remove(ebpfFilter, cidr, listDeny)
 }
 
@@ -1536,9 +2465,21 @@ func (s *Server) RemoveDeniedCIDR(id string, cidr *net.IPNet) error {
 // until their own DNS TTL lapses. Per-CIDR failures (e.g. map-full) are
 // aggregated, not aborting the rest of the reconcile.
 func (s *Server) ReconcileCIDRs(id string, mode apiv1.PolicyMode, allow, deny []parsedCIDR) error {
-	ebpfFilter, reg, err := s.filterAndRegistry(id)
+	if err := validatePolicyMode(mode); err != nil {
+		return err
+	}
+	state, done, err := s.beginAttachmentMutation(id)
 	if err != nil {
 		return err
+	}
+	defer done()
+	return s.reconcileCIDRsAdmitted(id, state, mode, allow, deny)
+}
+
+func (s *Server) reconcileCIDRsAdmitted(id string, state *attachmentState, mode apiv1.PolicyMode, allow, deny []parsedCIDR) error {
+	ebpfFilter, reg := state.filter, state.ttls
+	if ebpfFilter == nil {
+		return fmt.Errorf("attachment %s filter is unavailable", id)
 	}
 
 	// Which list does the new mode consult? Denylist reads denied_*;
@@ -1552,22 +2493,48 @@ func (s *Server) ReconcileCIDRs(id string, mode apiv1.PolicyMode, allow, deny []
 	}
 
 	firstErr := reg.reconcileCP(ebpfFilter, first, firstSet, s.now())
-	modeErr := s.SetFilterMode(id, mode)
+	modeErr := s.setFilterModeAdmitted(id, state, mode)
 	secondErr := reg.reconcileCP(ebpfFilter, second, secondSet, s.now())
 	return errors.Join(firstErr, modeErr, secondErr)
+}
+
+func validatePolicyMode(mode apiv1.PolicyMode) error {
+	switch mode {
+	case apiv1.PolicyMode_POLICY_MODE_DISABLED,
+		apiv1.PolicyMode_POLICY_MODE_ALLOWLIST,
+		apiv1.PolicyMode_POLICY_MODE_BLOCK_ALL,
+		apiv1.PolicyMode_POLICY_MODE_DENYLIST:
+		return nil
+	default:
+		return fmt.Errorf("invalid policy mode: %d", mode)
+	}
+}
+
+func validateDNSMode(mode apiv1.DnsMode) error {
+	switch mode {
+	case apiv1.DnsMode_DNS_MODE_DISABLED,
+		apiv1.DnsMode_DNS_MODE_ALLOWLIST,
+		apiv1.DnsMode_DNS_MODE_DENYLIST,
+		apiv1.DnsMode_DNS_MODE_PROXY:
+		return nil
+	default:
+		return fmt.Errorf("invalid DNS mode: %d", mode)
+	}
 }
 
 // filterAndRegistry snapshots an attachment's filter and TTL registry under
 // s.mu. Callers then operate under the registry's own lock only, so s.mu is
 // never held across filter syscalls.
-func (s *Server) filterAndRegistry(id string) (filter.Filter, *ttlRegistry, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	state, ok := s.attachments[id]
-	if !ok {
-		return nil, nil, fmt.Errorf("attachment not found: %s", id)
+func (s *Server) filterAndRegistry(id string) (filter.Filter, *ttlRegistry, func(), error) {
+	state, done, err := s.beginAttachmentMutation(id)
+	if err != nil {
+		return nil, nil, nil, err
 	}
-	return state.filter, state.ttls, nil
+	if state.filter == nil {
+		done()
+		return nil, nil, nil, fmt.Errorf("attachment %s filter is unavailable", id)
+	}
+	return state.filter, state.ttls, done, nil
 }
 
 func (s *Server) allocatePort() (int, error) {

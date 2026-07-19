@@ -36,6 +36,11 @@ const (
 	sourceCP ruleSource = iota
 	// sourceDNS is a DNS-resolved IP added through the DNSFilterSink.
 	sourceDNS
+	// sourceSystem is daemon-owned attachment infrastructure. Today it is the
+	// concrete host route for the attachment's DNS listener. It is permanent
+	// for the attachment lifetime and is deliberately outside authoritative
+	// control-plane state and regenerable DNS-derived ownership.
+	sourceSystem
 )
 
 // ttlKey identifies one tracked filter entry. cidr is the canonical (masked)
@@ -53,6 +58,10 @@ type ttlKey struct {
 // counts as infinite).
 type ttlEntry struct {
 	cidr *net.IPNet
+
+	// systemLive pins daemon-owned attachment infrastructure. Control-plane
+	// reconciliation/removal, DNS expiry, and rule clears must preserve it.
+	systemLive bool
 
 	// cpLive reports whether a control-plane rule currently wants this
 	// entry. While cpLive, cpDeadline zero means the CP rule is permanent;
@@ -101,9 +110,9 @@ func (e ttlEntry) cpPermanent() bool {
 // set clears only the CP source — a live DNS source keeps the entry in the
 // filter until its own TTL lapses.
 //
-// Explicit remove() and clear() are outright (operator/resync actions) and
-// drop the entry regardless of sources; a DNS-populated entry self-heals on
-// the next resolution.
+// Explicit remove() and clear() drop control-plane/DNS ownership, but retain
+// daemon-owned system entries. A DNS-populated entry self-heals on the next
+// resolution.
 //
 // Locking: r.mu is a leaf lock. Callers snapshot the *ttlRegistry and
 // filter.Filter under Server.mu, release Server.mu, and only then lock r.mu;
@@ -150,6 +159,47 @@ func (r *ttlRegistry) addDNS(f filter.Filter, cidr *net.IPNet, list ruleList, tt
 	return r.addSourceLocked(f, cidr, list, sourceDNS, ttl, now)
 }
 
+// addSystem installs a permanent daemon-owned entry. It is used for
+// attachment infrastructure that must remain reachable independently of
+// authoritative control-plane desired state and DNS-derived admission.
+func (r *ttlRegistry) addSystem(f filter.Filter, cidr *net.IPNet, list ruleList) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.addSourceLocked(f, cidr, list, sourceSystem, 0, time.Time{})
+}
+
+// removeSystem rolls back this daemon generation's system claim. Independent
+// CP/DNS aliases survive; the physical entry is removed only when system was
+// its sole owner. On removal failure the source-less entry remains for retry.
+func (r *ttlRegistry) removeSystem(f filter.Filter, cidr *net.IPNet, list ruleList) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	key := ttlKey{cidr: cidr.String(), list: list}
+	entry, ok := r.entries[key]
+	if !ok || !entry.systemLive {
+		return nil
+	}
+	entry.systemLive = false
+	if entry.cpLive || entry.dnsLive {
+		r.entries[key] = entry
+		return nil
+	}
+	var err error
+	if f != nil {
+		if list == listAllow {
+			err = f.RemoveAllowedIP(entry.cidr)
+		} else {
+			err = f.RemoveDeniedIP(entry.cidr)
+		}
+	}
+	if err != nil {
+		r.entries[key] = entry
+		return err
+	}
+	delete(r.entries, key)
+	return nil
+}
+
 // addSourceLocked updates one source's lifetime on the entry and writes the
 // CIDR to the filter if it is not already there. On a filter write error
 // nothing is recorded (an existing entry keeps its previous lifetimes) and
@@ -177,6 +227,8 @@ func (r *ttlRegistry) addSourceLocked(f filter.Filter, cidr *net.IPNet, list rul
 		if !entry.dnsLive || entry.dnsDeadline.Before(deadline) {
 			entry.dnsLive, entry.dnsDeadline = true, deadline
 		}
+	case sourceSystem:
+		entry.systemLive = true
 	}
 
 	if f != nil && !entry.inFilter {
@@ -239,7 +291,10 @@ func (r *ttlRegistry) reconcileCP(f filter.Filter, list ruleList, desired []pars
 		// already false; continue into the same removal path so every retry keeps
 		// reporting failure until the stale kernel rule is actually gone.
 		entry.cpLive, entry.cpDeadline = false, time.Time{}
-		if entry.dnsLive && entry.dnsDeadline.After(now) {
+		if entry.dnsLive && !entry.dnsDeadline.After(now) {
+			entry.dnsLive, entry.dnsDeadline = false, time.Time{}
+		}
+		if entry.systemLive || entry.dnsLive {
 			// DNS still wants it: keep the filter entry, drop only the CP
 			// source. It ages out via its DNS deadline.
 			r.entries[key] = entry
@@ -308,8 +363,9 @@ func (r *ttlRegistry) replaceCPSourceLocked(f filter.Filter, cidr *net.IPNet, li
 	return nil
 }
 
-// remove deletes the CIDR from the given filter list and purges the whole
-// entry (all sources) so the janitor never "expires" an entry that was
+// remove deletes control-plane and DNS ownership for the CIDR. A protected
+// system owner survives without a filter syscall; otherwise it purges the
+// whole entry so the janitor never "expires" an entry that was
 // explicitly removed (and possibly re-added as permanent) in the meantime.
 // Mirroring expire()'s fail-safe philosophy, the bookkeeping is only
 // dropped after the filter removal succeeds: if the rule is still in the
@@ -320,6 +376,14 @@ func (r *ttlRegistry) replaceCPSourceLocked(f filter.Filter, cidr *net.IPNet, li
 func (r *ttlRegistry) remove(f filter.Filter, cidr *net.IPNet, list ruleList) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	key := ttlKey{cidr: cidr.String(), list: list}
+	if entry, ok := r.entries[key]; ok && entry.systemLive {
+		entry.cpLive, entry.cpDeadline = false, time.Time{}
+		entry.dnsLive, entry.dnsDeadline = false, time.Time{}
+		r.entries[key] = entry
+		return nil
+	}
 
 	if f != nil {
 		var err error
@@ -332,21 +396,45 @@ func (r *ttlRegistry) remove(f filter.Filter, cidr *net.IPNet, list ruleList) er
 			return err
 		}
 	}
-	delete(r.entries, ttlKey{cidr: cidr.String(), list: list})
+	delete(r.entries, key)
 	return nil
 }
 
-// clear wipes all filter rules and all tracked entries atomically with
-// respect to concurrent adds and janitor sweeps.
+// clear removes ordinary filter rules as a delta while preserving daemon-owned
+// system entries in place. It deliberately never calls Filter.ClearRules:
+// implementations clear several maps sequentially, which would temporarily
+// remove the DNS bootstrap and could leave it absent on a partial failure.
+// Failed ordinary removals remain source-less in the registry for janitor retry.
 func (r *ttlRegistry) clear(f filter.Filter) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	r.entries = make(map[ttlKey]ttlEntry)
-	if f == nil {
-		return nil
+	var errs []error
+	for key, entry := range r.entries {
+		if entry.systemLive {
+			entry.cpLive, entry.cpDeadline = false, time.Time{}
+			entry.dnsLive, entry.dnsDeadline = false, time.Time{}
+			r.entries[key] = entry
+			continue
+		}
+		entry.cpLive, entry.cpDeadline = false, time.Time{}
+		entry.dnsLive, entry.dnsDeadline = false, time.Time{}
+		var err error
+		if f != nil {
+			if key.list == listAllow {
+				err = f.RemoveAllowedIP(entry.cidr)
+			} else {
+				err = f.RemoveDeniedIP(entry.cidr)
+			}
+		}
+		if err != nil {
+			r.entries[key] = entry
+			errs = append(errs, fmt.Errorf("removing %s: %w", key.cidr, err))
+			continue
+		}
+		delete(r.entries, key)
 	}
-	return f.ClearRules()
+	return errors.Join(errs...)
 }
 
 // purge drops all tracked entries without touching the filter. Used when an
@@ -376,7 +464,7 @@ func (r *ttlRegistry) pendingLen() int {
 	defer r.mu.Unlock()
 	n := 0
 	for _, entry := range r.entries {
-		if !entry.cpPermanent() {
+		if !entry.systemLive && !entry.cpPermanent() {
 			n++
 		}
 	}
@@ -425,7 +513,7 @@ func (r *ttlRegistry) expire(f filter.Filter, now time.Time) []sweptEntry {
 			entry.dnsLive, entry.dnsDeadline = false, time.Time{}
 			changed = true
 		}
-		if entry.cpLive || entry.dnsLive {
+		if entry.systemLive || entry.cpLive || entry.dnsLive {
 			if changed {
 				r.entries[key] = entry
 			}

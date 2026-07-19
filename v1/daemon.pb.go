@@ -425,9 +425,13 @@ type AttachmentInfo struct {
 	AttachedAt *timestamppb.Timestamp `protobuf:"bytes,12,opt,name=attached_at,json=attachedAt,proto3" json:"attached_at,omitempty"`
 	// TC attach direction for TC attachments (UNSPECIFIED = EGRESS).
 	// Not meaningful for cgroup attachments.
-	TcDirection   TcDirection `protobuf:"varint,13,opt,name=tc_direction,json=tcDirection,proto3,enum=netfence.v1.TcDirection" json:"tc_direction,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	TcDirection TcDirection `protobuf:"varint,13,opt,name=tc_direction,json=tcDirection,proto3,enum=netfence.v1.TcDirection" json:"tc_direction,omitempty"`
+	// DNS queries that ended in SERVFAIL or another resolver/proxy/admission
+	// failure. This is exclusive of allowed successes and policy-blocked
+	// REFUSED responses.
+	DnsQueriesErrors uint64 `protobuf:"varint,14,opt,name=dns_queries_errors,json=dnsQueriesErrors,proto3" json:"dns_queries_errors,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *AttachmentInfo) Reset() {
@@ -551,6 +555,13 @@ func (x *AttachmentInfo) GetTcDirection() TcDirection {
 	return TcDirection_TC_DIRECTION_UNSPECIFIED
 }
 
+func (x *AttachmentInfo) GetDnsQueriesErrors() uint64 {
+	if x != nil {
+		return x.DnsQueriesErrors
+	}
+	return 0
+}
+
 // DaemonStatus contains the current state of the daemon.
 type DaemonStatus struct {
 	state    protoimpl.MessageState `protogen:"open.v1"`
@@ -666,7 +677,7 @@ const file_v1_daemon_proto_rawDesc = "" +
 	"\vattachments\x18\x01 \x03(\v2\x1b.netfence.v1.AttachmentInfoR\vattachments\x12&\n" +
 	"\x0fnext_page_token\x18\x02 \x01(\tR\rnextPageToken\x12\x1f\n" +
 	"\vtotal_count\x18\x03 \x01(\x05R\n" +
-	"totalCount\"\x98\x05\n" +
+	"totalCount\"\xc6\x05\n" +
 	"\x0eAttachmentInfo\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x16\n" +
 	"\x06target\x18\x02 \x01(\tR\x06target\x12/\n" +
@@ -683,7 +694,8 @@ const file_v1_daemon_proto_rawDesc = "" +
 	"\x13dns_queries_blocked\x18\v \x01(\x04R\x11dnsQueriesBlocked\x12;\n" +
 	"\vattached_at\x18\f \x01(\v2\x1a.google.protobuf.TimestampR\n" +
 	"attachedAt\x12;\n" +
-	"\ftc_direction\x18\r \x01(\x0e2\x18.netfence.v1.TcDirectionR\vtcDirection\x1a;\n" +
+	"\ftc_direction\x18\r \x01(\x0e2\x18.netfence.v1.TcDirectionR\vtcDirection\x12,\n" +
+	"\x12dns_queries_errors\x18\x0e \x01(\x04R\x10dnsQueriesErrors\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x8e\x02\n" +

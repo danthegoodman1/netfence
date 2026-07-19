@@ -25,6 +25,12 @@ type CgroupFilter struct {
 	cgroupLink6  link.Link
 	sendmsgLink4 link.Link
 	sendmsgLink6 link.Link
+	removePinDir func(string) error
+	// closeHandlesForTest is nil in production. It lets unit tests exercise
+	// Detach's close-once/unpin-retry state machine without privileged BPF FDs.
+	closeHandlesForTest   func() error
+	handlesCloseAttempted bool
+	handlesCloseErr       error
 }
 
 // NewCgroupFilter creates a new cgroup-based filter attached to the specified
@@ -131,6 +137,7 @@ func NewCgroupFilterWithOptions(cgroupPath string, mode PolicyMode, carveouts Ca
 		cgroupLink6:  link6,
 		sendmsgLink4: sendmsg4,
 		sendmsgLink6: sendmsg6,
+		removePinDir: os.RemoveAll,
 	}
 
 	// Pin links + maps last, once everything is attached: a crash before this
@@ -158,15 +165,12 @@ func NewCgroupFilterWithOptions(cgroupPath string, mode PolicyMode, carveouts Ca
 // place for the caller to inspect or remove.
 func LoadPinnedCgroupFilter(cgroupPath, pinDir string) (_ *CgroupFilter, retErr error) {
 	f := &CgroupFilter{
-		objs:       &cgroupObjects{},
-		cgroupPath: cgroupPath,
-		pinDir:     pinDir,
+		objs:         &cgroupObjects{},
+		cgroupPath:   cgroupPath,
+		pinDir:       pinDir,
+		removePinDir: os.RemoveAll,
 	}
-	defer func() {
-		if retErr != nil {
-			_ = f.closeHandles()
-		}
-	}()
+	defer closePinnedLoadOnError(&retErr, f.closeHandles)
 
 	if err := loadPinnedMaps(pinDir, map[string]**ebpf.Map{
 		pinAllowedIPv4: &f.objs.AllowedIpv4,
@@ -196,7 +200,7 @@ func LoadPinnedCgroupFilter(cgroupPath, pinDir string) (_ *CgroupFilter, retErr 
 	} {
 		l, err := link.LoadPinnedLink(filepath.Join(pinDir, name), nil)
 		if err != nil {
-			return nil, fmt.Errorf("loading pinned link %s: %w", name, err)
+			return nil, pinnedObjectLoadError("link", name, err)
 		}
 		*dst = l
 		if err := validateCgroupLinkTarget(l, name, cgroupID); err != nil {
@@ -246,7 +250,11 @@ func (f *CgroupFilter) Detach() error {
 	// Removing the bpffs entries IS the unpin: once the pin files are gone,
 	// our fds hold the only references and closeHandles drops them.
 	if f.pinDir != "" {
-		if err := os.RemoveAll(f.pinDir); err != nil {
+		remove := f.removePinDir
+		if remove == nil {
+			remove = os.RemoveAll
+		}
+		if err := remove(f.pinDir); err != nil {
 			errs = append(errs, fmt.Errorf("removing pin dir %s: %w", f.pinDir, err))
 		}
 	}
@@ -261,35 +269,55 @@ func (f *CgroupFilter) Detach() error {
 
 // closeHandles closes all fds. Callers hold f.mu (or have exclusive access
 // during construction).
-func (f *CgroupFilter) closeHandles() error {
+func (f *CgroupFilter) closeHandles() (retErr error) {
+	if f.handlesCloseAttempted {
+		return f.handlesCloseErr
+	}
+	f.handlesCloseAttempted = true
+	defer func() { f.handlesCloseErr = retErr }()
+	if f.closeHandlesForTest != nil {
+		closeFn := f.closeHandlesForTest
+		f.closeHandlesForTest = nil
+		return closeFn()
+	}
 	var errs []error
 
 	if f.cgroupLink4 != nil {
-		if err := f.cgroupLink4.Close(); err != nil {
+		l := f.cgroupLink4
+		f.cgroupLink4 = nil
+		if err := l.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("closing IPv4 cgroup link: %w", err))
 		}
 	}
 
 	if f.cgroupLink6 != nil {
-		if err := f.cgroupLink6.Close(); err != nil {
+		l := f.cgroupLink6
+		f.cgroupLink6 = nil
+		if err := l.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("closing IPv6 cgroup link: %w", err))
 		}
 	}
 
 	if f.sendmsgLink4 != nil {
-		if err := f.sendmsgLink4.Close(); err != nil {
+		l := f.sendmsgLink4
+		f.sendmsgLink4 = nil
+		if err := l.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("closing IPv4 sendmsg cgroup link: %w", err))
 		}
 	}
 
 	if f.sendmsgLink6 != nil {
-		if err := f.sendmsgLink6.Close(); err != nil {
+		l := f.sendmsgLink6
+		f.sendmsgLink6 = nil
+		if err := l.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("closing IPv6 sendmsg cgroup link: %w", err))
 		}
 	}
 
 	if f.objs != nil {
-		if err := f.objs.Close(); err != nil {
+		objs := f.objs
+		f.objs = nil
+		if err := objs.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("closing eBPF objects: %w", err))
 		}
 	}
@@ -304,6 +332,9 @@ func (f *CgroupFilter) closeHandles() error {
 func (f *CgroupFilter) SetMode(mode PolicyMode) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.objs == nil || f.objs.PolicyMode == nil {
+		return fmt.Errorf("filter handles are closed")
+	}
 	return f.objs.PolicyMode.Put(uint32(0), uint8(mode))
 }
 
@@ -408,6 +439,9 @@ func (f *CgroupFilter) GetStats() (Stats, error) {
 	defer f.mu.Unlock()
 
 	var stats Stats
+	if f.objs == nil || f.objs.Stats == nil {
+		return stats, fmt.Errorf("filter handles are closed")
+	}
 	allowed, err := sumPerCPUCounter(f.objs.Stats, 0)
 	if err != nil {
 		return stats, fmt.Errorf("reading allowed count: %w", err)

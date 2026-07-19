@@ -134,7 +134,8 @@ func TestDaemonCIDRTTLExpiryTraffic(t *testing.T) {
 }
 
 // TestDaemonMapFullSurfacedAndRecovers configures tiny rule maps
-// (filter.max_rule_entries=2), fills them, and verifies that the overflow
+// (filter.max_rule_entries=3: protected DNS bootstrap + two test entries),
+// fills them, and verifies that the overflow
 // add (a) fails loudly instead of silently, (b) is surfaced via the
 // AttachmentStats map_full_drops counter, and (c) succeeds after the TTL
 // janitor expires an entry and frees capacity.
@@ -145,7 +146,7 @@ func TestDaemonMapFullSurfacedAndRecovers(t *testing.T) {
 
 	ts := newTestServerWithConfig(t, func(cfg *config.Config) {
 		cfg.TTLJanitorInterval = 50 * time.Millisecond
-		cfg.Filter.MaxRuleEntries = 2
+		cfg.Filter.MaxRuleEntries = 3
 		cfg.DNS.PortMin = 32200
 		cfg.DNS.PortMax = 32300
 	})
@@ -166,7 +167,8 @@ func TestDaemonMapFullSurfacedAndRecovers(t *testing.T) {
 		return cidr
 	}
 
-	// Fill the 2-entry allowed_ipv4 map: one short-TTL entry, one permanent.
+	// The protected DNS bootstrap occupies one entry. Fill the remaining two
+	// allowed_ipv4 slots with one short-TTL entry and one permanent entry.
 	require.NoError(t, ts.server.AllowCIDR(resp.Id, mustParse("198.51.100.1/32"), time.Second))
 	require.NoError(t, ts.server.AllowCIDR(resp.Id, mustParse("198.51.100.2/32"), 0))
 

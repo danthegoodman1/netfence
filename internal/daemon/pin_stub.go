@@ -10,3 +10,5 @@ package daemon
 func ensureBPFPinRoot(string) error {
 	return nil
 }
+
+func validateExistingBPFPinRoot(string) error { return nil }

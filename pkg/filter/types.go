@@ -1,8 +1,25 @@
 package filter
 
 import (
+	"errors"
 	"fmt"
 	"net"
+)
+
+var (
+	// ErrPinnedStateInvalid marks a pin set that is explicitly incomplete or
+	// structurally incompatible with the filter that owns it. Callers may
+	// discard that exact pin set and recreate the attachment.
+	ErrPinnedStateInvalid = errors.New("pinned filter state is structurally invalid")
+	// ErrPinnedTargetMismatch marks a successfully inspected pinned link whose
+	// kernel target identity differs from the live object currently at the
+	// persisted name/path. The old link is defunct and may be discarded.
+	ErrPinnedTargetMismatch = errors.New("pinned filter target identity changed")
+	// ErrPinnedStateCloseFailed marks an ambiguous attempt to close handles
+	// opened during a failed pinned-state load. Even if the primary load error
+	// is otherwise discardable, callers must preserve pins when this marker is
+	// present because userspace no longer knows which references remain live.
+	ErrPinnedStateCloseFailed = errors.New("closing partially loaded pinned filter state failed")
 )
 
 // PolicyMode defines the filtering behavior

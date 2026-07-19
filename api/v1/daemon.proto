@@ -97,6 +97,10 @@ message AttachmentInfo {
   // TC attach direction for TC attachments (UNSPECIFIED = EGRESS).
   // Not meaningful for cgroup attachments.
   TcDirection tc_direction = 13;
+  // DNS queries that ended in SERVFAIL or another resolver/proxy/admission
+  // failure. This is exclusive of allowed successes and policy-blocked
+  // REFUSED responses.
+  uint64 dns_queries_errors = 14;
 }
 
 // DaemonStatus contains the current state of the daemon.

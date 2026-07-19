@@ -189,15 +189,15 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 5A: auto-allow DNS address per attachment + topology docs | Missing: implementation + bootstrap test. |
-| Incomplete | Work | 5B: TCP listener + upstream TCP fallback | Missing: implementation + truncation test. |
-| Incomplete | Work | 5C: honor `DnsConfig.upstream_servers` | Missing: plumbing (currently ignored proto field). |
-| Incomplete | Work | 5D: HTTPS/SVCB hint policy | Missing: decision + implementation. |
-| Incomplete | Work | 5E: split error vs blocked counters | Missing: implementation. |
+| Complete | Work | 5A: auto-allow DNS address per attachment + topology docs | Protected system-owned `/32`/`/128` bootstrap survives authoritative replacement, clear, removal, and TTL expiry. Attach/restore fail closed across DNS, watcher, pin, and cleanup failures; README documents container/netns listen topology and cgroup port-granularity implications. Real cgroup + TC workload tests resolve through a non-carveout assigned DNS address with no manual DNS-IP rule. |
+| Complete | Work | 5B: TCP listener + upstream TCP fallback | UDP and TCP bind atomically to the same endpoint; sibling listener death is supervised and quarantines the exact attachment. Legacy no-OPT responses truncate at 512 bytes, workload TCP retry succeeds, and upstream TC responses retry over TCP on the same upstream before ordered failover. Unit/race tests and cgroup + TC traffic tests are green. |
+| Complete | Work | 5C: honor `DnsConfig.upstream_servers` | Per-attachment upstreams are canonicalized, ordered, deduplicated, bounded to 8 unique endpoints, applied atomically, and fall back to daemon `dns.upstream` only when empty. Two same-daemon cgroup attachments resolve distinct override/global answers with cross-attachment isolation; invalid restored updates remain resync-required until a valid retry. |
+| Complete | Work | 5D: HTTPS/SVCB hint policy | Filtering modes copy responses and strip `ipv4hint`/`ipv6hint` parameters plus their `Mandatory` references across answer, authority, and additional sections; other parameters and the original message remain intact. |
+| Complete | Work | 5E: split error vs blocked counters | Added exported DNS error counters with mutually exclusive allowed/blocked/error outcomes. SERVFAIL, upstream/proxy/admission, and response-write failures count only as errors; policy refusals count only as blocked. Proto, heartbeat/list stats, README, and tests agree. |
 | Incomplete | Work | 5F: evict a domain's resolved IPs promptly when it is de-allowed (ReplaceDNSRules / domain removal) | Deferred from Phase 2 (2B reviewer F4): today a removed domain's IPs age out by TTL rather than being evicted — strictly better than pre-2B (never expired), but prompt eviction needs a domain→IPs reverse index. Missing: reverse index + eviction + test. |
 | Incomplete | Work | 5G: source-aware bounded DNS admission/eviction + atomic CP admission + fail-closed deny pressure | Missing: separate exact-IP DNS allow tier, entry/domain/response/metadata caps, rolling eviction budget, working-set preservation with SERVFAIL throttling, protected authoritative/deny entries, atomic preflight, degraded-state recovery, occupancy/eviction/throttle stats, and README/proto contract. |
 | Incomplete | Test | Capacity-and-churn traffic tests and BPF/DNS benchmarks | Missing: tiny-capacity cgroup+TC tests proving eviction stops at the configured budget, metadata stays bounded, the working set survives throttling, DNS never returns uninstalled IPs, deny failure blocks, expiry/window recovery converges, and `make bench-docker` stays within thresholds. |
-| Incomplete | Gate | Bootstrap/TCP/upstream/capacity tests green in Docker gate | Missing: tests. |
+| Incomplete | Gate | Bootstrap/TCP/upstream/capacity tests green in Docker gate | 5A–5E accepted by skeptical review; `make check-docker`, `make test-docker`, `make test-docker-cgroup`, and `make test-docker-tc` all green, with both new DNS workload tests explicitly RUN/PASS. Still missing the 5F/5G ownership, bounded-capacity/LRU-budget traffic tests and benchmark evidence. |
 
 ## Phase 6: Local API and CLI completeness
 

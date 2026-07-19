@@ -13,7 +13,7 @@ Your control plane pushes network rules like `ALLOW *.pypi.org` or `ALLOW 10.0.0
 - Attach eBPF filters to network interfaces (TC) or cgroups
 - Policy modes: disabled, allowlist, denylist, block-all
 - IPv4 and IPv6 CIDR support with optional TTLs
-- Per-attachment DNS server with domain allowlist/denylist
+- Per-attachment UDP/TCP DNS server with domain allowlist/denylist and ordered upstream overrides
 - Domain rules support subdomains with specificity-based matching (more specific rules win)
 - Resolved domains auto-populate IP filter
 - Metadata on daemons and attachments for associating with VM ID, tenant, etc.
@@ -109,7 +109,59 @@ These numbers measure the DNS server path, not the warmed socket connect path.
                               (veth, eth)  (containers)
 ```
 
-Each attachment gets a unique DNS address (port) provisioned by the daemon. Containers/VMs should be configured to use their assigned DNS address.
+Each attachment gets a unique DNS address (port) provisioned by the daemon. Containers/VMs must be configured to use their assigned DNS address; filtering ordinary workload DNS traffic does not transparently redirect it.
+
+### DNS resolver topology and behavior
+
+`dns.listen_addr` must identify one concrete IPv4 or IPv6 address that every
+attached workload can reach. Wildcard addresses are rejected because they
+cannot be advertised as resolver endpoints. A configured hostname is resolved
+once when the daemon starts and the resulting concrete IP is used for binding,
+advertising, persistence, and filter bootstrap. The default `127.0.0.1` is
+appropriate only when the workload shares the daemon's network namespace; a
+container or VM in another namespace normally needs a reachable host/bridge
+address instead.
+
+```yaml
+dns:
+  listen_addr: 10.0.0.1
+  port_min: 11000
+  port_max: 11500
+  # Daemon-global fallback when DnsConfig.upstream_servers is empty.
+  upstream: 1.1.1.1:53
+```
+
+Attach returns the concrete `dns_address`; configure that exact address as the
+workload's resolver. Netfence installs a protected, non-expiring `/32` or
+`/128` allow entry for the listener IP so allowlist mode can bootstrap without
+a control-plane DNS-IP rule. The current filters enforce IP prefixes, not
+destination ports, so that protected entry permits every port at the listener
+IP (not only its DNS port); this is especially important for cgroup attachment
+threat models. Use a dedicated listener IP when that broader reachability is
+not acceptable.
+
+The assigned endpoint serves both UDP and TCP. UDP replies are truncated to a
+legacy client's 512-byte limit or its advertised EDNS size and carry `TC` when
+needed, allowing the workload to retry the same endpoint over TCP. For upstream
+resolution, a truncated UDP answer is retried over TCP against the same
+upstream first. A transport failure, `SERVFAIL`, or `REFUSED` then advances to
+the next configured upstream in order.
+
+`DnsConfig.upstream_servers` overrides the daemon-global `dns.upstream` for one
+attachment. Entries use `host:port` syntax (bracket IPv6 literals), are
+canonicalized and de-duplicated in first-seen order, and are limited to eight
+unique servers. An empty list selects the global fallback.
+
+In filtering modes, Netfence strips `ipv4hint` and `ipv6hint` parameters from
+HTTPS/SVCB answers, including their corresponding `mandatory` references,
+because hinted addresses have not independently passed filter admission.
+Disabled mode preserves upstream answers unchanged.
+
+DNS query counters are mutually exclusive: `dns_queries_allowed` counts
+successfully answered policy-allowed queries (including NXDOMAIN),
+`dns_queries_blocked` counts policy `REFUSED` responses, and
+`dns_queries_errors` counts resolver, proxy, filter-admission, response-write,
+and other error paths. A query increments exactly one bucket.
 
 ## Per host
 
@@ -269,6 +321,13 @@ Notes on re-adopted state:
   restore that cannot adopt valid pins recreates the attachment in its
   persisted mode with empty maps (fail-closed for allowlist/block-all) and
   uses the same `SubscribedAck` handshake to repopulate it.
+- DNS domain rules and per-attachment upstream overrides are authoritative
+  control-plane state and are not persisted. A restored attachment whose last
+  DNS mode was ALLOWLIST, DENYLIST, or PROXY starts its resolver in an empty
+  ALLOWLIST posture, returning `REFUSED` until a valid complete
+  `SubscribedAck` applies. An explicitly DISABLED DNS mode remains forwarding.
+  If either committed UDP/TCP listener later dies unexpectedly, the attachment
+  is quarantined in IP `BLOCK_ALL` and reported as an error unsubscribe.
 - The per-attachment DNS server is a userspace component and stops with the
   daemon; while the daemon is down, already-resolved (still unexpired) IPs
   keep working but new names cannot be resolved through it.

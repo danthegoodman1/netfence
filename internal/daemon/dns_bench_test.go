@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"net"
 	"testing"
 	"time"
@@ -107,7 +108,7 @@ func benchmarkRegistrySink(b *testing.B) (DNSFilterSink, *ttlRegistry) {
 func benchmarkDNSProxyQuery(b *testing.B, cold bool) {
 	sink, reg := benchmarkRegistrySink(b)
 	addr := freeUDPAddress(b)
-	server := NewDNSServer("bench", addr, "127.0.0.1:1", zerolog.Nop(), sink, func(string, string) (DnsProxyDecision, error) {
+	server := NewDNSServer("bench", addr, "127.0.0.1:1", zerolog.Nop(), sink, func(context.Context, string, string) (DnsProxyDecision, error) {
 		return DnsProxyDecision{
 			Allow:       true,
 			AddToFilter: true,

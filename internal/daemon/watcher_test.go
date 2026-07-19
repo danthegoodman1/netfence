@@ -524,6 +524,7 @@ func TestAttachFailsWhenIdentityChangesInWatchRegistrationRecheck(t *testing.T) 
 	require.Error(t, err)
 	require.Nil(t, resp)
 	require.Contains(t, err.Error(), "interface identity changed during watch registration")
+	require.ErrorIs(t, err, errTargetIdentityChanged)
 	require.GreaterOrEqual(t, identityCalls.Load(), int64(4))
 
 	select {
@@ -628,6 +629,7 @@ func TestWatcherCgroupRegistrationWindowReplacementDispatchesExactGeneration(t *
 	token, err := w.WatchCgroup(cgroup, oldIdentity)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "cgroup identity changed during watch registration")
+	require.ErrorIs(t, err, errTargetIdentityChanged)
 	select {
 	case got := <-removed:
 		require.Equal(t, token, got)

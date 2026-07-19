@@ -166,7 +166,7 @@ func (w *TargetWatcher) WatchInterface(name string, ifindex uint64) (watchToken,
 	}
 	if currentIfindex != ifindex {
 		w.dispatchInterfaceRemoved(token, "registration-recheck")
-		return token, fmt.Errorf("interface identity changed during watch registration: was %d, now %d", ifindex, currentIfindex)
+		return token, fmt.Errorf("interface identity changed during watch registration: was %d, now %d: %w", ifindex, currentIfindex, errTargetIdentityChanged)
 	}
 	return token, nil
 }
@@ -225,7 +225,7 @@ func (w *TargetWatcher) WatchCgroup(path string, identity uint64) (watchToken, e
 	}
 	if currentIdentity != identity {
 		w.dispatchCgroupRemoved(token)
-		return token, fmt.Errorf("cgroup identity changed during watch registration: was %d, now %d", identity, currentIdentity)
+		return token, fmt.Errorf("cgroup identity changed during watch registration: was %d, now %d: %w", identity, currentIdentity, errTargetIdentityChanged)
 	}
 	return token, nil
 }

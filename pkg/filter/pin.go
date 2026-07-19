@@ -4,6 +4,7 @@ package filter
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -107,11 +108,31 @@ func loadPinnedMaps(dir string, dsts map[string]**ebpf.Map) error {
 	for name, dst := range dsts {
 		m, err := ebpf.LoadPinnedMap(filepath.Join(dir, name), nil)
 		if err != nil {
-			return fmt.Errorf("loading pinned map %s: %w", name, err)
+			return pinnedObjectLoadError("map", name, err)
 		}
 		*dst = m
 	}
 	return nil
+}
+
+func pinnedObjectLoadError(kind, name string, err error) error {
+	if errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("%w: missing pinned %s %s: %w", ErrPinnedStateInvalid, kind, name, err)
+	}
+	return fmt.Errorf("loading pinned %s %s: %w", kind, name, err)
+}
+
+// closePinnedLoadOnError finalizes a failed pinned-state load without losing
+// a close ambiguity behind the primary error. ErrPinnedStateCloseFailed is a
+// veto marker: restore callers must not remove pins when it is present, even
+// when the primary failure is structurally discardable.
+func closePinnedLoadOnError(retErr *error, closeHandles func() error) {
+	if retErr == nil || *retErr == nil {
+		return
+	}
+	if closeErr := closeHandles(); closeErr != nil {
+		*retErr = errors.Join(*retErr, fmt.Errorf("%w: %w", ErrPinnedStateCloseFailed, closeErr))
+	}
 }
 
 // currentCgroupID returns the kernel cgroup id of the cgroup v2 directory at
@@ -146,10 +167,10 @@ func validateCgroupLinkTarget(l link.Link, name string, wantCgroupID uint64) err
 	}
 	cg := info.Cgroup()
 	if cg == nil {
-		return fmt.Errorf("pinned link %s: kernel reported no cgroup link info; cannot verify it targets the live cgroup", name)
+		return fmt.Errorf("%w: pinned link %s has no cgroup link info", ErrPinnedStateInvalid, name)
 	}
 	if cg.CgroupId != wantCgroupID {
-		return fmt.Errorf("pinned link %s is attached to cgroup id %d but the target path is now cgroup id %d — the cgroup was recreated while the daemon was down and this link is defunct", name, cg.CgroupId, wantCgroupID)
+		return fmt.Errorf("%w: pinned link %s is attached to cgroup id %d but the target path is now cgroup id %d", ErrPinnedTargetMismatch, name, cg.CgroupId, wantCgroupID)
 	}
 	return nil
 }
@@ -164,10 +185,10 @@ func validateTCXLinkTarget(l link.Link, name string, wantIfindex int) error {
 	}
 	tcx := info.TCX()
 	if tcx == nil {
-		return fmt.Errorf("pinned link %s: kernel reported no TCX link info; cannot verify it targets the live interface", name)
+		return fmt.Errorf("%w: pinned link %s has no TCX link info", ErrPinnedStateInvalid, name)
 	}
 	if tcx.Ifindex != uint32(wantIfindex) {
-		return fmt.Errorf("pinned link %s is attached to ifindex %d but the interface is now ifindex %d — the interface was recreated while the daemon was down and this link is defunct", name, tcx.Ifindex, wantIfindex)
+		return fmt.Errorf("%w: pinned link %s is attached to ifindex %d but the interface is now ifindex %d", ErrPinnedTargetMismatch, name, tcx.Ifindex, wantIfindex)
 	}
 	return nil
 }

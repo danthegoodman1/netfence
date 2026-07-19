@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -58,13 +59,13 @@ func newAttachTestEnv(t *testing.T, port int) *attachTestEnv {
 	server.setTargetIdentityResolver(func(apiv1.AttachmentType, string) (uint64, error) { return 1, nil })
 
 	env := &attachTestEnv{server: server, st: st, dbPath: dbPath, port: port}
-	server.newFilter = func(_, _ string, _ apiv1.AttachmentType, _ apiv1.PolicyMode, _ apiv1.TcDirection, _ uint32) (filter.Filter, error) {
+	server.newFilter = func(_, _ string, _ apiv1.AttachmentType, mode apiv1.PolicyMode, _ apiv1.TcDirection, _ uint32) (filter.Filter, error) {
 		env.mu.Lock()
 		defer env.mu.Unlock()
 		if env.filterErr != nil {
 			return nil, env.filterErr
 		}
-		ff := &fakeFilter{}
+		ff := &fakeFilter{mode: apiModeToFilterMode(mode)}
 		env.filters = append(env.filters, ff)
 		return ff, nil
 	}
@@ -157,13 +158,17 @@ func dispatchAttachAck(t *testing.T, client *ControlPlaneClient, id string, epoc
 	}, epoch)
 }
 
-// assertUDPPortFree asserts nothing (i.e. no leaked DNS server) is bound to
-// the port.
-func assertUDPPortFree(t *testing.T, port int) {
+// assertDNSPortFree verifies rollback did not leak either half of the
+// dual-protocol DNS endpoint.
+func assertDNSPortFree(t *testing.T, port int) {
 	t.Helper()
-	conn, err := net.ListenPacket("udp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+	udp, err := net.ListenPacket("udp", addr)
 	require.NoError(t, err, "expected DNS port to be unbound after rollback")
-	require.NoError(t, conn.Close())
+	tcp, err := net.Listen("tcp", addr)
+	require.NoError(t, err, "expected TCP DNS port to be unbound after rollback")
+	require.NoError(t, tcp.Close())
+	require.NoError(t, udp.Close())
 }
 
 // TestAttachDetachRaceDuringSubscribeAck is the core race regression: an
@@ -264,12 +269,35 @@ func TestAttachHappyPathNoControlPlane(t *testing.T) {
 	filters := env.createdFilters()
 	require.Len(t, filters, 1)
 	assert.Zero(t, filters[0].closeCallCount())
+	_, allowed, _, _ := filters[0].snapshot()
+	assert.Equal(t, []string{testDNSBootstrapCIDR}, allowed, "assigned resolver must be reachable without a control-plane DNS-IP rule")
 
 	// Detach releases everything exactly once.
 	_, err = env.server.Detach(context.Background(), &apiv1.DetachRequest{Id: resp.Id})
 	require.NoError(t, err)
 	assert.Equal(t, 1, filters[0].closeCallCount())
 	env.assertNoResidue(t)
+}
+
+func TestAttachBootstrapInsertionFailureRollsBackEverything(t *testing.T) {
+	env := newAttachTestEnv(t, 12112)
+	newFilter := env.server.newFilter
+	env.server.newFilter = func(pinDir, target string, attachType apiv1.AttachmentType, mode apiv1.PolicyMode, direction apiv1.TcDirection, maxRuleEntries uint32) (filter.Filter, error) {
+		f, err := newFilter(pinDir, target, attachType, mode, direction, maxRuleEntries)
+		if err == nil {
+			f.(*fakeFilter).setAllowErr(syscall.ENOSPC)
+		}
+		return f, err
+	}
+
+	resp, err := env.server.Attach(context.Background(), attachInterfaceReq("bootstrap-fail-if0"))
+	require.ErrorContains(t, err, "protected DNS bootstrap route")
+	assert.Nil(t, resp)
+	env.assertNoResidue(t)
+	filters := env.createdFilters()
+	require.Len(t, filters, 1)
+	assert.Equal(t, 1, filters[0].detachCallCount())
+	assertDNSPortFree(t, env.port)
 }
 
 // TestAttachRejectsInterfaceIdentityChangeBeforeWatchRegistration proves the
@@ -382,7 +410,7 @@ func TestAttachRollbackOnFilterCreateError(t *testing.T) {
 
 	env.assertNoResidue(t)
 	assert.Empty(t, env.createdFilters())
-	assertUDPPortFree(t, env.port)
+	assertDNSPortFree(t, env.port)
 }
 
 func TestAttachRollbackOnDNSStartError(t *testing.T) {
@@ -395,7 +423,7 @@ func TestAttachRollbackOnDNSStartError(t *testing.T) {
 
 	_, err = env.server.Attach(context.Background(), attachInterfaceReq("dnsfail-if0"))
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "starting DNS server")
+	assert.Contains(t, err.Error(), "binding DNS server")
 
 	env.assertNoResidue(t)
 	filters := env.createdFilters()
@@ -423,7 +451,7 @@ func TestAttachRollbackOnStoreSaveError(t *testing.T) {
 	filters := env.createdFilters()
 	require.Len(t, filters, 1)
 	assert.Equal(t, 1, filters[0].closeCallCount(), "staged filter must be closed exactly once")
-	assertUDPPortFree(t, env.port)
+	assertDNSPortFree(t, env.port)
 
 	// The row never landed: verify against a fresh store handle.
 	reopened, err := store.New(env.dbPath)
@@ -432,6 +460,92 @@ func TestAttachRollbackOnStoreSaveError(t *testing.T) {
 	rows, err := reopened.GetAllAttachments()
 	require.NoError(t, err)
 	assert.Empty(t, rows)
+}
+
+func TestAttachPreRegistrationDetachFailureRetainsOwnedBlockAllState(t *testing.T) {
+	env := newAttachTestEnv(t, 12161)
+	newFilter := env.server.newFilter
+	env.server.newFilter = func(pinDir, target string, attachType apiv1.AttachmentType, mode apiv1.PolicyMode, direction apiv1.TcDirection, maxRuleEntries uint32) (filter.Filter, error) {
+		f, err := newFilter(pinDir, target, attachType, mode, direction, maxRuleEntries)
+		if err == nil {
+			f.(*fakeFilter).setDetachErr(syscall.EIO)
+		}
+		return f, err
+	}
+	var saveCalls int
+	env.server.saveAttachment = func(a *store.Attachment) error {
+		saveCalls++
+		if saveCalls == 1 {
+			return errors.New("injected primary store save failure")
+		}
+		return env.st.SaveAttachment(a)
+	}
+
+	resp, err := env.server.Attach(context.Background(), attachInterfaceReq("degraded-pre-if0"))
+	require.Error(t, err)
+	assert.Nil(t, resp)
+	assert.Contains(t, err.Error(), "saving attachment")
+	assert.Contains(t, err.Error(), "detaching eBPF filter during attach rollback")
+	require.Equal(t, 2, saveCalls, "rollback must persist the explicit degraded owner")
+	require.Len(t, env.createdFilters(), 1)
+	ff := env.createdFilters()[0]
+	events := ff.eventLog()
+	assert.Less(t,
+		indexOfEvent(t, events, "set-mode "+filter.ModeBlockAll.String()),
+		indexOfEvent(t, events, "detach"))
+
+	rows, getErr := env.st.GetAllAttachments()
+	require.NoError(t, getErr)
+	require.Len(t, rows, 1)
+	assert.Equal(t, apiv1.PolicyMode_POLICY_MODE_BLOCK_ALL.String(), rows[0].Mode)
+	env.server.mu.RLock()
+	state := env.server.attachments[rows[0].ID]
+	require.NotNil(t, state)
+	assert.Same(t, ff, state.filter)
+	assert.Equal(t, rows[0].ID, env.server.targetIndex["degraded-pre-if0"])
+	env.server.mu.RUnlock()
+	assert.True(t, env.portInUse(), "ambiguous cleanup keeps port ownership")
+	assertDNSPortFree(t, env.port)
+}
+
+func TestAttachPostRegistrationDetachFailureRetainsOwnedBlockAllState(t *testing.T) {
+	env := newAttachTestEnv(t, 12162)
+	newFilter := env.server.newFilter
+	env.server.newFilter = func(pinDir, target string, attachType apiv1.AttachmentType, mode apiv1.PolicyMode, direction apiv1.TcDirection, maxRuleEntries uint32) (filter.Filter, error) {
+		f, err := newFilter(pinDir, target, attachType, mode, direction, maxRuleEntries)
+		if err == nil {
+			f.(*fakeFilter).setDetachErr(syscall.EIO)
+		}
+		return f, err
+	}
+	cp := NewControlPlaneClient("", env.server, zerolog.Nop(), nil, 20*time.Millisecond, nil)
+	env.server.SetControlPlaneClient(cp)
+
+	resp, err := env.server.Attach(context.Background(), attachInterfaceReq("degraded-post-if0"))
+	require.Error(t, err)
+	assert.Nil(t, resp)
+	assert.Contains(t, err.Error(), "control plane subscription failed")
+	assert.Contains(t, err.Error(), "detaching eBPF filter during attach rollback")
+	require.Len(t, env.createdFilters(), 1)
+	ff := env.createdFilters()[0]
+	events := ff.eventLog()
+	assert.Less(t,
+		indexOfEvent(t, events, "set-mode "+filter.ModeBlockAll.String()),
+		indexOfEvent(t, events, "detach"))
+
+	rows, getErr := env.st.GetAllAttachments()
+	require.NoError(t, getErr)
+	require.Len(t, rows, 1)
+	assert.Equal(t, apiv1.PolicyMode_POLICY_MODE_BLOCK_ALL.String(), rows[0].Mode)
+	env.server.mu.RLock()
+	state := env.server.attachments[rows[0].ID]
+	require.NotNil(t, state)
+	assert.Same(t, ff, state.filter)
+	assert.False(t, state.watch.valid(), "cleanup state owns the target without an active removal watch")
+	assert.Equal(t, rows[0].ID, env.server.targetIndex["degraded-post-if0"])
+	env.server.mu.RUnlock()
+	assert.True(t, env.portInUse())
+	assertDNSPortFree(t, env.port)
 }
 
 // TestAttachRollbackOnSubscribeFailure verifies the full unwind when the
@@ -451,7 +565,7 @@ func TestAttachRollbackOnSubscribeFailure(t *testing.T) {
 	filters := env.createdFilters()
 	require.Len(t, filters, 1)
 	assert.Equal(t, 1, filters[0].closeCallCount())
-	assertUDPPortFree(t, env.port)
+	assertDNSPortFree(t, env.port)
 
 	// Outbound queue: Subscribed first, then the ERROR Unsubscribed.
 	var events []*apiv1.DaemonEvent
@@ -514,7 +628,110 @@ func TestAttachRollbackOnSubscribedAckApplyFailure(t *testing.T) {
 	assert.Equal(t, 1, filters[0].detachCallCount())
 }
 
-func TestAttachTimeoutRollbackWaitsForClaimedAckApply(t *testing.T) {
+func TestZeroTimeoutInvalidSubscribedAckQuarantinesCommittedAttachment(t *testing.T) {
+	env := newAttachTestEnv(t, 12174)
+	cp := NewControlPlaneClient("", env.server, zerolog.Nop(), nil, 0, nil)
+	env.server.SetControlPlaneClient(cp)
+
+	resp, err := env.server.Attach(context.Background(), attachInterfaceReq("zero-invalid-if0"))
+	require.NoError(t, err)
+	dispatchAttachAck(t, cp, resp.Id, 1, &apiv1.SubscribedAck{
+		Mode: apiv1.PolicyMode_POLICY_MODE_UNSPECIFIED,
+	})
+
+	rows, err := env.st.GetAllAttachments()
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	assert.Equal(t, apiv1.PolicyMode_POLICY_MODE_BLOCK_ALL.String(), rows[0].Mode)
+	env.server.mu.RLock()
+	state := env.server.attachments[resp.Id]
+	require.NotNil(t, state)
+	assert.True(t, state.mutationsClosed)
+	env.server.mu.RUnlock()
+	ff := env.createdFilters()[0]
+	mode, _, _, _ := ff.snapshot()
+	assert.Equal(t, filter.ModeBlockAll, mode)
+	before := ff.eventLog()
+	require.Error(t, env.server.SetFilterMode(resp.Id, apiv1.PolicyMode_POLICY_MODE_DISABLED))
+	assert.Equal(t, before, ff.eventLog(), "quarantined attachment rejects later policy mutation")
+	assertQueuedErrorUnsubscribed(t, cp, resp.Id)
+}
+
+func TestZeroTimeoutSubscribedAckApplyFailureQuarantinesPartialDenylist(t *testing.T) {
+	env := newAttachTestEnv(t, 12175)
+	cp := NewControlPlaneClient("", env.server, zerolog.Nop(), nil, 0, nil)
+	env.server.SetControlPlaneClient(cp)
+
+	resp, err := env.server.Attach(context.Background(), attachInterfaceReq("zero-apply-if0"))
+	require.NoError(t, err)
+	ff := env.createdFilters()[0]
+	ff.setDenyErr(errors.New("injected deny-map admission failure"))
+	dispatchAttachAck(t, cp, resp.Id, 1, &apiv1.SubscribedAck{
+		Mode:      apiv1.PolicyMode_POLICY_MODE_DENYLIST,
+		DenyCidrs: []*apiv1.CIDREntry{{Cidr: "203.0.113.0/24"}},
+	})
+
+	mode, _, denied, _ := ff.snapshot()
+	assert.Equal(t, filter.ModeBlockAll, mode, "partial DENYLIST apply is forced back to fail-closed")
+	assert.Empty(t, denied)
+	events := ff.eventLog()
+	assert.Less(t,
+		indexOfEvent(t, events, "set-mode "+filter.ModeDenylist.String()),
+		indexOfEvent(t, events, "set-mode "+filter.ModeBlockAll.String()))
+	row, err := env.st.GetAttachment(resp.Id)
+	require.NoError(t, err)
+	assert.Equal(t, apiv1.PolicyMode_POLICY_MODE_BLOCK_ALL.String(), row.Mode)
+	assertQueuedErrorUnsubscribed(t, cp, resp.Id)
+}
+
+func TestCommittedAttachmentDNSListenerDeathQuarantinesBlockAll(t *testing.T) {
+	env := newAttachTestEnv(t, 12176)
+	resp, err := env.server.Attach(context.Background(), attachInterfaceReq("dns-fatal-if0"))
+	require.NoError(t, err)
+
+	env.server.mu.RLock()
+	state := env.server.attachments[resp.Id]
+	require.NotNil(t, state)
+	dnsServer := state.dns
+	env.server.mu.RUnlock()
+	dnsServer.serverMu.Lock()
+	udpConn := dnsServer.udpConn
+	dnsServer.serverMu.Unlock()
+	require.NotNil(t, udpConn)
+	require.NoError(t, udpConn.Close())
+
+	require.Eventually(t, func() bool {
+		env.server.mu.RLock()
+		defer env.server.mu.RUnlock()
+		return state.mutationsClosed
+	}, time.Second, time.Millisecond)
+	row, err := env.st.GetAttachment(resp.Id)
+	require.NoError(t, err)
+	assert.Equal(t, apiv1.PolicyMode_POLICY_MODE_BLOCK_ALL.String(), row.Mode)
+	mode, _, _, _ := env.createdFilters()[0].snapshot()
+	assert.Equal(t, filter.ModeBlockAll, mode)
+	require.Error(t, env.server.SetFilterMode(resp.Id, apiv1.PolicyMode_POLICY_MODE_DISABLED))
+}
+
+func assertQueuedErrorUnsubscribed(t *testing.T, cp *ControlPlaneClient, id string) {
+	t.Helper()
+	for {
+		select {
+		case outbound := <-cp.sendCh:
+			unsub := outbound.event.GetUnsubscribed()
+			if unsub == nil {
+				continue
+			}
+			assert.Equal(t, id, unsub.Id)
+			assert.Equal(t, apiv1.UnsubscribeReason_UNSUBSCRIBE_REASON_ERROR, unsub.Reason)
+			return
+		case <-time.After(time.Second):
+			t.Fatal("error Unsubscribed was not queued")
+		}
+	}
+}
+
+func TestAttachOwnsClaimedAckApplyBeforeCommit(t *testing.T) {
 	env := newAttachTestEnv(t, 12172)
 	cp := NewControlPlaneClient("", env.server, zerolog.Nop(), nil, 75*time.Millisecond, nil)
 	env.server.SetControlPlaneClient(cp)
@@ -560,8 +777,9 @@ func TestAttachTimeoutRollbackWaitsForClaimedAckApply(t *testing.T) {
 		t.Fatal("ack did not reach gated apply")
 	}
 
-	// SubscribeAndWait times out, but its deferred rollback must wait on the
-	// exact reconcileMu rather than deleting/closing underneath the claimed ack.
+	// The recv path only validates/delivers an attach-purpose ack. Attach owns
+	// the gated policy mutation and has committed teardown ownership before it
+	// begins, so no rollback can close underneath the apply.
 	select {
 	case err := <-attachDone:
 		t.Fatalf("Attach rollback interleaved with claimed ack: %v", err)
@@ -575,15 +793,84 @@ func TestAttachTimeoutRollbackWaitsForClaimedAckApply(t *testing.T) {
 	}
 	select {
 	case err := <-attachDone:
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "deadline exceeded")
+		require.NoError(t, err)
 	case <-time.After(time.Second):
-		t.Fatal("Attach rollback did not finish after ack released reconcileMu")
+		t.Fatal("Attach did not finish after its ack apply was released")
 	}
 
-	env.assertNoResidue(t)
-	assert.Equal(t, 1, ff.detachCallCount())
+	attachments, targets := env.attachmentCounts()
+	assert.Equal(t, 1, attachments)
+	assert.Equal(t, 1, targets)
+	assert.Zero(t, ff.detachCallCount())
 	assert.Zero(t, ff.mutationAfterCloseCount())
+}
+
+func TestBoundedSubscribedAckBlocksFollowingStreamCommandUntilAttachApply(t *testing.T) {
+	env := newAttachTestEnv(t, 12177)
+	cp := NewControlPlaneClient("", env.server, zerolog.Nop(), nil, time.Second, nil)
+	env.server.SetControlPlaneClient(cp)
+	attachDone := make(chan error, 1)
+	go func() {
+		_, err := env.server.Attach(context.Background(), attachInterfaceReq("ordered-ack-if0"))
+		attachDone <- err
+	}()
+
+	var id string
+	require.Eventually(t, func() bool {
+		cp.pendingAcksMu.Lock()
+		defer cp.pendingAcksMu.Unlock()
+		for pendingID := range cp.pendingAcks {
+			id = pendingID
+			return true
+		}
+		return false
+	}, time.Second, time.Millisecond)
+	ff := env.createdFilters()[0]
+	entered, release := make(chan struct{}), make(chan struct{})
+	ff.blockSetMode(entered, release)
+	pending := pendingSubscriptionFor(t, cp, id)
+	require.True(t, cp.beginPendingSend(pending, 1))
+
+	streamDone := make(chan struct{})
+	go func() {
+		defer close(streamDone)
+		cp.handleCommandForEpoch(&apiv1.ControlCommand{
+			Id: id,
+			Command: &apiv1.ControlCommand_SubscribedAck{SubscribedAck: &apiv1.SubscribedAck{
+				Mode: apiv1.PolicyMode_POLICY_MODE_ALLOWLIST,
+			}},
+		}, 1)
+		cp.handleCommandForEpoch(&apiv1.ControlCommand{
+			Id: id, CommandId: "after-ack",
+			Command: &apiv1.ControlCommand_SetMode{SetMode: &apiv1.SetMode{
+				Mode: apiv1.PolicyMode_POLICY_MODE_DENYLIST,
+			}},
+		}, 1)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("Attach-owned ack did not reach gated apply")
+	}
+	select {
+	case <-streamDone:
+		t.Fatal("following stream command ran before Attach completed ack apply")
+	case <-time.After(50 * time.Millisecond):
+	}
+	assert.NotContains(t, ff.eventLog(), "set-mode "+filter.ModeDenylist.String())
+
+	close(release)
+	require.NoError(t, <-attachDone)
+	select {
+	case <-streamDone:
+	case <-time.After(time.Second):
+		t.Fatal("stream did not resume after Attach completed ack apply")
+	}
+	mode, _, _, _ := ff.snapshot()
+	assert.Equal(t, filter.ModeDenylist, mode)
+	row, err := env.st.GetAttachment(id)
+	require.NoError(t, err)
+	assert.Equal(t, apiv1.PolicyMode_POLICY_MODE_DENYLIST.String(), row.Mode)
 }
 
 // Stop first publishes terminal admission state, then waits for every Attach
@@ -650,5 +937,5 @@ func TestStopWaitsForInFlightAttachRollbackBeforeSnapshot(t *testing.T) {
 	assert.Equal(t, 1, ff.detachCallCount())
 	assert.Equal(t, 1, ff.closeCallCount())
 	assert.Zero(t, ff.mutationAfterCloseCount())
-	assertUDPPortFree(t, env.port)
+	assertDNSPortFree(t, env.port)
 }

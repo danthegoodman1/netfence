@@ -2,8 +2,10 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"net"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -17,6 +19,141 @@ import (
 	"github.com/danthegoodman1/netfence/pkg/filter"
 	apiv1 "github.com/danthegoodman1/netfence/v1"
 )
+
+func TestDetachTombstoneRetriesClosedFilterCleanupExactlyOnce(t *testing.T) {
+	server, st, id, ff, _ := newTestServerWithAttachment(t)
+	ff.setDetachErrors(errors.New("injected unpin failure"), nil)
+
+	_, err := server.Detach(context.Background(), &apiv1.DetachRequest{Id: id})
+	require.Error(t, err)
+	row, err := st.GetAttachment(id)
+	require.NoError(t, err)
+	assert.True(t, row.CleanupNeeded)
+	assert.Equal(t, apiv1.PolicyMode_POLICY_MODE_BLOCK_ALL.String(), row.Mode)
+	server.mu.RLock()
+	state := server.attachments[id]
+	require.NotNil(t, state)
+	assert.True(t, state.cleanupNeeded)
+	assert.True(t, state.mutationsClosed)
+	assert.Equal(t, id, server.targetIndex[state.info.Target])
+	server.mu.RUnlock()
+	assert.Empty(t, server.GetSyncAttachments())
+	assert.Empty(t, server.GetAttachmentStats())
+	before := ff.eventLog()
+	require.Error(t, server.SetFilterMode(id, apiv1.PolicyMode_POLICY_MODE_DISABLED))
+	assert.Equal(t, before, ff.eventLog())
+
+	_, err = server.Detach(context.Background(), &apiv1.DetachRequest{Id: id})
+	require.NoError(t, err)
+	assert.Equal(t, 2, ff.detachCallCount())
+	assert.Equal(t, 1, ff.closeCallCount(), "retry does not close already-closed handles")
+	rows, err := st.GetAllAttachments()
+	require.NoError(t, err)
+	assert.Empty(t, rows)
+	server.mu.RLock()
+	assert.Empty(t, server.attachments)
+	assert.Empty(t, server.targetIndex)
+	server.mu.RUnlock()
+}
+
+func TestDetachDeleteFailureRetainsTombstoneUntilRetry(t *testing.T) {
+	server, st, id, ff, _ := newTestServerWithAttachment(t)
+	deleteCalls := 0
+	server.deleteAttachment = func(id string) error {
+		deleteCalls++
+		if deleteCalls == 1 {
+			return errors.New("injected delete failure")
+		}
+		return st.DeleteAttachment(id)
+	}
+
+	_, err := server.Detach(context.Background(), &apiv1.DetachRequest{Id: id})
+	require.Error(t, err)
+	row, err := st.GetAttachment(id)
+	require.NoError(t, err)
+	assert.True(t, row.CleanupNeeded)
+	server.mu.RLock()
+	state := server.attachments[id]
+	require.NotNil(t, state)
+	assert.Nil(t, state.filter, "proven filter removal is remembered across row-delete retry")
+	server.mu.RUnlock()
+	assert.Equal(t, 1, ff.detachCallCount())
+
+	_, err = server.Detach(context.Background(), &apiv1.DetachRequest{Id: id})
+	require.NoError(t, err)
+	assert.Equal(t, 1, ff.detachCallCount(), "row-delete retry does not touch closed filter")
+	assert.Equal(t, 2, deleteCalls)
+}
+
+func TestTargetRemovalRetainsCleanupOwnershipUntilLocalRetry(t *testing.T) {
+	server, _, id, ff, _ := newTestServerWithAttachment(t)
+	ff.setDetachErrors(errors.New("injected target-removal unpin failure"), nil)
+	server.mu.Lock()
+	state := server.attachments[id]
+	token := watchToken{generation: 1, target: state.info.Target, kind: watchKindInterface, identity: 1}
+	state.watch = token
+	server.mu.Unlock()
+
+	server.handleTargetRemoved(token)
+	server.mu.RLock()
+	assert.Same(t, state, server.attachments[id])
+	assert.True(t, state.cleanupNeeded)
+	assert.Equal(t, id, server.targetIndex[state.info.Target])
+	assert.False(t, state.watch.valid())
+	server.mu.RUnlock()
+	_, err := server.Attach(context.Background(), &apiv1.AttachRequest{
+		Target: &apiv1.AttachRequest_InterfaceName{InterfaceName: state.info.Target},
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "target already attached")
+
+	_, err = server.Detach(context.Background(), &apiv1.DetachRequest{Id: id})
+	require.NoError(t, err)
+	assert.Equal(t, 2, ff.detachCallCount())
+}
+
+func TestCleanupClosesAndDrainsMutationAdmissionBeforeBlockAll(t *testing.T) {
+	server, st, id, ff, _ := newTestServerWithAttachment(t)
+	expiring, err := filter.ParseCIDR("192.0.2.44/32")
+	require.NoError(t, err)
+	require.NoError(t, server.AllowCIDR(id, expiring, time.Millisecond))
+	ff.setDetachErr(errors.New("retain cleanup for inspection"))
+
+	enteredSave := make(chan struct{})
+	releaseSave := make(chan struct{})
+	originalSave := server.saveAttachment
+	var once sync.Once
+	server.saveAttachment = func(row *store.Attachment) error {
+		if row.CleanupNeeded {
+			once.Do(func() { close(enteredSave) })
+			<-releaseSave
+		}
+		return originalSave(row)
+	}
+	detachDone := make(chan error, 1)
+	go func() {
+		_, err := server.Detach(context.Background(), &apiv1.DetachRequest{Id: id})
+		detachDone <- err
+	}()
+	select {
+	case <-enteredSave:
+	case <-time.After(time.Second):
+		t.Fatal("Detach did not reach tombstone save")
+	}
+	eventsAtBlockAll := ff.eventLog()
+	require.Error(t, server.SetFilterMode(id, apiv1.PolicyMode_POLICY_MODE_DISABLED))
+	require.Error(t, server.AllowCIDR(id, expiring, 0))
+	server.sweepExpiredTTLs(time.Now().Add(time.Hour))
+	assert.Empty(t, server.GetAttachmentStats())
+	assert.Equal(t, eventsAtBlockAll, ff.eventLog(), "no mutation reaches filter after cleanup BLOCK_ALL")
+
+	close(releaseSave)
+	require.Error(t, <-detachDone)
+	assert.Zero(t, ff.mutationAfterCloseCount())
+	row, err := st.GetAttachment(id)
+	require.NoError(t, err)
+	assert.True(t, row.CleanupNeeded)
+}
 
 func TestExtractPortHandlesJoinHostPortAddresses(t *testing.T) {
 	tests := []struct {

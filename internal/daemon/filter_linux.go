@@ -36,9 +36,21 @@ func createFilter(pinDir, target string, attachType apiv1.AttachmentType, mode a
 func loadPinnedFilter(pinDir, target string, attachType apiv1.AttachmentType, direction apiv1.TcDirection) (filter.Filter, error) {
 	switch attachType {
 	case apiv1.AttachmentType_ATTACHMENT_TYPE_CGROUP:
-		return filter.LoadPinnedCgroupFilter(target, pinDir)
+		f, err := filter.LoadPinnedCgroupFilter(target, pinDir)
+		if err != nil {
+			// Avoid converting a nil *CgroupFilter into a non-nil Filter
+			// interface on the error path.
+			return nil, err
+		}
+		return f, nil
 	case apiv1.AttachmentType_ATTACHMENT_TYPE_TC:
-		return filter.LoadPinnedTCFilter(target, apiDirectionToFilterDirection(direction), pinDir)
+		f, err := filter.LoadPinnedTCFilter(target, apiDirectionToFilterDirection(direction), pinDir)
+		if err != nil {
+			// Avoid converting a nil *TCFilter into a non-nil Filter interface
+			// on the error path.
+			return nil, err
+		}
+		return f, nil
 	default:
 		return nil, fmt.Errorf("unsupported attachment type: %s", attachType)
 	}

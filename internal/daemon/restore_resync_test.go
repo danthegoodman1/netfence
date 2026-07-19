@@ -160,7 +160,7 @@ func TestRestoreWithoutControlPlaneKeepsRulesAndNeedsResync(t *testing.T) {
 
 	mode, allowed, denied, clearCalls := env.adopted.snapshot()
 	assert.Equal(t, filter.ModeAllowlist, mode)
-	assert.ElementsMatch(t, []string{"198.51.100.1/32", "203.0.113.5/32"}, allowed)
+	assert.ElementsMatch(t, []string{"198.51.100.1/32", "203.0.113.5/32", testDNSBootstrapCIDR}, allowed)
 	assert.Empty(t, denied)
 	assert.Zero(t, clearCalls)
 	for _, event := range env.adopted.eventLog() {
@@ -199,7 +199,7 @@ func TestRestoreSubscribedAckAuthoritativeReconcileClearsExactFlag(t *testing.T)
 
 	mode, allowed, denied, clearCalls := env.adopted.snapshot()
 	assert.Equal(t, filter.ModeAllowlist, mode)
-	assert.ElementsMatch(t, []string{survivor, added}, allowed)
+	assert.ElementsMatch(t, []string{survivor, added, testDNSBootstrapCIDR}, allowed)
 	assert.Empty(t, denied)
 	assert.Zero(t, clearCalls)
 	removedAllowed, _ := env.adopted.removeCalls()
@@ -225,7 +225,7 @@ func TestRestoreRecreatedEmptySubscribedAckConverges(t *testing.T) {
 	t.Cleanup(env.server.Stop)
 	require.Len(t, env.created, 1, "missing pins must use the recreate-empty restore path")
 	_, beforeAllowed, beforeDenied, _ := env.created[0].snapshot()
-	assert.Empty(t, beforeAllowed)
+	assert.Equal(t, []string{testDNSBootstrapCIDR}, beforeAllowed)
 	assert.Empty(t, beforeDenied)
 	assert.True(t, attachmentNeedsResync(t, env.server, env.id))
 
@@ -238,7 +238,7 @@ func TestRestoreRecreatedEmptySubscribedAckConverges(t *testing.T) {
 
 	mode, allowed, denied, _ := env.created[0].snapshot()
 	assert.Equal(t, filter.ModeAllowlist, mode)
-	assert.Equal(t, []string{desired}, allowed)
+	assert.ElementsMatch(t, []string{testDNSBootstrapCIDR, desired}, allowed)
 	assert.Empty(t, denied)
 	assert.False(t, attachmentNeedsResync(t, env.server, env.id))
 	assert.False(t, client.hasPendingAck(env.id))
@@ -355,6 +355,25 @@ func TestRestoreInvalidAuthoritativeAckIsStaticAndRetainsFlag(t *testing.T) {
 				{Cidr: "10.0.0.0/8", Ttl: durationpb.New(time.Minute)},
 			},
 		}},
+		{name: "malformed_dns_upstream", ack: &apiv1.SubscribedAck{
+			Mode: apiv1.PolicyMode_POLICY_MODE_ALLOWLIST,
+			Dns: &apiv1.DnsConfig{
+				Mode:            apiv1.DnsMode_DNS_MODE_ALLOWLIST,
+				AllowDomains:    []*apiv1.DomainEntry{{Domain: "must-not-apply.test"}},
+				UpstreamServers: []string{"2001:db8::53:53"},
+			},
+		}},
+		{name: "too_many_unique_dns_upstreams", ack: &apiv1.SubscribedAck{
+			Mode: apiv1.PolicyMode_POLICY_MODE_ALLOWLIST,
+			Dns: &apiv1.DnsConfig{
+				Mode: apiv1.DnsMode_DNS_MODE_ALLOWLIST,
+				UpstreamServers: []string{
+					"192.0.2.1:53", "192.0.2.2:53", "192.0.2.3:53",
+					"192.0.2.4:53", "192.0.2.5:53", "192.0.2.6:53",
+					"192.0.2.7:53", "192.0.2.8:53", "192.0.2.9:53",
+				},
+			},
+		}},
 	}
 
 	for i, tt := range tests {
@@ -364,12 +383,39 @@ func TestRestoreInvalidAuthoritativeAckIsStaticAndRetainsFlag(t *testing.T) {
 			assert.Equal(t, before, env.adopted.eventLog())
 			mode, allowed, _, clearCalls := env.adopted.snapshot()
 			assert.Equal(t, filter.ModeAllowlist, mode)
-			assert.Equal(t, []string{survivor}, allowed)
+			assert.ElementsMatch(t, []string{survivor, testDNSBootstrapCIDR}, allowed)
 			assert.Zero(t, clearCalls)
 			assert.True(t, attachmentNeedsResync(t, env.server, env.id))
 			assert.False(t, client.hasPendingAck(env.id))
+			env.server.mu.RLock()
+			dnsServer := env.server.attachments[env.id].dns
+			env.server.mu.RUnlock()
+			dnsServer.mu.RLock()
+			assert.Equal(t, apiv1.DnsMode_DNS_MODE_DISABLED, dnsServer.mode)
+			assert.Empty(t, dnsServer.allowedDomains)
+			assert.Empty(t, dnsServer.deniedDomains)
+			assert.Equal(t, []string{"127.0.0.1:1"}, dnsServer.upstreams)
+			dnsServer.mu.RUnlock()
 		})
 	}
+
+	dispatchRestoreAck(t, client, env.id, uint64(len(tests)+1), &apiv1.SubscribedAck{
+		Mode: apiv1.PolicyMode_POLICY_MODE_ALLOWLIST,
+		Dns: &apiv1.DnsConfig{
+			Mode:            apiv1.DnsMode_DNS_MODE_ALLOWLIST,
+			AllowDomains:    []*apiv1.DomainEntry{{Domain: "retry.test", IncludeSubdomains: true}},
+			UpstreamServers: []string{"192.0.2.53:53"},
+		},
+	})
+	assert.False(t, attachmentNeedsResync(t, env.server, env.id), "a later valid full state must clear the exact restore marker")
+	env.server.mu.RLock()
+	dnsServer := env.server.attachments[env.id].dns
+	env.server.mu.RUnlock()
+	dnsServer.mu.RLock()
+	assert.Equal(t, apiv1.DnsMode_DNS_MODE_ALLOWLIST, dnsServer.mode)
+	assert.Equal(t, map[string]bool{"retry.test": true}, dnsServer.allowedDomains)
+	assert.Equal(t, []string{"192.0.2.53:53"}, dnsServer.upstreams)
+	dnsServer.mu.RUnlock()
 }
 
 func TestRestoreAckReplacesPermanentSurvivorWithFiniteTTLWithoutRemove(t *testing.T) {
@@ -402,7 +448,7 @@ func TestRestoreAckReplacesPermanentSurvivorWithFiniteTTLWithoutRemove(t *testin
 	clock.Advance(2 * time.Second)
 	env.server.sweepExpiredTTLs(clock.Now())
 	_, allowed, _, _ := env.adopted.snapshot()
-	assert.Empty(t, allowed, "restored permanent seed must expire at the fresh ack TTL")
+	assert.Equal(t, []string{testDNSBootstrapCIDR}, allowed, "restored permanent seed must expire at the fresh ack TTL while bootstrap remains")
 	removed, _ = env.adopted.removeCalls()
 	assert.Equal(t, []string{survivor}, removed)
 }
@@ -437,7 +483,7 @@ func TestRestoreResyncRetriesFailedStaleRemovalBeforeClearingFlag(t *testing.T) 
 	dispatchRestoreAck(t, client, env.id, 3, ack)
 	assert.False(t, attachmentNeedsResync(t, env.server, env.id))
 	_, allowed, _, _ := env.adopted.snapshot()
-	assert.Equal(t, []string{survivor}, allowed)
+	assert.ElementsMatch(t, []string{survivor, testDNSBootstrapCIDR}, allowed)
 	removed, _ = env.adopted.removeCalls()
 	assert.Equal(t, []string{stale, stale, stale}, removed)
 	assert.NotContains(t, removed, survivor)
@@ -588,6 +634,145 @@ func TestRestoreAdoptedInventoryFailureAbortsWithoutUnpinning(t *testing.T) {
 			env.server.mu.RLock()
 			assert.False(t, env.server.attachments[env.id].needsResync)
 			env.server.mu.RUnlock()
+		})
+	}
+}
+
+func TestRestoreAdoptedBootstrapFailureAbortsWithoutUnpinning(t *testing.T) {
+	env := newRestoreEnv(t, 12324, apiv1.PolicyMode_POLICY_MODE_ALLOWLIST)
+	env.adopted = &fakeFilter{mode: filter.ModeAllowlist}
+	env.adopted.setAllowErr(syscall.ENOSPC)
+	env.mkPinDir(t)
+
+	err := env.server.Start()
+	require.ErrorContains(t, err, "protected DNS bootstrap route")
+	assert.Equal(t, 1, env.adopted.closeCallCount())
+	assert.Zero(t, env.adopted.detachCallCount(), "bootstrap failure must not destroy live pinned enforcement")
+	assert.DirExists(t, env.pinRoot+"/"+env.id)
+	assertDNSPortFree(t, env.port)
+	env.server.mu.RLock()
+	assert.False(t, env.server.attachments[env.id].needsResync)
+	env.server.mu.RUnlock()
+}
+
+func TestRestoreRecreatedBootstrapFailureAbortsAndRetainsDurableRow(t *testing.T) {
+	env := newRestoreEnv(t, 12325, apiv1.PolicyMode_POLICY_MODE_ALLOWLIST)
+	before, err := env.st.GetAttachment(env.id)
+	require.NoError(t, err)
+	env.server.newFilter = func(string, string, apiv1.AttachmentType, apiv1.PolicyMode, apiv1.TcDirection, uint32) (filter.Filter, error) {
+		env.newFilterCalls++
+		ff := &fakeFilter{mode: filter.ModeAllowlist, allowErr: syscall.ENOSPC}
+		env.created = append(env.created, ff)
+		return ff, nil
+	}
+
+	err = env.server.Start()
+	require.ErrorContains(t, err, "protected DNS bootstrap route")
+	require.Len(t, env.created, 1)
+	assert.Equal(t, 1, env.created[0].detachCallCount())
+	assertRestoreDurableOwnershipRetained(t, env, before)
+	assertDNSPortFree(t, env.port)
+}
+
+func TestRestoreRollbackDoesNotCompensateBootstrapInsideRecreatedFilter(t *testing.T) {
+	env := newRestoreEnv(t, 12326, apiv1.PolicyMode_POLICY_MODE_ALLOWLIST)
+	bootstrap := mustCIDR(t, testDNSBootstrapCIDR)
+
+	env.server.mu.RLock()
+	recreatedState := env.server.attachments[env.id]
+	env.server.mu.RUnlock()
+	recreated := &fakeFilter{mode: filter.ModeAllowlist}
+	require.NoError(t, recreatedState.ttls.addSystem(recreated, bootstrap, listAllow))
+	recreated.setRemoveAllowedErr(errors.New("must not remove a rule from a disposable recreated map"))
+	beforeRecreated, err := env.st.GetAttachment(env.id)
+	require.NoError(t, err)
+
+	adoptedInfo := cloneAttachment(beforeRecreated)
+	adoptedInfo.ID = "att-restore-adopted"
+	require.NoError(t, env.st.SaveAttachment(adoptedInfo))
+	adoptedState := &attachmentState{info: adoptedInfo, ttls: newTTLRegistry()}
+	adopted := &fakeFilter{mode: filter.ModeAllowlist}
+	require.NoError(t, adoptedState.ttls.addSystem(adopted, bootstrap, listAllow))
+	adopted.setRemoveAllowedErr(syscall.EIO)
+
+	env.server.mu.Lock()
+	err = env.server.rollbackRestoreStart([]*restoreStartResource{
+		{
+			id:                 env.id,
+			state:              recreatedState,
+			filter:             recreated,
+			bootstrap:          bootstrap,
+			bootstrapInstalled: true,
+			originalDNSAddress: beforeRecreated.DnsAddress,
+		},
+		{
+			id:                 adoptedInfo.ID,
+			state:              adoptedState,
+			filter:             adopted,
+			adopted:            true,
+			bootstrap:          bootstrap,
+			bootstrapInstalled: true,
+			originalDNSAddress: adoptedInfo.DnsAddress,
+		},
+	})
+	env.server.mu.Unlock()
+	require.ErrorContains(t, err, "restoring bootstrap for "+adoptedInfo.ID)
+
+	afterRecreated, err := env.st.GetAttachment(env.id)
+	require.NoError(t, err)
+	assert.Equal(t, beforeRecreated, afterRecreated, "successful recreated Detach must preserve the original persisted policy")
+	assert.Equal(t, 1, recreated.detachCallCount())
+	removed, _ := recreated.removeCalls()
+	assert.Empty(t, removed, "recreated rollback destroys the map instead of compensating individual rules")
+	events := recreated.eventLog()
+	assert.Less(t,
+		indexOfEvent(t, events, "set-mode "+filter.ModeBlockAll.String()),
+		indexOfEvent(t, events, "detach"),
+		"recreated map must be staged fail-closed before Detach can close its FDs")
+
+	afterAdopted, err := env.st.GetAttachment(adoptedInfo.ID)
+	require.NoError(t, err)
+	assert.Equal(t, apiv1.PolicyMode_POLICY_MODE_BLOCK_ALL.String(), afterAdopted.Mode)
+	assert.Equal(t, 1, adopted.closeCallCount())
+	assert.Zero(t, adopted.detachCallCount())
+}
+
+func TestRestoreRollbackStagesRecreatedFilterBlockAllBeforeFailedDetach(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		setModeErr error
+	}{
+		{name: "prestage_succeeds"},
+		{name: "prestage_failure_is_aggregated", setModeErr: syscall.EPERM},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			env := newRestoreEnv(t, 12327, apiv1.PolicyMode_POLICY_MODE_ALLOWLIST)
+			env.server.mu.RLock()
+			state := env.server.attachments[env.id]
+			env.server.mu.RUnlock()
+			ff := &fakeFilter{mode: filter.ModeAllowlist}
+			ff.setSetModeErr(tt.setModeErr)
+			ff.setDetachErr(syscall.EIO)
+
+			env.server.mu.Lock()
+			err := env.server.rollbackRestoreStart([]*restoreStartResource{{
+				id:                 env.id,
+				state:              state,
+				filter:             ff,
+				originalDNSAddress: state.info.DnsAddress,
+			}})
+			env.server.mu.Unlock()
+			require.ErrorContains(t, err, "detaching recreated filter")
+			if tt.setModeErr != nil {
+				assert.ErrorContains(t, err, "forcing "+env.id+" block-all before failed detach")
+			}
+			events := ff.eventLog()
+			assert.Less(t,
+				indexOfEvent(t, events, "set-mode "+filter.ModeBlockAll.String()),
+				indexOfEvent(t, events, "detach"))
+			stored, getErr := env.st.GetAttachment(env.id)
+			require.NoError(t, getErr)
+			assert.Equal(t, apiv1.PolicyMode_POLICY_MODE_BLOCK_ALL.String(), stored.Mode)
 		})
 	}
 }

@@ -508,6 +508,64 @@ func TestDirectionMigrationAddsColumnToOldSchema(t *testing.T) {
 	assert.Equal(t, "TC_DIRECTION_INGRESS", got.Direction)
 }
 
+func TestAttachmentCleanupTombstoneAndPinIdentityRoundTrip(t *testing.T) {
+	st := newTestStore(t)
+	a := testAttachment("cleanup-row", time.Now().UTC())
+	a.Mode = "POLICY_MODE_BLOCK_ALL"
+	a.CleanupNeeded = true
+	a.PinDir = "/sys/fs/bpf/netfence/cleanup-row"
+	a.PinPathKnown = true
+	require.NoError(t, st.SaveAttachment(a))
+
+	got, err := st.GetAttachment(a.ID)
+	require.NoError(t, err)
+	assert.True(t, got.CleanupNeeded)
+	assert.Equal(t, a.PinDir, got.PinDir)
+	assert.True(t, got.PinPathKnown)
+
+	all, err := st.GetAllAttachments()
+	require.NoError(t, err)
+	require.Len(t, all, 1)
+	assert.True(t, all[0].CleanupNeeded)
+	assert.Equal(t, a.PinDir, all[0].PinDir)
+	assert.True(t, all[0].PinPathKnown)
+}
+
+func TestCleanupAndPinIdentityMigrationDefaultsLegacyRowsSafely(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "netfence.db")
+	db, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	_, err = db.Exec(`
+		CREATE TABLE attachments (
+			id TEXT PRIMARY KEY,
+			target TEXT NOT NULL,
+			type TEXT NOT NULL,
+			mode TEXT NOT NULL,
+			dns_mode TEXT NOT NULL,
+			dns_address TEXT NOT NULL,
+			metadata TEXT NOT NULL,
+			attached_at TEXT NOT NULL,
+			direction TEXT NOT NULL DEFAULT ''
+		) STRICT, WITHOUT ROWID
+	`)
+	require.NoError(t, err)
+	_, err = db.Exec(`
+		INSERT INTO attachments (id, target, type, mode, dns_mode, dns_address, direction, metadata, attached_at)
+		VALUES ('legacy', 'lo', 'ATTACHMENT_TYPE_TC', 'POLICY_MODE_DISABLED', 'DNS_MODE_DISABLED', '127.0.0.1:12000', '', '{}', '2026-05-27T12:00:00Z')
+	`)
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+
+	st, err := New(dbPath)
+	require.NoError(t, err)
+	defer st.Close()
+	got, err := st.GetAttachment("legacy")
+	require.NoError(t, err)
+	assert.False(t, got.CleanupNeeded)
+	assert.Empty(t, got.PinDir)
+	assert.False(t, got.PinPathKnown, "legacy empty pin identity remains explicitly unknown")
+}
+
 func TestDaemonIDStableAcrossReopen(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "netfence.db")
 	st, err := New(dbPath)

@@ -54,9 +54,10 @@ func TestApplyBulkUpdateReplacesExistingState(t *testing.T) {
 		AllowCidrs: []*apiv1.CIDREntry{{Cidr: "198.51.100.0/24"}},
 		DenyCidrs:  []*apiv1.CIDREntry{{Cidr: "2001:db8::/32"}},
 		Dns: &apiv1.DnsConfig{
-			Mode:         apiv1.DnsMode_DNS_MODE_ALLOWLIST,
-			AllowDomains: []*apiv1.DomainEntry{{Domain: "new-allow.test", IncludeSubdomains: true}},
-			DenyDomains:  []*apiv1.DomainEntry{{Domain: "new-deny.test"}},
+			Mode:            apiv1.DnsMode_DNS_MODE_ALLOWLIST,
+			AllowDomains:    []*apiv1.DomainEntry{{Domain: "new-allow.test", IncludeSubdomains: true}},
+			DenyDomains:     []*apiv1.DomainEntry{{Domain: "new-deny.test"}},
+			UpstreamServers: []string{"[2001:db8::53]:0053", "dns.example.:53"},
 		},
 	})
 
@@ -84,6 +85,41 @@ func TestApplyBulkUpdateReplacesExistingState(t *testing.T) {
 	assert.Equal(t, apiv1.DnsMode_DNS_MODE_ALLOWLIST, dnsServer.mode)
 	assert.Equal(t, map[string]bool{"new-allow.test": true}, dnsServer.allowedDomains)
 	assert.Equal(t, map[string]bool{"new-deny.test": false}, dnsServer.deniedDomains)
+	assert.Equal(t, []string{"[2001:db8::53]:53", "dns.example:53"}, dnsServer.upstreams)
+}
+
+func TestIncrementalModesRejectUnspecifiedAndUnknownWithoutMutation(t *testing.T) {
+	server, st, id, ff, dnsServer := newTestServerWithAttachment(t)
+	rowBefore, err := st.GetAttachment(id)
+	require.NoError(t, err)
+	filterEvents := ff.eventLog()
+
+	for _, mode := range []apiv1.PolicyMode{
+		apiv1.PolicyMode_POLICY_MODE_UNSPECIFIED,
+		apiv1.PolicyMode(99),
+	} {
+		require.Error(t, server.SetFilterMode(id, mode))
+	}
+	assert.Equal(t, filterEvents, ff.eventLog())
+	row, err := st.GetAttachment(id)
+	require.NoError(t, err)
+	assert.Equal(t, rowBefore.Mode, row.Mode)
+
+	dnsServer.mu.RLock()
+	dnsModeBefore := dnsServer.mode
+	dnsServer.mu.RUnlock()
+	for _, mode := range []apiv1.DnsMode{
+		apiv1.DnsMode_DNS_MODE_UNSPECIFIED,
+		apiv1.DnsMode(99),
+	} {
+		require.Error(t, server.SetDnsMode(id, mode))
+	}
+	dnsServer.mu.RLock()
+	assert.Equal(t, dnsModeBefore, dnsServer.mode)
+	dnsServer.mu.RUnlock()
+	row, err = st.GetAttachment(id)
+	require.NoError(t, err)
+	assert.Equal(t, rowBefore.DnsMode, row.DnsMode)
 }
 
 func TestApplyBulkUpdateWithNilDNSClearsExistingDNSRules(t *testing.T) {
@@ -134,6 +170,49 @@ func TestApplyBulkUpdateRejectsInvalidCIDRBeforeClearingExistingState(t *testing
 	defer dnsServer.mu.RUnlock()
 	assert.Equal(t, apiv1.DnsMode_DNS_MODE_DENYLIST, dnsServer.mode)
 	assert.Equal(t, map[string]bool{"old-deny.test": false}, dnsServer.deniedDomains)
+}
+
+func TestApplyBulkUpdateRejectsInvalidUpstreamBeforeAnyMutation(t *testing.T) {
+	server, st, id, ff, dnsServer := newTestServerWithAttachment(t)
+	client := NewControlPlaneClient("", server, zerolog.Nop(), nil, 0, nil)
+	require.NoError(t, server.ReplaceDNSRules(id, apiv1.DnsMode_DNS_MODE_DENYLIST,
+		nil, []*apiv1.DomainEntry{{Domain: "old-deny.test"}}, []string{"1.1.1.1:53"}))
+	beforeEvents := ff.eventLog()
+	beforeStored, err := st.GetAttachment(id)
+	require.NoError(t, err)
+	server.mu.Lock()
+	server.attachments[id].needsResync = true
+	server.mu.Unlock()
+
+	client.handleCommand(&apiv1.ControlCommand{
+		Id:        id,
+		CommandId: "invalid-upstream",
+		Command: &apiv1.ControlCommand_BulkUpdate{BulkUpdate: &apiv1.BulkUpdate{
+			Mode:       apiv1.PolicyMode_POLICY_MODE_ALLOWLIST,
+			AllowCidrs: []*apiv1.CIDREntry{{Cidr: "192.0.2.0/24"}},
+			Dns: &apiv1.DnsConfig{
+				Mode:            apiv1.DnsMode_DNS_MODE_ALLOWLIST,
+				AllowDomains:    []*apiv1.DomainEntry{{Domain: "new.test"}},
+				UpstreamServers: []string{"2001:db8::53:53"},
+			},
+		}},
+	})
+	results := drainCommandResults(t, client)
+	require.Len(t, results, 1)
+	assert.False(t, results[0].Success)
+	assert.Contains(t, results[0].Error, "validating DNS upstreams")
+	assert.Equal(t, beforeEvents, ff.eventLog())
+	afterStored, err := st.GetAttachment(id)
+	require.NoError(t, err)
+	assert.Equal(t, beforeStored, afterStored, "validation failure must not persist desired state")
+	server.mu.RLock()
+	assert.True(t, server.attachments[id].needsResync, "failed authoritative state must remain pending")
+	server.mu.RUnlock()
+	dnsServer.mu.RLock()
+	defer dnsServer.mu.RUnlock()
+	assert.Equal(t, apiv1.DnsMode_DNS_MODE_DENYLIST, dnsServer.mode)
+	assert.Equal(t, map[string]bool{"old-deny.test": false}, dnsServer.deniedDomains)
+	assert.Equal(t, []string{"1.1.1.1:53"}, dnsServer.upstreams)
 }
 
 func TestBulkUpdateRejectsInvalidModesBeforeAnyMutation(t *testing.T) {
@@ -358,6 +437,17 @@ func TestSubscribedAckApplySerializesWithStop(t *testing.T) {
 		defer close(stopDone)
 		server.Stop()
 	}()
+	require.Eventually(t, func() bool {
+		server.mu.RLock()
+		defer server.mu.RUnlock()
+		return server.stopping
+	}, time.Second, time.Millisecond)
+	allowCallsBefore := ff.allowCallCount()
+	cidr, err := filter.ParseCIDR("198.51.100.0/24")
+	require.NoError(t, err)
+	require.Error(t, server.AllowCIDR(id, cidr, 0))
+	require.Error(t, server.SetFilterMode(id, apiv1.PolicyMode_POLICY_MODE_DISABLED))
+	assert.Equal(t, allowCallsBefore, ff.allowCallCount(), "post-Stop mutation is not admitted behind active command")
 	select {
 	case <-stopDone:
 		t.Fatal("Stop closed resources while a claimed ack owned reconcileMu")
@@ -407,7 +497,7 @@ func TestMakeProxyFuncRequiresConnectedState(t *testing.T) {
 	c.mu.Unlock()
 
 	proxy := c.MakeProxyFunc("att-1")
-	_, err := proxy("example.com.", "A")
+	_, err := proxy(context.Background(), "example.com.", "A")
 	require.ErrorIs(t, err, errDNSProxyUnavailable)
 	assert.Zero(t, fakeClient.queries)
 
@@ -415,7 +505,7 @@ func TestMakeProxyFuncRequiresConnectedState(t *testing.T) {
 	c.state = apiv1.ConnectionState_CONNECTION_STATE_CONNECTED
 	c.mu.Unlock()
 
-	decision, err := proxy("example.com.", "A")
+	decision, err := proxy(context.Background(), "example.com.", "A")
 	require.NoError(t, err)
 	assert.True(t, decision.Allow)
 	assert.Equal(t, uint32(30), decision.TTLSeconds)
