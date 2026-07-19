@@ -2,17 +2,38 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/keepalive"
+	"google.golang.org/protobuf/types/known/durationpb"
 
 	"github.com/danthegoodman1/netfence/pkg/filter"
 	apiv1 "github.com/danthegoodman1/netfence/v1"
+)
+
+const (
+	// defaultKeepaliveTime/-Timeout drive HTTP/2 keepalive pings on the
+	// control-plane connection: a ping is sent after keepaliveTime of
+	// inactivity and the connection is torn down if no ack arrives within
+	// keepaliveTimeout, so a silently dead path (cable pull, dropped NAT
+	// mapping, blackhole) is detected in ~Time+Timeout instead of waiting
+	// for the kernel's multi-minute TCP retransmission timeout. Note that
+	// grpc-go clamps the ping interval to a 10s minimum client-side.
+	defaultKeepaliveTime    = 30 * time.Second
+	defaultKeepaliveTimeout = 10 * time.Second
+	// A configured subscribe_ack_timeout of zero deliberately lets a new
+	// Attach return without waiting, but restored attachments must still be
+	// ack-driven: otherwise their needsResync flag could never be cleared
+	// safely. Background restore attempts use this bounded timeout and retry
+	// on a later connection.
+	defaultRestoreSubscribeAckTimeout = 5 * time.Second
 )
 
 // SubscribedAckResult contains the result of waiting for a SubscribedAck.
@@ -21,12 +42,63 @@ type SubscribedAckResult struct {
 	Err error
 }
 
+type subscriptionPurpose uint8
+
+const (
+	subscriptionPurposeAttach subscriptionPurpose = iota
+	subscriptionPurposeRestore
+)
+
+// pendingSubscription is the exact ownership token for one effective
+// Subscribed -> SubscribedAck handshake. The pending map is put-if-absent by
+// attachment ID, and outbound queue entries point back to this object, so a
+// canceled attempt's stale event cannot become valid merely because a later
+// attempt reused the same attachment ID.
+type pendingSubscription struct {
+	sub      *apiv1.Subscribed
+	purpose  subscriptionPurpose
+	resultCh chan SubscribedAckResult // nil for background/fire-and-forget waits
+	// callerApplies is set only by Server.Attach. A bounded waiter receives a
+	// validated ack and atomically commits/applies it itself; a zero-timeout
+	// ack waits for Attach's setup barrier before applying in the recv path.
+	callerApplies bool
+	// state is the exact server attachment this ack may reconcile. It is set
+	// for daemon Attach and restore handshakes and provides the per-state
+	// reconcile-vs-teardown lock/identity token. It may be nil when callers use
+	// SubscribeAndWait directly as a transport handshake without a registered
+	// server attachment (kept for API/backward compatibility).
+	state *attachmentState
+
+	// Restore-only ownership. restoreEpoch scopes the attempt to one connection
+	// so disconnect cleanup cannot clobber a newer retry or a normal Attach
+	// subscription.
+	restoreEpoch uint64
+	// sentEpoch is the connection epoch on which this exact Subscribed was
+	// most recently dispatched. Ack claims must match it, preventing a delayed
+	// command from an older stream from consuming a newer retry. Guarded by
+	// pendingAcksMu; zero means not dispatched in production (epochs start at 1).
+	sentEpoch uint64
+	timer     *time.Timer // guarded by pendingAcksMu
+}
+
 type ControlPlaneClient struct {
 	url                 string
 	server              *Server
 	logger              zerolog.Logger
 	metadata            map[string]string
 	subscribeAckTimeout time.Duration
+	// creds holds the transport (and optional per-RPC) credentials used to
+	// dial the control plane, resolved once at startup. May be nil for
+	// clients that never dial (unit tests); connect() refuses to dial
+	// without a transport credential — there is no insecure fallback.
+	creds *ControlPlaneCreds
+
+	// Transport tuning (see SetTransportTuning): keepalive ping cadence for
+	// dead-peer detection and the reconnect backoff cap. Always non-zero
+	// after NewControlPlaneClient (defaults applied there).
+	keepaliveTime       time.Duration
+	keepaliveTimeout    time.Duration
+	reconnectBackoffMax time.Duration
 
 	mu     sync.RWMutex
 	state  apiv1.ConnectionState
@@ -35,30 +107,95 @@ type ControlPlaneClient struct {
 	stream grpc.BidiStreamingClient[apiv1.DaemonEvent, apiv1.ControlCommand]
 	cancel context.CancelFunc
 
+	// sendCh is created once and PERSISTS across reconnects, so events
+	// queued against a dead connection are still sitting in it when the
+	// next connection comes up. Each connection's sendLoop drops those
+	// stale events instead of replaying them after the fresh SyncRequest —
+	// see sendEpoch and sendLoop.
 	sendCh chan outboundEvent
 
-	// pendingAcks tracks subscriptions waiting for SubscribedAck responses.
-	// Key is attachment ID, value is the channel to send the result on.
+	// sendEpoch is the current connection epoch. connect() increments it
+	// BEFORE snapshotting the attachment list for the SyncRequest, and
+	// enqueue() stamps every outbound event with the epoch current at
+	// enqueue time. An event carrying an older epoch was therefore produced
+	// from state that predates the Sync snapshot, so the SyncRequest already
+	// sent on the new stream supersedes it and sendLoop drops it (with the
+	// single exception of a Subscribed whose ack is still pending).
+	sendEpoch atomic.Uint64
+
+	// pendingAcks tracks exact subscription handshakes awaiting a
+	// SubscribedAck. A put-if-absent registration prevents duplicate effective
+	// work for one attachment and, unlike the old channel-only map, lets
+	// reconnect/detach cleanup remove only the attempt it owns.
 	pendingAcksMu sync.Mutex
-	pendingAcks   map[string]chan SubscribedAckResult
+	pendingAcks   map[string]*pendingSubscription
+
+	// admissionStopped is terminal for this client instance. Quarantine or
+	// daemon Stop flips it before canceling the current stream so Run cannot
+	// reconnect and an already-received ordinary command cannot mutate state.
+	admissionStopped atomic.Bool
 }
 
 type outboundEvent struct {
-	event             *apiv1.DaemonEvent
-	subscribedID      string
-	requirePendingAck bool
+	event   *apiv1.DaemonEvent
+	pending *pendingSubscription
+	// epoch is the connection epoch current when the event was enqueued
+	// (see ControlPlaneClient.sendEpoch). sendLoop drops events from an
+	// older epoch: the fresh SyncRequest supersedes them.
+	epoch uint64
 }
 
-func NewControlPlaneClient(url string, server *Server, logger zerolog.Logger, metadata map[string]string, subscribeAckTimeout time.Duration) *ControlPlaneClient {
+var (
+	errSubscriptionAlreadyPending = errors.New("subscription already pending")
+	errSubscriptionQueueFull      = errors.New("send channel full")
+)
+
+// enqueue stamps the event with the current connection epoch and queues it
+// without blocking. It returns false when the channel is full — callers
+// treat outbound events as best-effort and drop with a warning rather than
+// stalling.
+func (c *ControlPlaneClient) enqueue(out outboundEvent) bool {
+	out.epoch = c.sendEpoch.Load()
+	select {
+	case c.sendCh <- out:
+		return true
+	default:
+		return false
+	}
+}
+
+func NewControlPlaneClient(url string, server *Server, logger zerolog.Logger, metadata map[string]string, subscribeAckTimeout time.Duration, creds *ControlPlaneCreds) *ControlPlaneClient {
 	return &ControlPlaneClient{
 		url:                 url,
 		server:              server,
 		logger:              logger.With().Str("component", "controlplane").Logger(),
 		metadata:            metadata,
 		subscribeAckTimeout: subscribeAckTimeout,
+		creds:               creds,
+		keepaliveTime:       defaultKeepaliveTime,
+		keepaliveTimeout:    defaultKeepaliveTimeout,
+		reconnectBackoffMax: defaultReconnectBackoffMax,
 		state:               apiv1.ConnectionState_CONNECTION_STATE_DISCONNECTED,
 		sendCh:              make(chan outboundEvent, 100),
-		pendingAcks:         make(map[string]chan SubscribedAckResult),
+		pendingAcks:         make(map[string]*pendingSubscription),
+	}
+}
+
+// SetTransportTuning overrides the connection-liveness knobs: the HTTP/2
+// keepalive ping interval and timeout (dead-peer detection) and the cap on
+// the jittered exponential reconnect backoff. A zero value keeps the
+// corresponding default — it never disables keepalive or the backoff cap
+// (the same "0 means default, not off" convention as ttl_janitor_interval).
+// Must be called before Run.
+func (c *ControlPlaneClient) SetTransportTuning(keepaliveTime, keepaliveTimeout, reconnectBackoffMax time.Duration) {
+	if keepaliveTime > 0 {
+		c.keepaliveTime = keepaliveTime
+	}
+	if keepaliveTimeout > 0 {
+		c.keepaliveTimeout = keepaliveTimeout
+	}
+	if reconnectBackoffMax > 0 {
+		c.reconnectBackoffMax = reconnectBackoffMax
 	}
 }
 
@@ -75,27 +212,74 @@ func (c *ControlPlaneClient) setState(state apiv1.ConnectionState) {
 }
 
 func (c *ControlPlaneClient) Run(ctx context.Context) {
+	// Reconnect pacing: jittered exponential backoff from the floor up to
+	// reconnectBackoffMax, so a flapping or overloaded control plane is not
+	// hammered on a fixed cadence. The schedule resets to the floor only
+	// after a connection stayed CONNECTED for cpConnectionHealthyAge — an
+	// instantly-dying connection keeps escalating instead of thrashing.
+	backoff := newReconnectBackoff(reconnectBackoffFloor, c.reconnectBackoffMax, nil)
 	for {
+		if c.admissionStopped.Load() {
+			return
+		}
 		select {
 		case <-ctx.Done():
 			return
 		default:
-			c.connect(ctx)
+			connectedAt := c.connect(ctx)
+			if c.admissionStopped.Load() {
+				return
+			}
+			backoff.noteOutcome(connectedAt, time.Now())
+			delay := backoff.next()
+			c.logger.Debug().Dur("delay", delay).Msg("waiting before control plane reconnect")
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(5 * time.Second):
-				// Reconnection backoff to avoid hammering the control plane
+			case <-time.After(delay):
 			}
 		}
 	}
 }
 
-func (c *ControlPlaneClient) connect(ctx context.Context) {
+// connect dials the control plane, runs the stream until it dies, and
+// returns when it became CONNECTED (the zero time if it never did) so Run
+// can distinguish a healthy-then-lost connection from one that failed
+// outright when deciding whether to reset the reconnect backoff.
+func (c *ControlPlaneClient) connect(ctx context.Context) (connectedAt time.Time) {
+	if c.admissionStopped.Load() {
+		return time.Time{}
+	}
 	c.setState(apiv1.ConnectionState_CONNECTION_STATE_CONNECTING)
 	c.logger.Info().Str("url", c.url).Msg("connecting to control plane")
 
-	conn, err := grpc.NewClient(c.url, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	// Fail closed: never fall back to plaintext when credentials are
+	// missing. Production wiring always resolves them via
+	// BuildControlPlaneCreds before constructing the client.
+	if c.creds == nil || c.creds.Transport == nil {
+		c.logger.Error().Msg("no transport credentials configured for control plane; refusing to dial")
+		c.setState(apiv1.ConnectionState_CONNECTION_STATE_DISCONNECTED)
+		return
+	}
+
+	opts := []grpc.DialOption{grpc.WithTransportCredentials(c.creds.Transport)}
+	if c.creds.PerRPC != nil {
+		opts = append(opts, grpc.WithPerRPCCredentials(c.creds.PerRPC))
+	}
+	// HTTP/2 keepalive: without it a silently dead TCP path leaves this
+	// connection CONNECTED (and every proxied DNS query eating its timeout)
+	// until the kernel's TCP retransmission timeout, which takes minutes.
+	// PermitWithoutStream keeps liveness checks running even between
+	// streams. The control plane must permit this cadence via its keepalive
+	// enforcement policy (see README) or it will GOAWAY with
+	// ENHANCE_YOUR_CALM ("too_many_pings").
+	opts = append(opts, grpc.WithKeepaliveParams(keepalive.ClientParameters{
+		Time:                c.keepaliveTime,
+		Timeout:             c.keepaliveTimeout,
+		PermitWithoutStream: true,
+	}))
+
+	conn, err := grpc.NewClient(c.url, opts...)
 	if err != nil {
 		c.logger.Error().Err(err).Msg("failed to create grpc client")
 		c.setState(apiv1.ConnectionState_CONNECTION_STATE_DISCONNECTED)
@@ -130,6 +314,14 @@ func (c *ControlPlaneClient) connect(ctx context.Context) {
 	c.stream = stream
 	c.mu.Unlock()
 
+	// New connection epoch. Bumping BEFORE snapshotting the attachment list
+	// below guarantees that any event still queued with an older epoch was
+	// produced from state the snapshot already reflects, so the SyncRequest
+	// supersedes it and sendLoop can safely drop it. Events enqueued after
+	// this point may race the snapshot in either direction — the CP handles
+	// that via the idempotency contract documented in control.proto.
+	epoch := c.sendEpoch.Add(1)
+
 	syncReq := &apiv1.DaemonEvent{
 		Event: &apiv1.DaemonEvent_Sync{
 			Sync: &apiv1.SyncRequest{
@@ -147,41 +339,167 @@ func (c *ControlPlaneClient) connect(ctx context.Context) {
 	}
 
 	c.setState(apiv1.ConnectionState_CONNECTION_STATE_CONNECTED)
+	connectedAt = time.Now()
 	c.logger.Info().Msg("connected to control plane")
 
-	errCh := make(chan error, 2)
-
-	go c.sendLoop(streamCtx, stream, errCh)
-	go c.recvLoop(stream, errCh)
-	go c.heartbeatLoop(streamCtx)
-
-	select {
-	case <-streamCtx.Done():
-	case err := <-errCh:
-		if err != nil {
-			c.logger.Error().Err(err).Msg("stream error")
-		}
+	if err := c.runStreamEpoch(streamCtx, cancel, stream, epoch); err != nil {
+		c.logger.Error().Err(err).Msg("stream error")
 	}
 
 	c.setState(apiv1.ConnectionState_CONNECTION_STATE_DISCONNECTED)
 	c.logger.Info().Msg("disconnected from control plane")
+	return connectedAt
 }
 
-func (c *ControlPlaneClient) sendLoop(ctx context.Context, stream grpc.BidiStreamingClient[apiv1.DaemonEvent, apiv1.ControlCommand], errCh chan<- error) {
+// runStreamEpoch owns every worker that touches one exact gRPC stream after
+// its SyncRequest has been sent. Cancellation is the only stream shutdown
+// primitive used here: grpc-go permits one concurrent sender and receiver,
+// but CloseSend must not race SendMsg. Canceling the stream context unblocks
+// both directions; joining all workers before returning ensures the next
+// connection epoch is the sole sendCh consumer and recv-loop owner.
+func (c *ControlPlaneClient) runStreamEpoch(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	stream grpc.BidiStreamingClient[apiv1.DaemonEvent, apiv1.ControlCommand],
+	epoch uint64,
+) error {
+	errCh := make(chan error, 2)
+	var workers sync.WaitGroup
+	workers.Add(4)
+	go func() {
+		defer workers.Done()
+		c.sendLoop(ctx, stream, epoch, errCh)
+	}()
+	go func() {
+		defer workers.Done()
+		c.recvLoop(stream, epoch, errCh)
+	}()
+	go func() {
+		defer workers.Done()
+		c.heartbeatLoop(ctx)
+	}()
+	// Restored subscriptions are scheduled only after the fresh SyncRequest
+	// above has been sent, and they run outside the liveness select. send/recv
+	// loops are already active, so a slow/missing ack never blocks ordinary
+	// commands/events or stream error detection.
+	go func() {
+		defer workers.Done()
+		c.startRestoreResyncs(ctx, epoch)
+	}()
+
+	var streamErr error
+	select {
+	case <-ctx.Done():
+	case streamErr = <-errCh:
+	}
+
+	// End restore attempts owned by this connection before returning. Their
+	// needsResync flags deliberately remain set; the next connection registers
+	// fresh exact attempts after its own SyncRequest. Cancel first so blocked
+	// Send/Recv calls unwind and a concurrently-starting scheduler cannot leave
+	// a dead-epoch entry behind. Do not CloseSend concurrently with sendLoop.
+	cancel()
+	c.cancelRestoreSubscriptions(epoch, fmt.Errorf("control plane disconnected"))
+	workers.Wait()
+	return streamErr
+}
+
+// sendLoop drains sendCh onto one connection's stream. epoch is that
+// connection's epoch: events stamped with an older one were queued before
+// this connection's SyncRequest snapshot (i.e. during or before a previous
+// connection) and are dropped — the Sync already conveyed the authoritative
+// attachment state, so replaying stale Heartbeats, Unsubscribeds, or
+// CommandResults after it would only hand the CP superseded interleavings.
+// The one exception is a Subscribed whose ack is STILL pending: a caller
+// blocked in SubscribeAndWait across the reconnect needs the CP to see the
+// Subscribed on the new stream, because the CP replies SubscribedAck to
+// Subscribed, not to Sync. It is re-sent after the SyncRequest (which
+// connect() sends directly before starting this loop, so ordering holds by
+// construction) and the CP handles the possible re-delivery idempotently
+// (see control.proto).
+func (c *ControlPlaneClient) sendLoop(ctx context.Context, stream grpc.BidiStreamingClient[apiv1.DaemonEvent, apiv1.ControlCommand], epoch uint64, errCh chan<- error) {
+	// Re-drive every exact pending subscription after this connection's Sync.
+	// This closes the case where the previous sendLoop dequeued Subscribed but
+	// stream.Send failed: the pending entry retains the full payload even though
+	// its old queue item is gone. Queue duplicates are suppressed by sentEpoch.
+	for _, pending := range c.snapshotPendingSubscriptions() {
+		if !c.beginPendingSend(pending, epoch) {
+			continue
+		}
+		if err := stream.Send(&apiv1.DaemonEvent{
+			Event: &apiv1.DaemonEvent_Subscribed{Subscribed: pending.sub},
+		}); err != nil {
+			c.resetPendingSend(pending, epoch)
+			errCh <- err
+			return
+		}
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case outbound := <-c.sendCh:
-			if outbound.requirePendingAck && !c.hasPendingAck(outbound.subscribedID) {
-				c.logger.Debug().Str("id", outbound.subscribedID).Msg("dropping stale subscribed event")
+			if outbound.pending != nil {
+				if !c.beginPendingSend(outbound.pending, epoch) {
+					c.logger.Debug().Str("id", outbound.pending.sub.Id).Msg("dropping stale or duplicate subscribed event")
+					continue
+				}
+			} else if outbound.epoch < epoch {
+				c.logger.Debug().Msg("dropping stale queued event superseded by sync")
 				continue
 			}
 			if err := stream.Send(outbound.event); err != nil {
+				if outbound.pending != nil {
+					c.resetPendingSend(outbound.pending, epoch)
+				}
 				errCh <- err
 				return
 			}
 		}
+	}
+}
+
+func (c *ControlPlaneClient) snapshotPendingSubscriptions() []*pendingSubscription {
+	c.pendingAcksMu.Lock()
+	defer c.pendingAcksMu.Unlock()
+	pending := make([]*pendingSubscription, 0, len(c.pendingAcks))
+	for _, subscription := range c.pendingAcks {
+		pending = append(pending, subscription)
+	}
+	return pending
+}
+
+// beginPendingSend both validates exact ownership and reserves this connection
+// epoch before stream.Send. Reserving first permits an immediate CP response to
+// claim the ack; resetPendingSend makes a failed Send eligible for redrive.
+func (c *ControlPlaneClient) beginPendingSend(expected *pendingSubscription, epoch uint64) bool {
+	if expected == nil || expected.sub == nil {
+		return false
+	}
+	c.pendingAcksMu.Lock()
+	defer c.pendingAcksMu.Unlock()
+	if c.pendingAcks[expected.sub.Id] != expected {
+		return false
+	}
+	if expected.purpose == subscriptionPurposeRestore && expected.restoreEpoch != epoch {
+		return false
+	}
+	if expected.sentEpoch == epoch {
+		return false
+	}
+	expected.sentEpoch = epoch
+	return true
+}
+
+func (c *ControlPlaneClient) resetPendingSend(expected *pendingSubscription, epoch uint64) {
+	if expected == nil || expected.sub == nil {
+		return
+	}
+	c.pendingAcksMu.Lock()
+	defer c.pendingAcksMu.Unlock()
+	if c.pendingAcks[expected.sub.Id] == expected && expected.sentEpoch == epoch {
+		expected.sentEpoch = 0
 	}
 }
 
@@ -192,7 +510,217 @@ func (c *ControlPlaneClient) hasPendingAck(id string) bool {
 	return ok
 }
 
-func (c *ControlPlaneClient) recvLoop(stream grpc.BidiStreamingClient[apiv1.DaemonEvent, apiv1.ControlCommand], errCh chan<- error) {
+// publishPendingSubscription makes the pending-map entry and its initial queue
+// item visible atomically with respect to sendLoop snapshots/beginPendingSend.
+// Holding pendingAcksMu across the non-blocking enqueue means sendLoop can
+// dequeue the item, but cannot validate/send it until publication either fully
+// succeeds or is fully rolled back. No ack can therefore be sent and then
+// invalidated by a late queue-full branch.
+func (c *ControlPlaneClient) publishPendingSubscription(pending *pendingSubscription) error {
+	if pending == nil || pending.sub == nil || pending.sub.Id == "" {
+		return fmt.Errorf("invalid pending subscription")
+	}
+	c.pendingAcksMu.Lock()
+	defer c.pendingAcksMu.Unlock()
+	if _, exists := c.pendingAcks[pending.sub.Id]; exists {
+		return errSubscriptionAlreadyPending
+	}
+	c.pendingAcks[pending.sub.Id] = pending
+	outbound := outboundEvent{
+		event: &apiv1.DaemonEvent{
+			Event: &apiv1.DaemonEvent_Subscribed{Subscribed: pending.sub},
+		},
+		pending: pending,
+		epoch:   c.sendEpoch.Load(),
+	}
+	select {
+	case c.sendCh <- outbound:
+		return nil
+	default:
+		delete(c.pendingAcks, pending.sub.Id)
+		return errSubscriptionQueueFull
+	}
+}
+
+// takePendingSubscription atomically claims the only ack that may apply to an
+// attachment ID. A late/duplicate ack finds no entry and is ignored.
+func (c *ControlPlaneClient) takePendingSubscription(id string) *pendingSubscription {
+	c.pendingAcksMu.Lock()
+	pending := c.pendingAcks[id]
+	if pending != nil {
+		delete(c.pendingAcks, id)
+		if pending.timer != nil {
+			pending.timer.Stop()
+		}
+	}
+	c.pendingAcksMu.Unlock()
+	return pending
+}
+
+func (c *ControlPlaneClient) takePendingSubscriptionForEpoch(id string, epoch uint64) *pendingSubscription {
+	c.pendingAcksMu.Lock()
+	pending := c.pendingAcks[id]
+	// Production connection epochs start at one. Rejecting zero also makes it
+	// impossible for an undispatched pending entry (sentEpoch == 0) to accept a
+	// synthetic/default-epoch ack.
+	if epoch == 0 || pending == nil || pending.sentEpoch != epoch {
+		c.pendingAcksMu.Unlock()
+		return nil
+	}
+	delete(c.pendingAcks, id)
+	if pending.timer != nil {
+		pending.timer.Stop()
+	}
+	c.pendingAcksMu.Unlock()
+	return pending
+}
+
+// removePendingSubscription removes only the exact attempt supplied, so an
+// old timeout/disconnect cannot erase a newer retry that reused the ID.
+func (c *ControlPlaneClient) removePendingSubscription(expected *pendingSubscription) bool {
+	if expected == nil || expected.sub == nil {
+		return false
+	}
+	c.pendingAcksMu.Lock()
+	defer c.pendingAcksMu.Unlock()
+	if c.pendingAcks[expected.sub.Id] != expected {
+		return false
+	}
+	delete(c.pendingAcks, expected.sub.Id)
+	if expected.timer != nil {
+		expected.timer.Stop()
+	}
+	return true
+}
+
+func (c *ControlPlaneClient) deliverSubscriptionResult(pending *pendingSubscription, result SubscribedAckResult) {
+	if pending == nil || pending.resultCh == nil {
+		return
+	}
+	select {
+	case pending.resultCh <- result:
+	default:
+	}
+}
+
+// cancelSubscription is called by attachment teardown after the exact server
+// state has been unregistered. It unblocks a waiting Attach and invalidates any
+// queued Subscribed event; restore attempts retain needsResync automatically.
+func (c *ControlPlaneClient) cancelSubscription(id string, err error) {
+	pending := c.takePendingSubscription(id)
+	if pending == nil {
+		return
+	}
+	c.deliverSubscriptionResult(pending, SubscribedAckResult{Err: err})
+}
+
+func (c *ControlPlaneClient) cancelRestoreSubscriptions(epoch uint64, err error) {
+	var canceled []*pendingSubscription
+	c.pendingAcksMu.Lock()
+	for id, pending := range c.pendingAcks {
+		if pending.purpose != subscriptionPurposeRestore || pending.restoreEpoch != epoch {
+			continue
+		}
+		delete(c.pendingAcks, id)
+		if pending.timer != nil {
+			pending.timer.Stop()
+		}
+		canceled = append(canceled, pending)
+	}
+	c.pendingAcksMu.Unlock()
+	for _, pending := range canceled {
+		c.deliverSubscriptionResult(pending, SubscribedAckResult{Err: err})
+	}
+}
+
+// stopAdmission permanently shuts down this client's command stream. It is
+// used for daemon terminal/quarantine state as well as graceful Stop: cancel
+// the exact live stream, unblock every pending Attach, and prevent Run from
+// reconnecting with the same client instance.
+func (c *ControlPlaneClient) stopAdmission(err error) {
+	c.admissionStopped.Store(true)
+	c.mu.RLock()
+	cancel := c.cancel
+	c.mu.RUnlock()
+	if cancel != nil {
+		cancel()
+	}
+
+	var pending []*pendingSubscription
+	c.pendingAcksMu.Lock()
+	for id, subscription := range c.pendingAcks {
+		delete(c.pendingAcks, id)
+		if subscription.timer != nil {
+			subscription.timer.Stop()
+		}
+		pending = append(pending, subscription)
+	}
+	c.pendingAcksMu.Unlock()
+	for _, subscription := range pending {
+		c.deliverSubscriptionResult(subscription, SubscribedAckResult{Err: err})
+	}
+}
+
+func (c *ControlPlaneClient) restoreSubscribeAckTimeout() time.Duration {
+	if c.subscribeAckTimeout > 0 {
+		return c.subscribeAckTimeout
+	}
+	return defaultRestoreSubscribeAckTimeout
+}
+
+// startRestoreResyncs registers one bounded background handshake for each
+// exact restored attachment still flagged. It never waits for acks itself;
+// recvLoop applies them, while timers/disconnect merely invalidate attempts
+// and leave needsResync set for a later connection.
+func (c *ControlPlaneClient) startRestoreResyncs(ctx context.Context, epoch uint64) {
+	timeout := c.restoreSubscribeAckTimeout()
+	for _, candidate := range c.server.GetRestoreResyncSubscriptions() {
+		if ctx.Err() != nil {
+			return
+		}
+		if candidate.sub == nil || !c.server.restoreResyncStillNeeded(candidate.sub.Id, candidate.state) {
+			continue
+		}
+
+		pending := &pendingSubscription{
+			sub:          candidate.sub,
+			purpose:      subscriptionPurposeRestore,
+			state:        candidate.state,
+			restoreEpoch: epoch,
+		}
+		if err := c.publishPendingSubscription(pending); err != nil {
+			if errors.Is(err, errSubscriptionAlreadyPending) {
+				c.logger.Debug().Str("id", candidate.sub.Id).Msg("restore resync already pending; skipping duplicate")
+			} else {
+				c.logger.Warn().Err(err).Str("id", candidate.sub.Id).
+					Msg("could not queue restored attachment resync; will retry after reconnect")
+			}
+			continue
+		}
+		if ctx.Err() != nil {
+			c.removePendingSubscription(pending)
+			return
+		}
+
+		// Arm the background timeout only while this exact entry is current.
+		timer := time.AfterFunc(timeout, func() {
+			if c.removePendingSubscription(pending) {
+				c.logger.Warn().Str("id", pending.sub.Id).Dur("timeout", timeout).
+					Msg("timeout waiting for restored attachment subscribed ack; will retry after reconnect")
+			}
+		})
+		c.pendingAcksMu.Lock()
+		if c.pendingAcks[pending.sub.Id] == pending {
+			pending.timer = timer
+		} else {
+			timer.Stop()
+		}
+		c.pendingAcksMu.Unlock()
+
+	}
+}
+
+func (c *ControlPlaneClient) recvLoop(stream grpc.BidiStreamingClient[apiv1.DaemonEvent, apiv1.ControlCommand], epoch uint64, errCh chan<- error) {
 	for {
 		cmd, err := stream.Recv()
 		if err != nil {
@@ -200,7 +728,7 @@ func (c *ControlPlaneClient) recvLoop(stream grpc.BidiStreamingClient[apiv1.Daem
 			return
 		}
 
-		c.handleCommand(cmd)
+		c.handleCommandForEpoch(cmd, epoch)
 	}
 }
 
@@ -222,107 +750,122 @@ func (c *ControlPlaneClient) heartbeatLoop(ctx context.Context) {
 					},
 				},
 			}
-			select {
-			case c.sendCh <- event:
-			case <-ctx.Done():
-				return
-			default:
+			if !c.enqueue(event) {
 				c.logger.Warn().Msg("send channel full, dropping heartbeat")
 			}
 		}
 	}
 }
 
+// handleCommand applies one control-plane command. Every applying case
+// yields an outcome (nil = fully applied); when the command carried a
+// non-empty command_id, that outcome is reported back as a CommandResult
+// event so the control plane can converge on truth instead of assuming
+// success. SyncAck and SubscribedAck are pure acks of daemon events and
+// never produce results (SubscribedAck already has its own handshake via
+// SubscribeAndWait).
 func (c *ControlPlaneClient) handleCommand(cmd *apiv1.ControlCommand) {
+	c.handleCommandForEpoch(cmd, c.sendEpoch.Load())
+}
+
+// handleCommandForEpoch applies a command received on one exact stream epoch.
+// Only SubscribedAck uses the epoch: a delayed ack from an older recvLoop must
+// not claim a newer restore retry for the same attachment ID.
+func (c *ControlPlaneClient) handleCommandForEpoch(cmd *apiv1.ControlCommand, epoch uint64) {
+	var err error
+	reportResult := true
+	if c.admissionStopped.Load() {
+		switch cmd.Command.(type) {
+		case *apiv1.ControlCommand_SyncAck, *apiv1.ControlCommand_SubscribedAck:
+			return
+		default:
+			c.sendCommandResult(cmd.CommandId, cmd.Id, fmt.Errorf("control-plane command admission is stopped"))
+			return
+		}
+	}
+	if c.server != nil {
+		done, ok := c.server.beginControlCommand(cmd.Id)
+		if !ok {
+			switch cmd.Command.(type) {
+			case *apiv1.ControlCommand_SyncAck, *apiv1.ControlCommand_SubscribedAck:
+				return
+			default:
+				c.sendCommandResult(cmd.CommandId, cmd.Id, fmt.Errorf("daemon is stopping"))
+				return
+			}
+		}
+		defer done()
+	}
+
 	switch v := cmd.Command.(type) {
 	case *apiv1.ControlCommand_SyncAck:
 		c.logger.Debug().Msg("received sync ack")
-
-	case *apiv1.ControlCommand_SetMode:
-		c.logger.Debug().Str("id", cmd.Id).Str("mode", v.SetMode.Mode.String()).Msg("received set mode")
-		if err := c.server.SetFilterMode(cmd.Id, v.SetMode.Mode); err != nil {
-			c.logger.Error().Err(err).Str("id", cmd.Id).Msg("failed to set filter mode")
-		}
-
-	case *apiv1.ControlCommand_AllowCidr:
-		c.logger.Debug().Str("id", cmd.Id).Str("cidr", v.AllowCidr.Cidr).Msg("received allow cidr")
-		cidr, err := filter.ParseCIDR(v.AllowCidr.Cidr)
-		if err != nil {
-			c.logger.Error().Err(err).Str("id", cmd.Id).Str("cidr", v.AllowCidr.Cidr).Msg("failed to parse CIDR")
-			return
-		}
-		if err := c.server.AllowCIDR(cmd.Id, cidr); err != nil {
-			c.logger.Error().Err(err).Str("id", cmd.Id).Msg("failed to allow CIDR")
-		}
-
-	case *apiv1.ControlCommand_DenyCidr:
-		c.logger.Debug().Str("id", cmd.Id).Str("cidr", v.DenyCidr.Cidr).Msg("received deny cidr")
-		cidr, err := filter.ParseCIDR(v.DenyCidr.Cidr)
-		if err != nil {
-			c.logger.Error().Err(err).Str("id", cmd.Id).Str("cidr", v.DenyCidr.Cidr).Msg("failed to parse CIDR")
-			return
-		}
-		if err := c.server.DenyCIDR(cmd.Id, cidr); err != nil {
-			c.logger.Error().Err(err).Str("id", cmd.Id).Msg("failed to deny CIDR")
-		}
-
-	case *apiv1.ControlCommand_RemoveCidr:
-		c.logger.Debug().Str("id", cmd.Id).Str("cidr", v.RemoveCidr).Msg("received remove cidr")
-		cidr, err := filter.ParseCIDR(v.RemoveCidr)
-		if err != nil {
-			c.logger.Error().Err(err).Str("id", cmd.Id).Str("cidr", v.RemoveCidr).Msg("failed to parse CIDR")
-			return
-		}
-		if err := c.server.RemoveAllowedCIDR(cmd.Id, cidr); err != nil {
-			c.logger.Warn().Err(err).Str("id", cmd.Id).Msg("failed to remove CIDR from allowlist")
-		}
-		if err := c.server.RemoveDeniedCIDR(cmd.Id, cidr); err != nil {
-			c.logger.Warn().Err(err).Str("id", cmd.Id).Msg("failed to remove CIDR from denylist")
-		}
-
-	case *apiv1.ControlCommand_BulkUpdate:
-		c.logger.Debug().Str("id", cmd.Id).Msg("received bulk update")
-		c.applyBulkUpdate(cmd.Id, v.BulkUpdate)
-
-	case *apiv1.ControlCommand_SetDnsMode:
-		c.logger.Debug().Str("id", cmd.Id).Str("mode", v.SetDnsMode.Mode.String()).Msg("received set dns mode")
-		if err := c.server.SetDnsMode(cmd.Id, v.SetDnsMode.Mode); err != nil {
-			c.logger.Error().Err(err).Str("id", cmd.Id).Msg("failed to set dns mode")
-		}
-
-	case *apiv1.ControlCommand_AllowDomain:
-		c.logger.Debug().Str("id", cmd.Id).Str("domain", v.AllowDomain.Domain).Msg("received allow domain")
-		if err := c.server.AllowDomain(cmd.Id, v.AllowDomain.Domain, v.AllowDomain.IncludeSubdomains); err != nil {
-			c.logger.Error().Err(err).Str("id", cmd.Id).Msg("failed to allow domain")
-		}
-
-	case *apiv1.ControlCommand_DenyDomain:
-		c.logger.Debug().Str("id", cmd.Id).Str("domain", v.DenyDomain.Domain).Msg("received deny domain")
-		if err := c.server.DenyDomain(cmd.Id, v.DenyDomain.Domain, v.DenyDomain.IncludeSubdomains); err != nil {
-			c.logger.Error().Err(err).Str("id", cmd.Id).Msg("failed to deny domain")
-		}
-
-	case *apiv1.ControlCommand_RemoveDomain:
-		c.logger.Debug().Str("id", cmd.Id).Str("domain", v.RemoveDomain).Msg("received remove domain")
-		if err := c.server.RemoveDomain(cmd.Id, v.RemoveDomain); err != nil {
-			c.logger.Error().Err(err).Str("id", cmd.Id).Msg("failed to remove domain")
-		}
+		reportResult = false
 
 	case *apiv1.ControlCommand_SubscribedAck:
 		c.logger.Debug().Str("id", cmd.Id).Msg("received subscribed ack")
-		c.applySubscribedAck(cmd.Id, v.SubscribedAck)
-		c.pendingAcksMu.Lock()
-		if ch, ok := c.pendingAcks[cmd.Id]; ok {
-			select {
-			case ch <- SubscribedAckResult{Ack: v.SubscribedAck}:
-			default:
-			}
-			delete(c.pendingAcks, cmd.Id)
+		reportResult = false
+		pending := c.takePendingSubscriptionForEpoch(cmd.Id, epoch)
+		if pending == nil {
+			// The attempt timed out, disconnected, detached, or already consumed
+			// this ack. Applying it now could mutate removed/replaced state.
+			c.logger.Debug().Str("id", cmd.Id).Msg("ignoring subscribed ack with no exact pending subscription")
+			break
 		}
-		c.pendingAcksMu.Unlock()
+
+		err = c.applyPendingSubscribedAck(cmd.Id, pending, v.SubscribedAck)
+		if err != nil && !isReportedProtectedPressure(err) {
+			c.logger.Error().Err(err).Str("id", cmd.Id).Msg("failed to apply subscribed ack")
+		}
+		c.deliverSubscriptionResult(pending, SubscribedAckResult{Ack: v.SubscribedAck, Err: err})
+		if pending.purpose == subscriptionPurposeAttach && pending.callerApplies && pending.resultCh != nil && pending.state != nil {
+			// Preserve control-stream order across the bounded Attach handoff. The
+			// ack has been claimed and delivered, but Attach owns apply+commit; do
+			// not let recvLoop process the following command until Attach either
+			// applies/quarantines successfully or rolls setup back.
+			if pending.state.setupDone != nil {
+				<-pending.state.setupDone
+			}
+		}
 
 	default:
-		c.logger.Warn().Str("id", cmd.Id).Msg("received unknown command")
+		err = c.server.ApplyPolicyCommand(cmd)
+		if err != nil && !isReportedProtectedPressure(err) {
+			c.logger.Error().Err(err).Str("id", cmd.Id).Msg("failed to apply policy command")
+		}
+	}
+
+	if reportResult {
+		c.sendCommandResult(cmd.CommandId, cmd.Id, err)
+	}
+}
+
+func isReportedProtectedPressure(err error) bool {
+	return errors.Is(err, errPolicyDegraded) || errors.Is(err, errProtectedPolicyDurablyDegraded)
+}
+
+// sendCommandResult reports a command outcome back to the control plane,
+// echoing its correlation id. Commands without a command_id (the default)
+// produce no result — opt-in, backward compatible. The send is
+// non-blocking: a saturated event channel drops the result with a warning
+// rather than stalling the receive loop (results are best-effort by
+// contract; the CP treats a missing result as unknown).
+func (c *ControlPlaneClient) sendCommandResult(commandID, attachmentID string, cmdErr error) {
+	if commandID == "" {
+		return
+	}
+	result := &apiv1.CommandResult{
+		CommandId: commandID,
+		Id:        attachmentID,
+		Success:   cmdErr == nil,
+	}
+	if cmdErr != nil {
+		result.Error = cmdErr.Error()
+	}
+	if !c.enqueue(outboundEvent{event: &apiv1.DaemonEvent{
+		Event: &apiv1.DaemonEvent_CommandResult{CommandResult: result},
+	}}) {
+		c.logger.Warn().Str("command_id", commandID).Str("id", attachmentID).Msg("send channel full, dropping command result")
 	}
 }
 
@@ -330,66 +873,73 @@ func (c *ControlPlaneClient) handleCommand(cmd *apiv1.ControlCommand) {
 // acknowledge it with initial configuration. Returns the ack, or an error if
 // the timeout is reached or the connection is lost.
 //
-// If subscribeAckTimeout is 0, this returns immediately without waiting.
+// If subscribeAckTimeout is 0, this returns immediately without waiting, but
+// keeps an exact fire-and-forget pending entry so a later ack is still applied
+// safely. (Restored-attachment handshakes use a separate bounded background
+// timeout and are always ack-driven.)
 func (c *ControlPlaneClient) SubscribeAndWait(ctx context.Context, sub *apiv1.Subscribed) (*apiv1.SubscribedAck, error) {
-	if c.subscribeAckTimeout == 0 {
-		select {
-		case c.sendCh <- outboundEvent{event: &apiv1.DaemonEvent{
-			Event: &apiv1.DaemonEvent_Subscribed{Subscribed: sub},
-		}}:
-			return nil, nil
-		default:
-			return nil, fmt.Errorf("send channel full")
-		}
+	return c.subscribeAndWait(ctx, sub, false)
+}
+
+func (c *ControlPlaneClient) subscribeForAttachAndWait(ctx context.Context, sub *apiv1.Subscribed) (*apiv1.SubscribedAck, error) {
+	return c.subscribeAndWait(ctx, sub, true)
+}
+
+func (c *ControlPlaneClient) subscribeAndWait(ctx context.Context, sub *apiv1.Subscribed, callerApplies bool) (*apiv1.SubscribedAck, error) {
+	if sub == nil || sub.Id == "" {
+		return nil, fmt.Errorf("subscribed attachment id is required")
 	}
 
-	resultCh := make(chan SubscribedAckResult, 1)
-
-	c.pendingAcksMu.Lock()
-	c.pendingAcks[sub.Id] = resultCh
-	c.pendingAcksMu.Unlock()
-
-	select {
-	case c.sendCh <- outboundEvent{
-		event: &apiv1.DaemonEvent{
-			Event: &apiv1.DaemonEvent_Subscribed{Subscribed: sub},
-		},
-		subscribedID:      sub.Id,
-		requirePendingAck: true,
-	}:
-	default:
-		c.pendingAcksMu.Lock()
-		delete(c.pendingAcks, sub.Id)
-		c.pendingAcksMu.Unlock()
-		return nil, fmt.Errorf("send channel full")
+	pending := &pendingSubscription{
+		sub:           sub,
+		purpose:       subscriptionPurposeAttach,
+		callerApplies: callerApplies,
+	}
+	if c.server != nil {
+		pending.state = c.server.getAttachmentState(sub.Id)
+	}
+	if c.subscribeAckTimeout != 0 {
+		pending.resultCh = make(chan SubscribedAckResult, 1)
+	}
+	if err := c.publishPendingSubscription(pending); err != nil {
+		if errors.Is(err, errSubscriptionAlreadyPending) {
+			return nil, fmt.Errorf("subscription already pending for attachment %s", sub.Id)
+		}
+		return nil, err
+	}
+	if c.subscribeAckTimeout == 0 {
+		return nil, nil
 	}
 
 	timeoutCtx, cancel := context.WithTimeout(ctx, c.subscribeAckTimeout)
 	defer cancel()
 
 	select {
-	case result := <-resultCh:
+	case result := <-pending.resultCh:
 		return result.Ack, result.Err
 	case <-timeoutCtx.Done():
-		c.pendingAcksMu.Lock()
-		delete(c.pendingAcks, sub.Id)
-		c.pendingAcksMu.Unlock()
-		return nil, fmt.Errorf("timeout waiting for subscribed ack from control plane")
+		if c.removePendingSubscription(pending) {
+			return nil, fmt.Errorf("waiting for subscribed ack from control plane: %w", timeoutCtx.Err())
+		}
+		// The receive loop already claimed this exact ack. It will deliver the
+		// result and, for Attach-owned apply, wait on setupDone before processing
+		// the next stream command. Consume the claimed result even though the
+		// timer fired so Attach can finish that handoff and release the barrier.
+		result := <-pending.resultCh
+		return result.Ack, result.Err
 	}
 }
 
 func (c *ControlPlaneClient) SendUnsubscribed(unsub *apiv1.Unsubscribed) {
-	select {
-	case c.sendCh <- outboundEvent{event: &apiv1.DaemonEvent{
+	if !c.enqueue(outboundEvent{event: &apiv1.DaemonEvent{
 		Event: &apiv1.DaemonEvent_Unsubscribed{Unsubscribed: unsub},
-	}}:
-	default:
+	}}) {
 		c.logger.Warn().Str("id", unsub.Id).Msg("send channel full, dropping unsubscribed event")
 	}
 }
 
 func (c *ControlPlaneClient) MakeProxyFunc(attachmentID string) DnsProxyFunc {
-	return func(domain, queryType string) (DnsProxyDecision, error) {
+	return func(ctx context.Context, domain, queryType string) (DnsProxyDecision, error) {
 		c.mu.RLock()
 		client := c.client
 		state := c.state
@@ -399,7 +949,7 @@ func (c *ControlPlaneClient) MakeProxyFunc(attachmentID string) DnsProxyFunc {
 			return DnsProxyDecision{}, errDNSProxyUnavailable
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
 
 		resp, err := client.QueryDns(ctx, &apiv1.DnsQueryRequest{
@@ -420,101 +970,387 @@ func (c *ControlPlaneClient) MakeProxyFunc(attachmentID string) DnsProxyFunc {
 	}
 }
 
-func (c *ControlPlaneClient) applySubscribedAck(id string, ack *apiv1.SubscribedAck) {
+func (c *ControlPlaneClient) applyPendingSubscribedAck(id string, pending *pendingSubscription, ack *apiv1.SubscribedAck) error {
+	if pending == nil {
+		return fmt.Errorf("subscription is nil")
+	}
+	if pending.state == nil {
+		if pending.purpose == subscriptionPurposeRestore {
+			return fmt.Errorf("restored subscription has no live attachment state")
+		}
+		// SubscribeAndWait predates server-owned attachment reconciliation and is
+		// also used directly to verify/control the stream transport. Preserve that
+		// handshake mode when no corresponding server state exists: the ack is
+		// delivered to the caller but there is intentionally nothing to apply.
+		return nil
+	}
+	zeroTimeoutAttach := pending.purpose == subscriptionPurposeAttach && pending.callerApplies && pending.resultCh == nil
+	var attachValidationErr error
+	if pending.purpose == subscriptionPurposeAttach && pending.callerApplies {
+		attachValidationErr = c.validateSubscribedAck(id, ack)
+		if pending.resultCh != nil {
+			// The Attach goroutine owns the apply+commit boundary. Delivering a
+			// validated immutable ack cannot change the staged BLOCK_ALL filter.
+			return attachValidationErr
+		}
+		// Zero-timeout fire-and-forget: an ack may beat Attach's final commit.
+		// Wait without reconcileMu; Attach needs that lock to finish setup.
+		if pending.state.setupDone == nil {
+			return fmt.Errorf("attach subscription has no setup barrier")
+		}
+		<-pending.state.setupDone
+		if !pending.state.setupCommitted.Load() {
+			return fmt.Errorf("attachment setup did not commit")
+		}
+	}
+
+	// Teardown never waits for reconcileMu while holding Server.mu. Whichever
+	// side wins this exact-state lock completes atomically with respect to the
+	// other: ack-first fully applies before teardown; teardown-first unregisters
+	// the state, causing the exact-live check below to reject the stale ack.
+	pending.state.reconcileMu.Lock()
+	defer pending.state.reconcileMu.Unlock()
+	if !c.server.attachmentStateStillLive(id, pending.state) {
+		return fmt.Errorf("attachment is no longer live")
+	}
+	if pending.purpose == subscriptionPurposeRestore &&
+		!c.server.restoreResyncStillNeeded(id, pending.state) {
+		return fmt.Errorf("restored attachment no longer needs resync")
+	}
+	if attachValidationErr != nil {
+		quarantineErr := c.server.quarantineAttachment(id, pending.state)
+		c.SendUnsubscribed(&apiv1.Unsubscribed{
+			Id: id, Reason: apiv1.UnsubscribeReason_UNSUBSCRIBE_REASON_ERROR,
+			Error: "initial control-plane policy failed validation",
+		})
+		return errors.Join(attachValidationErr, quarantineErr)
+	}
+
+	if err := c.applySubscribedAck(id, ack); err != nil {
+		if zeroTimeoutAttach {
+			if errors.Is(err, errProtectedPolicyDurablyDegraded) {
+				return err
+			}
+			quarantineErr := c.server.quarantineAttachment(id, pending.state)
+			c.SendUnsubscribed(&apiv1.Unsubscribed{
+				Id: id, Reason: apiv1.UnsubscribeReason_UNSUBSCRIBE_REASON_ERROR,
+				Error: "initial control-plane policy failed to apply",
+			})
+			return errors.Join(err, quarantineErr)
+		}
+		return err
+	}
+	if pending.purpose == subscriptionPurposeRestore {
+		if !c.server.clearRestoreResync(id, pending.state) {
+			return fmt.Errorf("restored attachment changed while applying subscribed ack")
+		}
+		c.logger.Info().Str("id", id).Msg("restored attachment converged to fresh control-plane state")
+	}
+	return nil
+}
+
+func (c *ControlPlaneClient) validateSubscribedAck(id string, ack *apiv1.SubscribedAck) error {
 	if ack == nil {
-		return
+		return fmt.Errorf("subscribed ack is nil")
 	}
-	if err := c.server.SetFilterMode(id, ack.Mode); err != nil {
-		c.logger.Error().Err(err).Str("id", id).Msg("failed to set filter mode from subscribed ack")
+	if err := validateFullDesiredModes(ack.Mode, ack.Dns); err != nil {
+		return err
 	}
-
-	for _, entry := range ack.AllowCidrs {
-		cidr, err := filter.ParseCIDR(entry.Cidr)
-		if err != nil {
-			c.logger.Error().Err(err).Str("id", id).Str("cidr", entry.Cidr).Msg("failed to parse allow CIDR in subscribed ack")
-			continue
-		}
-		if err := c.server.AllowCIDR(id, cidr); err != nil {
-			c.logger.Error().Err(err).Str("id", id).Str("cidr", entry.Cidr).Msg("failed to allow CIDR in subscribed ack")
-		}
+	dnsConfig := ack.Dns
+	if dnsConfig == nil {
+		dnsConfig = &apiv1.DnsConfig{Mode: apiv1.DnsMode_DNS_MODE_DISABLED}
 	}
-
-	for _, entry := range ack.DenyCidrs {
-		cidr, err := filter.ParseCIDR(entry.Cidr)
-		if err != nil {
-			c.logger.Error().Err(err).Str("id", id).Str("cidr", entry.Cidr).Msg("failed to parse deny CIDR in subscribed ack")
-			continue
-		}
-		if err := c.server.DenyCIDR(id, cidr); err != nil {
-			c.logger.Error().Err(err).Str("id", id).Str("cidr", entry.Cidr).Msg("failed to deny CIDR in subscribed ack")
-		}
+	ceilings, err := c.server.dnsLimitCeilingsForAttachment(id)
+	if err != nil {
+		return err
 	}
-
-	if ack.Dns != nil {
-		if err := c.server.ReplaceDNSRules(id, ack.Dns.Mode, ack.Dns.AllowDomains, ack.Dns.DenyDomains); err != nil {
-			c.logger.Error().Err(err).Str("id", id).Msg("failed to replace DNS rules in subscribed ack")
-		}
+	churnCeiling, err := c.server.dnsChurnCeilingForAttachment(id)
+	if err != nil {
+		return err
 	}
+	if _, err := prepareDNSRules(dnsConfig.Mode, dnsConfig.AllowDomains, dnsConfig.DenyDomains,
+		dnsConfig.UpstreamServers, c.server.defaultDNSUpstream, ceilings,
+		dnsLimitOverridesFromProto(dnsConfig), churnCeiling, dnsConfig.MaxChurnUnits); err != nil {
+		return fmt.Errorf("validating DNS configuration: %w", err)
+	}
+	_, _, err = c.server.parseBulkCIDRs(id, &apiv1.BulkUpdate{
+		Mode:       ack.Mode,
+		AllowCidrs: ack.AllowCidrs,
+		DenyCidrs:  ack.DenyCidrs,
+		Dns:        ack.Dns,
+	})
+	return err
 }
 
-func (c *ControlPlaneClient) applyBulkUpdate(id string, update *apiv1.BulkUpdate) {
+func (c *ControlPlaneClient) applySubscribedAck(id string, ack *apiv1.SubscribedAck) error {
+	if ack == nil {
+		return fmt.Errorf("subscribed ack is nil")
+	}
+	// SubscribedAck declares the complete desired state, just like a
+	// BulkUpdate. Routing it through the same parse-first, window-free delta
+	// reconcile removes stale restored rules without ever removing survivors;
+	// nil DNS is authoritative disabled/empty state too.
+	return c.applyBulkUpdate(id, &apiv1.BulkUpdate{
+		Mode:       ack.Mode,
+		AllowCidrs: ack.AllowCidrs,
+		DenyCidrs:  ack.DenyCidrs,
+		Dns:        ack.Dns,
+	})
+}
+
+// applyBulkUpdate routes control-plane complete state through the same server
+// transaction used by the local API. Keeping this wrapper preserves the
+// control-plane command boundary (and its focused tests) without duplicating
+// any validation, fail-closed staging, DNS, or recovery behavior.
+func (c *ControlPlaneClient) applyBulkUpdate(id string, update *apiv1.BulkUpdate) error {
+	return c.server.ApplyRules(id, update)
+}
+
+// ApplyRules reconciles the attachment to the declared state with
+// add/remove deltas instead of the old wipe-then-rebuild: a rule present in
+// both the old and new state is never removed from the kernel map, so a
+// control-plane resync opens no transient allow/block window. CIDR reconcile
+// leaves the independent DNS exact tier untouched; the authoritative DNS
+// config in this same operation then remaps still-authorized ownership and
+// promptly removes blocked or provisional keys. Any validation/parse error
+// aborts BEFORE any mutation. The returned error aggregates every failed step
+// — a partially-applied bulk update is a failure, never reported as success.
+func (s *Server) ApplyRules(id string, update *apiv1.BulkUpdate) error {
+	prepared, err := s.prepareBulkUpdate(id, update)
+	if err != nil {
+		return err
+	}
+	return s.applyPreparedRules(id, prepared)
+}
+
+type preparedBulkUpdate struct {
+	update      *apiv1.BulkUpdate
+	preparedDNS *preparedDNSRules
+	allowCIDRs  []parsedCIDR
+	denyCIDRs   []parsedCIDR
+}
+
+// prepareBulkUpdate validates every nested field before attachment mutation
+// admission. It is shared by stream and local commands; applyPreparedRules is
+// the only mutating authoritative implementation.
+func (s *Server) prepareBulkUpdate(id string, update *apiv1.BulkUpdate) (*preparedBulkUpdate, error) {
 	if update == nil {
-		return
+		return nil, fmt.Errorf("bulk update is nil")
 	}
-	allowCIDRs, denyCIDRs, ok := c.parseBulkCIDRs(id, update)
-	if !ok {
-		return
+	if err := validateFullDesiredModes(update.Mode, update.Dns); err != nil {
+		return nil, err
 	}
-	if err := c.server.ClearRules(id); err != nil {
-		c.logger.Error().Err(err).Str("id", id).Msg("failed to clear rules in bulk update")
-		return
+	allowCIDRs, denyCIDRs, err := s.parseBulkCIDRs(id, update)
+	if err != nil {
+		return nil, err
 	}
-	if err := c.server.SetFilterMode(id, update.Mode); err != nil {
-		c.logger.Error().Err(err).Str("id", id).Msg("failed to set filter mode in bulk update")
-		return
+	dnsConfig := update.Dns
+	if dnsConfig == nil {
+		dnsConfig = &apiv1.DnsConfig{Mode: apiv1.DnsMode_DNS_MODE_DISABLED}
 	}
+	dnsCeilings, err := s.dnsLimitCeilingsForAttachment(id)
+	if err != nil {
+		return nil, err
+	}
+	dnsChurnCeiling, err := s.dnsChurnCeilingForAttachment(id)
+	if err != nil {
+		return nil, err
+	}
+	preparedDNS, err := prepareDNSRules(dnsConfig.Mode, dnsConfig.AllowDomains, dnsConfig.DenyDomains,
+		dnsConfig.UpstreamServers, s.defaultDNSUpstream, dnsCeilings,
+		dnsLimitOverridesFromProto(dnsConfig), dnsChurnCeiling, dnsConfig.MaxChurnUnits)
+	if err != nil {
+		return nil, fmt.Errorf("validating DNS configuration: %w", err)
+	}
+	return &preparedBulkUpdate{
+		update:      update,
+		preparedDNS: preparedDNS,
+		allowCIDRs:  allowCIDRs,
+		denyCIDRs:   denyCIDRs,
+	}, nil
+}
 
-	for _, cidr := range allowCIDRs {
-		if err := c.server.AllowCIDR(id, cidr); err != nil {
-			c.logger.Error().Err(err).Str("id", id).Str("cidr", cidr.String()).Msg("failed to allow CIDR in bulk update")
+func (s *Server) applyPreparedRules(id string, prepared *preparedBulkUpdate) error {
+	if prepared == nil || prepared.update == nil || prepared.preparedDNS == nil {
+		return fmt.Errorf("prepared bulk update is nil")
+	}
+	update := prepared.update
+	preparedDNS := prepared.preparedDNS
+	allowCIDRs, denyCIDRs := prepared.allowCIDRs, prepared.denyCIDRs
+	state, done, admissionErr := s.beginAttachmentMutation(id)
+	if admissionErr != nil {
+		return admissionErr
+	}
+	if state.dns != nil {
+		if preflightErr := state.dns.preflightPreparedRules(preparedDNS); preflightErr != nil {
+			return s.finishDNSMutation(state, done, fmt.Errorf("preflighting DNS configuration: %w", preflightErr))
 		}
 	}
 
-	for _, cidr := range denyCIDRs {
-		if err := c.server.DenyCIDR(id, cidr); err != nil {
-			c.logger.Error().Err(err).Str("id", id).Str("cidr", cidr.String()).Msg("failed to deny CIDR in bulk update")
+	// ReconcileCIDRs owns the mode write too, sandwiching it between the
+	// two list reconciles (new mode's list first) so no mode pair opens a
+	// transient allow/block window — see its doc comment.
+	degradedActivationHeld, holdErr := s.holdAuthoritativeRecoveryIfNeededAdmitted(id, state)
+	if holdErr != nil {
+		return s.finishDNSMutation(state, done, fmt.Errorf("preparing authoritative BLOCK_ALL recovery hold: %w", holdErr))
+	}
+	degradedActivationHeld, reconcileErr := s.stageAuthoritativeCIDRsAdmitted(id, state, update.Mode, allowCIDRs, denyCIDRs, degradedActivationHeld)
+	if reconcileErr != nil {
+		if !errors.Is(reconcileErr, errProtectedPolicyDurablyDegraded) {
+			s.logger.Error().Err(reconcileErr).Str("id", id).Msg("failed to reconcile CIDRs in bulk update")
 		}
+		reconcileErr = fmt.Errorf("reconciling CIDRs: %w", reconcileErr)
+		// A valid protected-policy projection that cannot complete is now
+		// durable BLOCK_ALL. Do not apply the DNS half of the authoritative
+		// update or claim partial recovery; a later complete retry owns both.
+		return s.finishDNSMutation(state, done, reconcileErr)
 	}
 
+	// Apply the prepared authoritative DNS state after the CIDR delta. The
+	// ownership manager preserves still-authorized exact keys (and their TTLs),
+	// remaps owners when rule precedence changes, and promptly removes keys
+	// whose queries no longer have an authorizing policy owner.
+	var dnsErr error
 	if update.Dns == nil {
-		if err := c.server.ReplaceDNSRules(id, apiv1.DnsMode_DNS_MODE_DISABLED, nil, nil); err != nil {
-			c.logger.Error().Err(err).Str("id", id).Msg("failed to clear DNS rules in bulk update")
+		if dnsErr = s.replaceDNSPreparedAdmitted(id, state, preparedDNS); dnsErr != nil {
+			s.logger.Error().Err(dnsErr).Str("id", id).Msg("failed to clear DNS rules in bulk update")
+			dnsErr = fmt.Errorf("clearing DNS rules: %w", dnsErr)
 		}
-		return
+	} else if dnsErr = s.replaceDNSPreparedAdmitted(id, state, preparedDNS); dnsErr != nil {
+		s.logger.Error().Err(dnsErr).Str("id", id).Msg("failed to replace DNS rules in bulk update")
+		dnsErr = fmt.Errorf("replacing DNS rules: %w", dnsErr)
 	}
-	if err := c.server.ReplaceDNSRules(id, update.Dns.Mode, update.Dns.AllowDomains, update.Dns.DenyDomains); err != nil {
-		c.logger.Error().Err(err).Str("id", id).Msg("failed to replace DNS rules in bulk update")
+	if dnsErr != nil && degradedActivationHeld {
+		// The pre-existing durable marker and effective BLOCK_ALL intentionally
+		// remain until a later complete retry succeeds. Convert a transient
+		// in-progress marker to the stable failure reason before returning.
+		degradeErr := s.enterPolicyDegradedAdmitted(id, state, policyDegradedAuthoritative, dnsErr)
+		return s.finishDNSMutation(state, done, errors.Join(dnsErr, degradeErr))
+	}
+	if degradedActivationHeld {
+		if activationErr := s.activateAuthoritativePolicyAdmitted(id, state, update.Mode); activationErr != nil {
+			return s.finishDNSMutation(state, done, fmt.Errorf("activating recovered protected policy: %w", activationErr))
+		}
+	}
+
+	return s.finishDNSMutation(state, done, errors.Join(reconcileErr, dnsErr))
+}
+
+// validateFullDesiredModes rejects unknown/UNSPECIFIED enum values before an
+// authoritative update reaches any filter, DNS, TTL, or store mutation. In
+// particular, the API-to-filter conversion defaults unknown values to
+// DISABLED; allowing that fallback here would turn malformed full desired
+// state into a successful fail-open mode change.
+func validateFullDesiredModes(mode apiv1.PolicyMode, dns *apiv1.DnsConfig) error {
+	switch mode {
+	case apiv1.PolicyMode_POLICY_MODE_DISABLED,
+		apiv1.PolicyMode_POLICY_MODE_ALLOWLIST,
+		apiv1.PolicyMode_POLICY_MODE_BLOCK_ALL,
+		apiv1.PolicyMode_POLICY_MODE_DENYLIST:
+	default:
+		return fmt.Errorf("invalid policy mode in full desired state: %d", mode)
+	}
+	if dns == nil {
+		return nil
+	}
+	switch dns.Mode {
+	case apiv1.DnsMode_DNS_MODE_DISABLED,
+		apiv1.DnsMode_DNS_MODE_ALLOWLIST,
+		apiv1.DnsMode_DNS_MODE_DENYLIST,
+		apiv1.DnsMode_DNS_MODE_PROXY:
+		return nil
+	default:
+		return fmt.Errorf("invalid DNS mode in full desired state: %d", dns.Mode)
 	}
 }
 
-func (c *ControlPlaneClient) parseBulkCIDRs(id string, update *apiv1.BulkUpdate) (allowCIDRs, denyCIDRs []*net.IPNet, ok bool) {
-	for _, entry := range update.AllowCidrs {
+// parsedCIDR is a parsed CIDREntry: the network plus its TTL (0 = permanent).
+type parsedCIDR struct {
+	cidr *net.IPNet
+	ttl  time.Duration
+}
+
+// parseIncrementalCIDREntry is shared by control-plane and local unary
+// mutation paths. Validation is deliberately complete before either path
+// enters attachment mutation admission: nil entries, malformed CIDRs, and
+// negative/non-round-trippable protobuf durations are true no-ops. In
+// particular, a malformed negative TTL must never be coerced to the
+// incremental API's ttl<=0 permanent meaning.
+func parseIncrementalCIDREntry(entry *apiv1.CIDREntry) (*net.IPNet, time.Duration, error) {
+	if entry == nil {
+		return nil, 0, fmt.Errorf("CIDR entry is required")
+	}
+	cidr, err := filter.ParseCIDR(entry.Cidr)
+	if err != nil {
+		return nil, 0, fmt.Errorf("parsing CIDR: %w", err)
+	}
+	ttl, err := exactNonNegativeDuration(entry.Ttl)
+	if err != nil {
+		return nil, 0, fmt.Errorf("invalid TTL: %w", err)
+	}
+	return cidr, ttl, nil
+}
+
+// parseBulkCIDRs parses both CIDR lists up front; any invalid entry fails
+// the whole bulk update before anything is mutated.
+func (s *Server) parseBulkCIDRs(id string, update *apiv1.BulkUpdate) (allowCIDRs, denyCIDRs []parsedCIDR, err error) {
+	allowCIDRs, err = s.parseDesiredCIDRs(id, "allow", update.AllowCidrs)
+	if err != nil {
+		return nil, nil, err
+	}
+	denyCIDRs, err = s.parseDesiredCIDRs(id, "deny", update.DenyCidrs)
+	if err != nil {
+		return nil, nil, err
+	}
+	return allowCIDRs, denyCIDRs, nil
+}
+
+func (s *Server) parseDesiredCIDRs(id, list string, entries []*apiv1.CIDREntry) ([]parsedCIDR, error) {
+	parsed := make([]parsedCIDR, 0, len(entries))
+	seen := make(map[string]struct{}, len(entries))
+	for i, entry := range entries {
+		if entry == nil {
+			return nil, fmt.Errorf("%s CIDR entry %d is nil", list, i)
+		}
 		cidr, err := filter.ParseCIDR(entry.Cidr)
 		if err != nil {
-			c.logger.Error().Err(err).Str("id", id).Str("cidr", entry.Cidr).Msg("failed to parse allow CIDR in bulk update")
-			return nil, nil, false
+			s.logger.Error().Err(err).Str("id", id).Str("cidr", entry.Cidr).
+				Msg("failed to parse CIDR in full desired state")
+			return nil, fmt.Errorf("parsing %s CIDR %q: %w", list, entry.Cidr, err)
 		}
-		allowCIDRs = append(allowCIDRs, cidr)
-	}
+		canonical := cidr.String()
+		if _, duplicate := seen[canonical]; duplicate {
+			return nil, fmt.Errorf("duplicate %s CIDR %q (canonical %s)", list, entry.Cidr, canonical)
+		}
+		seen[canonical] = struct{}{}
 
-	for _, entry := range update.DenyCidrs {
-		cidr, err := filter.ParseCIDR(entry.Cidr)
+		ttl, err := exactNonNegativeDuration(entry.Ttl)
 		if err != nil {
-			c.logger.Error().Err(err).Str("id", id).Str("cidr", entry.Cidr).Msg("failed to parse deny CIDR in bulk update")
-			return nil, nil, false
+			return nil, fmt.Errorf("invalid TTL for %s CIDR %q: %w", list, entry.Cidr, err)
 		}
-		denyCIDRs = append(denyCIDRs, cidr)
+		parsed = append(parsed, parsedCIDR{cidr: cidr, ttl: ttl})
 	}
+	return parsed, nil
+}
 
-	return allowCIDRs, denyCIDRs, true
+// exactNonNegativeDuration rejects protobuf durations that the generated
+// AsDuration helper would normalize or clamp. In a full desired state, silently
+// turning a negative/clamped TTL into a permanent or different lifetime is an
+// over-allow and must fail before any mutation. Nil/zero means permanent.
+func exactNonNegativeDuration(value *durationpb.Duration) (time.Duration, error) {
+	if value == nil {
+		return 0, nil
+	}
+	if err := value.CheckValid(); err != nil {
+		return 0, err
+	}
+	duration := value.AsDuration()
+	if duration < 0 {
+		return 0, fmt.Errorf("negative duration")
+	}
+	roundTrip := durationpb.New(duration)
+	if roundTrip.Seconds != value.Seconds || roundTrip.Nanos != value.Nanos {
+		return 0, fmt.Errorf("duration is outside time.Duration range")
+	}
+	return duration, nil
 }

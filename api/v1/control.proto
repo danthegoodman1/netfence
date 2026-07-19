@@ -16,10 +16,15 @@ service ControlPlane {
   //
   // Flow:
   // 1. Daemon connects and sends SyncRequest with current attachments
-  // 2. Control plane sends SyncAck
-  // 3. Daemon sends Subscribed when local orchestration attaches filters
-  // 4. Control plane sends filter commands (AllowCIDR, SetMode, etc.)
-  // 5. Daemon sends Unsubscribed when attachments are detached/removed
+  // 2. Control plane processes SyncRequest and sends SyncAck
+  // 3. After SyncRequest, daemon sends Subscribed for restored attachments
+  //    that still need authoritative desired state; it also sends Subscribed
+  //    whenever local orchestration attaches a new filter. The daemon orders
+  //    restored Subscribed after its outbound SyncRequest but does not wait for
+  //    SyncAck before sending it
+  // 4. Control plane answers every Subscribed with a fresh SubscribedAck
+  // 5. Control plane sends filter commands (AllowCIDR, SetMode, etc.)
+  // 6. Daemon sends Unsubscribed when attachments are detached/removed
   rpc Connect(stream DaemonEvent) returns (stream ControlCommand);
 
   // QueryDns is called by the daemon when DNS_MODE_PROXY is enabled.
@@ -39,11 +44,27 @@ message DaemonEvent {
     Unsubscribed unsubscribed = 3;
     // Periodic heartbeat with optional stats
     Heartbeat heartbeat = 4;
+    // Outcome of a ControlCommand that carried a command_id (see
+    // ControlCommand.command_id / CommandResult).
+    CommandResult command_result = 5;
   }
 }
 
 // SyncRequest is sent when the daemon connects or reconnects.
 // It lists all current attachments so the control plane can resync.
+//
+// SyncRequest is the authoritative reconciliation point on every
+// (re)connect: the control plane MUST treat the attachment list as the
+// daemon's complete current truth, reconciling its own view against it
+// (adding unknown attachments, dropping ones it believed existed but are
+// absent). The daemon purges events queued against a previous connection
+// when it reconnects, but a just-generated event can still race the sync
+// snapshot in either direction, so the control plane MUST apply the
+// idempotency rules documented on Subscribed and Unsubscribed to any event
+// arriving after a SyncRequest. An attachment restored from persisted/pinned
+// state is present in this list and then sends Subscribed after the SyncRequest
+// until one authoritative SubscribedAck applies completely. SyncRequest
+// reconciles attachment inventory; it does not replace that policy handshake.
 message SyncRequest {
   // Daemon instance identifier (stable across restarts)
   string daemon_id = 1;
@@ -69,9 +90,29 @@ message Attachment {
   DnsMode dns_mode = 5;
   // User-defined metadata (VM ID, tenant, etc.)
   map<string, string> metadata = 6;
+  // TC attach direction for TC attachments (UNSPECIFIED = EGRESS).
+  // Not meaningful for cgroup attachments.
+  TcDirection tc_direction = 7;
 }
 
-// Subscribed notifies that a new filter attachment is now managed.
+// Subscribed declares the complete identity/current state of a managed filter
+// attachment. It is sent for a new attachment and re-sent after SyncRequest for
+// a restored attachment until fresh authoritative desired state is applied.
+//
+// Idempotency: the control plane MUST treat a Subscribed for an
+// already-known attachment id as an update to that attachment (and reply
+// with a fresh SubscribedAck), never as a duplicate registration. This
+// re-delivery is legitimate: a Subscribed whose SubscribedAck was still
+// pending when the connection dropped is re-sent on the next connection, and
+// a restored attachment deliberately sends one on every connection until an
+// ack applies completely. It always follows the fresh SyncRequest (which may
+// already list the same attachment). The control plane acknowledges
+// Subscribed, not SyncRequest; it MUST answer each effective declaration with
+// a complete fresh SubscribedAck. One exception is operational, not an
+// idempotency relaxation: after a zero-timeout new attachment consumes an ack
+// that leaves protected policy durably degraded, the daemon reports that state
+// in Heartbeat but does not automatically re-drive Subscribed before restart.
+// The control plane must send a complete BulkUpdate to recover it.
 message Subscribed {
   // Unique identifier for this attachment
   string id = 1;
@@ -79,18 +120,27 @@ message Subscribed {
   string target = 2;
   // Type of attachment
   AttachmentType type = 3;
-  // Initial IP filter policy mode
+  // Current IP filter policy mode
   PolicyMode mode = 4;
-  // Initial DNS filtering mode
+  // Current DNS filtering mode
   DnsMode dns_mode = 5;
   // DNS server address for this attachment (e.g., "10.0.0.1:53")
   // Containers should use this as their DNS resolver
   string dns_address = 6;
   // User-defined metadata for associating with VM ID, tenant, etc.
   map<string, string> metadata = 7;
+  // TC attach direction for TC attachments (UNSPECIFIED = EGRESS).
+  // Not meaningful for cgroup attachments.
+  TcDirection tc_direction = 8;
 }
 
 // Unsubscribed notifies that an attachment is no longer managed.
+//
+// Idempotency: the control plane MUST treat an Unsubscribed for an unknown
+// (or already-removed) attachment id as a no-op. A removal can also be
+// conveyed implicitly by the attachment being absent from the next
+// SyncRequest's list — the control plane must converge to the same state
+// either way.
 message Unsubscribed {
   // The attachment that was removed
   string id = 1;
@@ -121,6 +171,71 @@ message AttachmentStats {
   uint64 packets_blocked = 3;
   uint64 dns_queries_allowed = 4;
   uint64 dns_queries_blocked = 5;
+  // Cumulative count of control-plane CIDR insertions rejected by protected
+  // LPM-map capacity plus address-bearing DNS responses rejected by exact-map
+  // or logical ownership capacity. A non-zero, growing value means new policy or
+  // DNS admissions are NOT taking effect. For protected CIDR pressure, reduce
+  // rules or raise filter.max_rule_entries; for DNS pressure, reduce
+  // domain/TTL volume or raise the corresponding bounded dns.* ceiling and,
+  // if physically full, filter.max_dns_rule_entries. Both filter map sizes are
+  // load-time: an existing pinned map must be recreated to change capacity.
+  uint64 map_full_drops = 6;
+  // DNS queries that ended in SERVFAIL or another resolver/proxy/admission
+  // failure. Mutually exclusive with dns_queries_allowed (successfully
+  // answered policy-allowed queries) and dns_queries_blocked (policy REFUSED).
+  uint64 dns_queries_errors = 7;
+  // Current physical occupancy/capacity and process-generation high-water
+  // marks for the two DNS exact-host maps. Restored provisional pins count in
+  // physical occupancy until authoritative reconciliation.
+  uint32 dns_exact_ipv4_entries = 8;
+  uint32 dns_exact_ipv4_capacity = 9;
+  uint32 dns_exact_ipv4_high_water = 10;
+  uint32 dns_exact_ipv6_entries = 11;
+  uint32 dns_exact_ipv6_capacity = 12;
+  uint32 dns_exact_ipv6_high_water = 13;
+  // Successfully committed physical DNS-only LRU evictions. Expiry and
+  // policy-driven removal do not increment this counter.
+  uint64 dns_lru_evictions = 14;
+  // All address-bearing DNS admission failures, including capacity, rolling
+  // budget, exact-map I/O, and rollback ambiguity.
+  uint64 dns_admission_failures = 15;
+  // Admissions rejected by either the rolling physical-churn budget or the
+  // normalized slow-planning work guard. This is intentionally separate from
+  // map_full_drops because rejection is due to a rolling mutation/attempt
+  // allowance, not inability to represent the state or a raw map insertion.
+  uint64 dns_budget_throttles = 16;
+  // Current physical occupancy/capacity and daemon-generation high-water
+  // values for each protected, non-evictable authoritative/system LPM map.
+  // The DNS listener bootstrap is included in protected allow occupancy;
+  // adopted pinned entries initialize high-water for the new daemon process.
+  // A transient inventory failure retains the last proven snapshot and emits
+  // a rate-limited daemon warning rather than publishing guessed counts.
+  uint32 protected_allow_ipv4_entries = 17;
+  uint32 protected_allow_ipv4_capacity = 18;
+  uint32 protected_allow_ipv4_high_water = 19;
+  uint32 protected_allow_ipv6_entries = 20;
+  uint32 protected_allow_ipv6_capacity = 21;
+  uint32 protected_allow_ipv6_high_water = 22;
+  uint32 protected_deny_ipv4_entries = 23;
+  uint32 protected_deny_ipv4_capacity = 24;
+  uint32 protected_deny_ipv4_high_water = 25;
+  uint32 protected_deny_ipv6_entries = 26;
+  uint32 protected_deny_ipv6_capacity = 27;
+  uint32 protected_deny_ipv6_high_water = 28;
+  // policy_degraded is true while a protected-policy safety record is nonempty;
+  // configured BLOCK_ALL alone is healthy and reports false. The
+  // protected_policy_mutation_in_progress reason is a transient crash journal:
+  // its owning live operation clears it on success and may publish the intended
+  // mode before that final clear. Startup that finds it first proves BLOCK_ALL
+  // and converts it to protected_policy_mutation_interrupted. That interrupted
+  // code and authoritative_protected_policy_failed,
+  // incremental_deny_install_failed, incremental_allow_removal_failed, and
+  // incremental_mode_change_failed are stable degraded reasons (never raw
+  // errors): they hold proven BLOCK_ALL, reject protected incrementals, and
+  // require a complete authoritative LPM+DNS reconcile. Independent DNS
+  // mutation and expiry may continue but cannot reactivate packet policy.
+  bool policy_degraded = 29;
+  string policy_degraded_reason = 30;
 }
 
 // ControlCommand represents commands sent from the control plane to the daemon.
@@ -149,15 +264,58 @@ message ControlCommand {
     DomainEntry deny_domain = 10;
     // Remove a domain from DNS allow/deny lists
     string remove_domain = 11;
-    // Acknowledge subscription with initial config (sent after receiving Subscribed)
+    // Acknowledge a subscription declaration with complete authoritative config
+    // (sent after receiving Subscribed, including restored declarations)
     SubscribedAck subscribed_ack = 12;
   }
+
+  // Optional control-plane-chosen correlation id for this command. When
+  // non-empty, the daemon reports the command's outcome with a
+  // CommandResult DaemonEvent echoing this value; when empty (the
+  // default), no result is emitted — fully backward-compatible opt-in.
+  // SubscribedAck is excluded (it is itself the ack of a daemon event and
+  // is answered by the Subscribed handshake), as is SyncAck.
+  string command_id = 13;
+
+  // Optional selector for remove_cidr. UNSPECIFIED preserves the original
+  // wire/API behavior and, like BOTH, removes from both allow and deny lists.
+  // This field is ignored for every other command type.
+  RuleList remove_cidr_list = 14;
+}
+
+// CommandResult reports the outcome of a ControlCommand that carried a
+// non-empty command_id. success is true only when the command fully
+// applied (parse + filter + bookkeeping); a partially-applied command
+// (e.g. one CIDR of a BulkUpdate failing) reports success=false with the
+// aggregated error. Results are best-effort: a saturated event channel
+// drops them (with a daemon-side warning) rather than blocking command
+// processing, so the control plane must treat a missing result as
+// unknown, not failed.
+message CommandResult {
+  // Echo of ControlCommand.command_id
+  string command_id = 1;
+  // The attachment the command targeted (echo of ControlCommand.id)
+  string id = 2;
+  // Whether the command fully applied
+  bool success = 3;
+  // Error detail when success is false
+  string error = 4;
 }
 
 // SyncAck acknowledges that the control plane has processed the SyncRequest.
 message SyncAck {}
 
-// SubscribedAck acknowledges a Subscribed event and provides initial configuration.
+// SubscribedAck acknowledges a Subscribed event and provides complete,
+// authoritative desired state. It configures a new attachment and reconciles a
+// restored attachment's last-known map contents. The daemon applies it by
+// delta: unchanged CIDRs remain installed, stale CIDRs are removed, new CIDRs
+// are added, and control-plane TTLs are replaced exactly. The restore remains
+// pending after any validation or apply failure and is retried after a later
+// connection. For a zero-timeout new attachment, however, a protected-policy
+// apply failure consumes this ack and is signaled by degraded Heartbeat fields;
+// it emits no CommandResult or error Unsubscribed and is not re-driven before
+// restart. Recover that live attachment with a complete BulkUpdate, preferably
+// carrying command_id for an explicit outcome.
 //
 // Design note: This is sent over the bidirectional stream (rather than a separate
 // unary RPC) to ensure the same control plane node that holds the stream connection
@@ -165,23 +323,27 @@ message SyncAck {}
 // control plane, a separate unary RPC could be load-balanced to a different node
 // that doesn't have the stream, requiring cross-node coordination.
 message SubscribedAck {
-  // Initial IP filter policy mode
+  // Complete desired IP filter policy mode. Must be a known non-UNSPECIFIED value.
   PolicyMode mode = 1;
-  // Initial CIDRs to allow
+  // Complete desired CIDRs to allow (canonical duplicates are invalid).
   repeated CIDREntry allow_cidrs = 2;
-  // Initial CIDRs to deny
+  // Complete desired CIDRs to deny (canonical duplicates are invalid).
   repeated CIDREntry deny_cidrs = 3;
-  // Initial DNS configuration
+  // Complete desired DNS configuration. Omitted means disabled with empty lists.
   DnsConfig dns = 4;
 }
 
 // SetMode changes the policy mode for an attachment.
 message SetMode { PolicyMode mode = 1; }
 
-// BulkUpdate sets the complete state for an attachment.
-// Clears existing rules and replaces with the provided state.
+// BulkUpdate sets the complete authoritative state for an attachment. The
+// daemon reconciles by delta; an unchanged CIDR is not removed/re-added, and
+// its control-plane TTL is replaced exactly by the provided lifetime. This is
+// also the live recovery operation for protected-policy degradation: maps and
+// DNS must both apply before the requested mode activates and the durable
+// marker clears. Use command_id when the outcome must be observed.
 message BulkUpdate {
-  // IP filter policy mode
+  // Complete desired IP filter policy mode. Must be a known non-UNSPECIFIED value.
   PolicyMode mode = 1;
   // CIDRs to allow
   repeated CIDREntry allow_cidrs = 2;
@@ -191,20 +353,65 @@ message BulkUpdate {
   DnsConfig dns = 4;
 }
 
-// DnsConfig contains the complete DNS filtering configuration.
+// DnsConfig contains the complete DNS filtering configuration. In every
+// filtering mode, all A/AAAA records across a response's answer, authority,
+// and additional sections are admitted transactionally to the independent
+// exact-host tier before return. This includes default/explicit allows in DNS
+// DENYLIST even when the current packet mode ignores exact allows, preserving
+// cached connectivity across a later packet ALLOWLIST transition. Capacity
+// rejection preserves the existing working set and returns SERVFAIL without
+// an address. Zero limit fields inherit the daemon ceilings.
 message DnsConfig {
-  // DNS filtering mode
+  // Complete desired DNS filtering mode. Must be a known non-UNSPECIFIED value.
   DnsMode mode = 1;
   // Domains to allow (when mode is ALLOWLIST or to override in DENYLIST)
   repeated DomainEntry allow_domains = 2;
   // Domains to deny (when mode is DENYLIST or to override in ALLOWLIST)
   repeated DomainEntry deny_domains = 3;
-  // Upstream DNS servers to use for resolution (optional, uses system default
-  // if empty)
+  // Ordered upstream DNS servers for this attachment. Entries are host:port;
+  // IPv6 literals must be bracketed. The daemon canonicalizes and de-duplicates
+  // them in first-seen order and accepts at most 8 unique servers. Empty uses
+  // the daemon-global dns.upstream fallback. Resolution tries each server in
+  // order; a truncated UDP reply is retried over TCP against that same server
+  // before failover continues.
   repeated string upstream_servers = 4;
+
+  // Per-attachment logical DNS exact-tier ceiling for each IP family. It may
+  // not exceed either the daemon's dns.max_ips_per_family ceiling or the
+  // actual exact HASH map capacity.
+  uint32 max_ips_per_family = 5;
+  // Maximum unique A/AAAA addresses admitted from one response across answer,
+  // authority, and additional sections.
+  uint32 max_ips_per_response = 6;
+  // Maximum unique addresses owned by one authorization owner: an explicit
+  // matched allow-policy domain (including wildcard matches), implicit
+  // DENYLIST query owner, or proxy query owner. Shared IPs count once per
+  // owner even when several query domains hold independent TTL edges.
+  uint32 max_ips_per_policy_domain = 7;
+  // Maximum union of normalized configured policy-rule domains and live query
+  // domains retained in TTL ownership metadata.
+  uint32 max_tracked_domains = 8;
+  // Maximum (query domain, matched policy owner, IP) TTL ownership edges.
+  // Shared physical IPs still consume one edge for each independent query and
+  // matched owner.
+  uint32 max_ownership_edges = 9;
+
+  // Per-attachment rolling DNS churn-unit limit. Zero inherits the daemon's
+  // dns.max_churn_units ceiling; a non-zero value may only lower it. A new
+  // physical exact admission costs one unit and each unexpired LRU physical
+  // eviction costs one. Expiry/policy removal and refresh of an already
+  // admitted key cost zero. The same limit also gates stable normalized work
+  // units for ownership-graph pressure planning; attempt units are committed
+  // before projection and retained even when the plan or later filter write
+  // fails. The rolling window is the daemon-global dns.churn_window and cannot
+  // be weakened by a control-plane update.
+  uint32 max_churn_units = 10;
 }
 
-// CIDREntry represents a CIDR with optional TTL.
+// CIDREntry represents a CIDR with an optional TTL. In complete
+// SubscribedAck/BulkUpdate state, TTLs must be valid and non-negative and
+// replace control-plane lifetimes exactly. Incremental AllowCIDR/DenyCIDR
+// positive-TTL re-adds extend lifetimes monotonically; absent/zero is permanent.
 message CIDREntry {
   string cidr = 1;
   google.protobuf.Duration ttl = 2;
@@ -225,7 +432,9 @@ message SetDnsMode { DnsMode mode = 1; }
 message DnsQueryRequest {
   // Attachment ID
   string id = 1;
-  // Domain being queried (e.g., "example.com.")
+  // Wire-canonical, lowercase, fully-qualified domain being queried (for
+  // example, "example.com."). Equivalent DNS presentation escapes are
+  // normalized to one spelling before the policy call.
   string domain = 2;
   // DNS query type (e.g., "A", "AAAA", "CNAME")
   string query_type = 3;
@@ -235,7 +444,11 @@ message DnsQueryRequest {
 message DnsQueryResponse {
   // Whether to allow this query
   bool allow = 1;
-  // If allowed, whether to add resolved IPs to the filter
+  // If allowed, whether every returned/upstream A/AAAA address may be admitted
+  // transactionally to the attachment's bounded exact tier. In filtering
+  // PROXY mode, an address-bearing response with false is converted to
+  // SERVFAIL; non-address answers may still pass. DNS_MODE_DISABLED is the
+  // explicit pass-through mode.
   bool add_to_filter = 2;
   // Optional: override IPs to return (if empty, daemon queries upstream)
   repeated string ips = 3;

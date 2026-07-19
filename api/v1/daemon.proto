@@ -6,6 +6,7 @@ option go_package = "github.com/danthegoodman1/netfence/api/v1;apiv1";
 
 import "google/protobuf/empty.proto";
 import "google/protobuf/timestamp.proto";
+import "v1/control.proto";
 import "v1/types.proto";
 
 // DaemonService is the local API exposed by the daemon.
@@ -23,6 +24,48 @@ service DaemonService {
 
   // GetStatus returns the current daemon status.
   rpc GetStatus(google.protobuf.Empty) returns (DaemonStatus);
+
+  // ApplyCommand applies one existing policy mutation command locally. The
+  // attachment id and mutation are carried by ControlCommand exactly as they
+  // are on the control-plane stream. Sync/ack variants and unknown commands
+  // are rejected before mutation. BulkUpdate is the complete authoritative
+  // operation and the only local recovery path for stable degradation.
+  rpc ApplyCommand(ControlCommand) returns (google.protobuf.Empty);
+
+  // GetRules returns a serialized snapshot of protected-policy ownership,
+  // expirations, DNS policy, and degradation state for one attachment.
+  rpc GetRules(GetRulesRequest) returns (GetRulesResponse);
+}
+
+message GetRulesRequest { string id = 1; }
+
+// CIDRRule describes one registry entry. policy_owned includes rules received
+// from either the local API or control plane. system_owned identifies daemon
+// infrastructure such as the DNS-listener bootstrap route. A rule can have
+// both owners. expires_at is absent for permanent/non-policy ownership.
+// provisional identifies protected policy re-adopted from pinned kernel maps
+// that has not yet been replaced by a complete authoritative update.
+message CIDRRule {
+  string cidr = 1;
+  RuleList list = 2;
+  bool policy_owned = 3;
+  bool system_owned = 4;
+  google.protobuf.Timestamp expires_at = 5;
+  bool provisional = 6;
+  // installed is the registry's last committed kernel-map state. An installed
+  // rule with neither owner is a failed-removal retry, not desired policy.
+  bool installed = 7;
+}
+
+message GetRulesResponse {
+  string id = 1;
+  PolicyMode mode = 2;
+  repeated CIDRRule cidrs = 3;
+  // Live effective DNS policy, normalized by the daemon. This is configured
+  // policy only; DNS-derived exact-host cache entries are intentionally absent.
+  DnsConfig dns = 4;
+  bool policy_degraded = 5;
+  string policy_degraded_reason = 6;
 }
 
 // AttachRequest specifies what to attach the eBPF filter to.
@@ -36,6 +79,10 @@ message AttachRequest {
   // User-defined metadata (VM ID, tenant, container ID, etc.)
   // This is passed to the control plane with the subscription.
   map<string, string> metadata = 3;
+  // TC attach direction. Only used for interface_name targets; ignored for
+  // cgroup_path targets. Unspecified defaults to EGRESS (see TcDirection for
+  // guidance on choosing the correct direction per topology).
+  TcDirection tc_direction = 4;
 }
 
 // AttachResponse confirms attachment.
@@ -90,6 +137,13 @@ message AttachmentInfo {
   uint64 dns_queries_blocked = 11;
   // When the filter was attached (used for stable pagination ordering)
   google.protobuf.Timestamp attached_at = 12;
+  // TC attach direction for TC attachments (UNSPECIFIED = EGRESS).
+  // Not meaningful for cgroup attachments.
+  TcDirection tc_direction = 13;
+  // DNS queries that ended in SERVFAIL or another resolver/proxy/admission
+  // failure. This is exclusive of allowed successes and policy-blocked
+  // REFUSED responses.
+  uint64 dns_queries_errors = 14;
 }
 
 // DaemonStatus contains the current state of the daemon.

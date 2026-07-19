@@ -18,6 +18,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/danthegoodman1/netfence/internal/config"
 	"github.com/danthegoodman1/netfence/internal/daemon"
@@ -109,21 +111,29 @@ type dnsResponse struct {
 type testControlPlane struct {
 	apiv1.UnimplementedControlPlaneServer
 
-	mu            sync.RWMutex
-	pendingConfig map[string]*apiv1.SubscribedAck
-	streams       map[string]grpc.BidiStreamingServer[apiv1.DaemonEvent, apiv1.ControlCommand]
-	dnsResponses  map[string]*dnsResponse // domain -> response
-	noAckTargets  map[string]bool
-	unsubscribed  map[string]*apiv1.Unsubscribed
+	mu             sync.RWMutex
+	pendingConfig  map[string]*apiv1.SubscribedAck
+	streams        map[string]grpc.BidiStreamingServer[apiv1.DaemonEvent, apiv1.ControlCommand]
+	dnsResponses   map[string]*dnsResponse // domain -> response
+	noAckTargets   map[string]bool
+	unsubscribed   map[string]*apiv1.Unsubscribed
+	commandResults map[string]*apiv1.CommandResult // command_id -> result
+	subscribed     map[string]int                  // attachment_id -> observed declarations
+	heartbeatStats map[string]*apiv1.AttachmentStats
+	heartbeatCount map[string]int
 }
 
 func newTestControlPlane() *testControlPlane {
 	return &testControlPlane{
-		pendingConfig: make(map[string]*apiv1.SubscribedAck),
-		streams:       make(map[string]grpc.BidiStreamingServer[apiv1.DaemonEvent, apiv1.ControlCommand]),
-		dnsResponses:  make(map[string]*dnsResponse),
-		noAckTargets:  make(map[string]bool),
-		unsubscribed:  make(map[string]*apiv1.Unsubscribed),
+		pendingConfig:  make(map[string]*apiv1.SubscribedAck),
+		streams:        make(map[string]grpc.BidiStreamingServer[apiv1.DaemonEvent, apiv1.ControlCommand]),
+		dnsResponses:   make(map[string]*dnsResponse),
+		noAckTargets:   make(map[string]bool),
+		unsubscribed:   make(map[string]*apiv1.Unsubscribed),
+		commandResults: make(map[string]*apiv1.CommandResult),
+		subscribed:     make(map[string]int),
+		heartbeatStats: make(map[string]*apiv1.AttachmentStats),
+		heartbeatCount: make(map[string]int),
 	}
 }
 
@@ -151,6 +161,21 @@ func (cp *testControlPlane) StreamCount() int {
 	return len(cp.streams)
 }
 
+// HasStream reports whether a command stream is registered for the
+// attachment (via Subscribed or a post-restart Sync).
+func (cp *testControlPlane) HasStream(id string) bool {
+	cp.mu.RLock()
+	defer cp.mu.RUnlock()
+	_, ok := cp.streams[id]
+	return ok
+}
+
+func (cp *testControlPlane) SubscribedCount(id string) int {
+	cp.mu.RLock()
+	defer cp.mu.RUnlock()
+	return cp.subscribed[id]
+}
+
 func (cp *testControlPlane) Unsubscribed(id string) *apiv1.Unsubscribed {
 	cp.mu.RLock()
 	defer cp.mu.RUnlock()
@@ -162,6 +187,32 @@ func (cp *testControlPlane) Unsubscribed(id string) *apiv1.Unsubscribed {
 		}
 	}
 	return nil
+}
+
+// CommandResult returns the captured result for a command_id, or nil.
+func (cp *testControlPlane) CommandResult(commandID string) *apiv1.CommandResult {
+	cp.mu.RLock()
+	defer cp.mu.RUnlock()
+	return cp.commandResults[commandID]
+}
+
+// CommandResultCount returns how many CommandResult events were received.
+func (cp *testControlPlane) CommandResultCount() int {
+	cp.mu.RLock()
+	defer cp.mu.RUnlock()
+	return len(cp.commandResults)
+}
+
+// HeartbeatStats returns the most recently observed wire heartbeat stats and
+// the number of heartbeats that have carried this attachment.
+func (cp *testControlPlane) HeartbeatStats(id string) (*apiv1.AttachmentStats, int) {
+	cp.mu.RLock()
+	defer cp.mu.RUnlock()
+	stats := cp.heartbeatStats[id]
+	if stats == nil {
+		return nil, cp.heartbeatCount[id]
+	}
+	return proto.Clone(stats).(*apiv1.AttachmentStats), cp.heartbeatCount[id]
 }
 
 func (cp *testControlPlane) SendCommand(attachmentID string, cmd *apiv1.ControlCommand) error {
@@ -186,6 +237,15 @@ func (cp *testControlPlane) Connect(stream grpc.BidiStreamingServer[apiv1.Daemon
 
 		switch e := event.Event.(type) {
 		case *apiv1.DaemonEvent_Sync:
+			// Register the stream for every synced attachment so tests can
+			// SendCommand immediately after a daemon restart. Restored
+			// attachments also follow this snapshot with a fresh Subscribed
+			// declaration so the CP can return authoritative desired state.
+			cp.mu.Lock()
+			for _, att := range e.Sync.Attachments {
+				cp.streams[att.Id] = stream
+			}
+			cp.mu.Unlock()
 			if err := stream.Send(&apiv1.ControlCommand{
 				Command: &apiv1.ControlCommand_SyncAck{SyncAck: &apiv1.SyncAck{}},
 			}); err != nil {
@@ -195,6 +255,7 @@ func (cp *testControlPlane) Connect(stream grpc.BidiStreamingServer[apiv1.Daemon
 		case *apiv1.DaemonEvent_Subscribed:
 			cp.mu.Lock()
 			cp.streams[e.Subscribed.Id] = stream
+			cp.subscribed[e.Subscribed.Id]++
 			noAck := cp.noAckTargets[e.Subscribed.Target]
 
 			ack := cp.pendingConfig[e.Subscribed.Target]
@@ -218,6 +279,19 @@ func (cp *testControlPlane) Connect(stream grpc.BidiStreamingServer[apiv1.Daemon
 			cp.mu.Lock()
 			delete(cp.streams, e.Unsubscribed.Id)
 			cp.unsubscribed[e.Unsubscribed.Id] = e.Unsubscribed
+			cp.mu.Unlock()
+
+		case *apiv1.DaemonEvent_CommandResult:
+			cp.mu.Lock()
+			cp.commandResults[e.CommandResult.CommandId] = e.CommandResult
+			cp.mu.Unlock()
+
+		case *apiv1.DaemonEvent_Heartbeat:
+			cp.mu.Lock()
+			for _, stats := range e.Heartbeat.Stats {
+				cp.heartbeatStats[stats.Id] = proto.Clone(stats).(*apiv1.AttachmentStats)
+				cp.heartbeatCount[stats.Id]++
+			}
 			cp.mu.Unlock()
 		}
 	}
@@ -255,6 +329,10 @@ func newE2ETestEnv(t *testing.T) *e2eTestEnv {
 }
 
 func newE2ETestEnvWithOptions(t *testing.T, portMin, portMax int, subscribeAckTimeout time.Duration) *e2eTestEnv {
+	return newE2ETestEnvWithConfig(t, portMin, portMax, subscribeAckTimeout, nil)
+}
+
+func newE2ETestEnvWithConfig(t *testing.T, portMin, portMax int, subscribeAckTimeout time.Duration, configure func(*config.Config)) *e2eTestEnv {
 	t.Helper()
 
 	cp := newTestControlPlane()
@@ -262,7 +340,13 @@ func newE2ETestEnvWithOptions(t *testing.T, portMin, portMax int, subscribeAckTi
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 
-	grpcServer := grpc.NewServer()
+	// Permit the daemon's keepalive ping cadence (the documented CP-side
+	// contract): the default gRPC enforcement policy (5min) would GOAWAY
+	// the daemon with "too_many_pings".
+	grpcServer := grpc.NewServer(grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+		MinTime:             time.Second,
+		PermitWithoutStream: true,
+	}))
 	apiv1.RegisterControlPlaneServer(grpcServer, cp)
 
 	go grpcServer.Serve(listener)
@@ -280,9 +364,15 @@ func newE2ETestEnvWithOptions(t *testing.T, portMin, portMax int, subscribeAckTi
 			Upstream:   "8.8.8.8:53",
 		},
 		ControlPlane: config.ControlPlaneConfig{
-			URL:                 grpcAddr,
+			URL: grpcAddr,
+			// Plaintext is now an explicit opt-in (4A fail-closed default);
+			// this exercises the insecure: true path end to end.
+			Insecure:            true,
 			SubscribeAckTimeout: subscribeAckTimeout,
 		},
+	}
+	if configure != nil {
+		configure(cfg)
 	}
 
 	logger := zerolog.New(io.Discard)
@@ -290,7 +380,10 @@ func newE2ETestEnvWithOptions(t *testing.T, portMin, portMax int, subscribeAckTi
 	srv, err := daemon.NewServer(cfg, st, logger, "test")
 	require.NoError(t, err)
 
-	cpClient := daemon.NewControlPlaneClient(grpcAddr, srv, logger, nil, subscribeAckTimeout)
+	creds, err := daemon.BuildControlPlaneCreds(cfg.ControlPlane)
+	require.NoError(t, err)
+
+	cpClient := daemon.NewControlPlaneClient(grpcAddr, srv, logger, nil, subscribeAckTimeout, creds)
 	srv.SetControlPlaneClient(cpClient)
 
 	require.NoError(t, srv.Start())
@@ -810,4 +903,73 @@ func queryDNS(t *testing.T, serverAddr, domain string) []string {
 		}
 	}
 	return ips
+}
+
+// TestE2E_CommandResults verifies 2D over the real control-plane stream:
+// commands carrying a command_id get a CommandResult DaemonEvent back
+// (success mirroring whether the command fully applied), and commands
+// without one produce no result at all.
+func TestE2E_CommandResults(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("test requires root")
+	}
+
+	env := newE2ETestEnv(t)
+	defer env.cleanup()
+
+	at := setupCgroupAttachment(t, env, "cmd-results", &apiv1.SubscribedAck{
+		Mode: apiv1.PolicyMode_POLICY_MODE_ALLOWLIST,
+	})
+	defer at.cleanup()
+
+	// No command_id: applied silently, no result (sent first so a stray
+	// result would be counted by the final total below).
+	require.NoError(t, at.sendCommand(&apiv1.ControlCommand{
+		Command: &apiv1.ControlCommand_AllowCidr{AllowCidr: &apiv1.CIDREntry{Cidr: "198.51.100.0/24"}},
+	}))
+
+	// Valid command with command_id: success result echoing ids.
+	require.NoError(t, at.sendCommand(&apiv1.ControlCommand{
+		CommandId: "res-ok",
+		Command:   &apiv1.ControlCommand_AllowCidr{AllowCidr: &apiv1.CIDREntry{Cidr: "203.0.113.0/24"}},
+	}))
+
+	// Invalid CIDR with command_id: failure result with error detail.
+	require.NoError(t, at.sendCommand(&apiv1.ControlCommand{
+		CommandId: "res-bad",
+		Command:   &apiv1.ControlCommand_AllowCidr{AllowCidr: &apiv1.CIDREntry{Cidr: "not-a-cidr"}},
+	}))
+
+	// Bulk update with an invalid CIDR: aborts pre-mutation, reports failure.
+	require.NoError(t, at.sendCommand(&apiv1.ControlCommand{
+		CommandId: "res-bulk-bad",
+		Command: &apiv1.ControlCommand_BulkUpdate{BulkUpdate: &apiv1.BulkUpdate{
+			Mode:       apiv1.PolicyMode_POLICY_MODE_ALLOWLIST,
+			AllowCidrs: []*apiv1.CIDREntry{{Cidr: "bogus"}},
+		}},
+	}))
+
+	require.True(t, waitForCondition(5*time.Second, func() bool {
+		return env.controlPlane.CommandResult("res-ok") != nil &&
+			env.controlPlane.CommandResult("res-bad") != nil &&
+			env.controlPlane.CommandResult("res-bulk-bad") != nil
+	}), "expected all three command results")
+
+	ok := env.controlPlane.CommandResult("res-ok")
+	assert.True(t, ok.Success)
+	assert.Equal(t, at.attachmentID, ok.Id)
+	assert.Empty(t, ok.Error)
+
+	bad := env.controlPlane.CommandResult("res-bad")
+	assert.False(t, bad.Success)
+	assert.Equal(t, at.attachmentID, bad.Id)
+	assert.Contains(t, bad.Error, "parsing CIDR")
+
+	bulkBad := env.controlPlane.CommandResult("res-bulk-bad")
+	assert.False(t, bulkBad.Success)
+	assert.Contains(t, bulkBad.Error, "parsing allow CIDR")
+
+	// The id-less command (sent before all three id'd ones on the same
+	// ordered stream, so long since processed) contributed nothing.
+	assert.Equal(t, 3, env.controlPlane.CommandResultCount())
 }

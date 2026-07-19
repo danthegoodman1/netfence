@@ -27,7 +27,7 @@ func BenchmarkCgroupConnectWarmAllowlist(b *testing.B) {
 	cgroupPath, restore := moveBenchmarkToCgroup(b, "netfence-connect-warm-bench")
 	defer restore()
 
-	f, err := filter.NewCgroupFilter(cgroupPath, filter.ModeAllowlist)
+	f, err := filter.NewCgroupFilter(cgroupPath, filter.ModeAllowlist, filter.DefaultCarveouts())
 	require.NoError(b, err)
 	defer f.Close()
 
@@ -40,13 +40,30 @@ func BenchmarkCgroupConnectWarmAllowlist(b *testing.B) {
 	benchDialUDP(b, benchmarkSocketAddr)
 }
 
+func BenchmarkCgroupConnectWarmDNSExact(b *testing.B) {
+	requireRootBenchmark(b)
+
+	cgroupPath, restore := moveBenchmarkToCgroup(b, "netfence-connect-exact-bench")
+	defer restore()
+
+	f, err := filter.NewCgroupFilter(cgroupPath, filter.ModeAllowlist, filter.DefaultCarveouts())
+	require.NoError(b, err)
+	defer f.Close()
+
+	host, _, err := net.SplitHostPort(benchmarkSocketAddr)
+	require.NoError(b, err)
+	require.NoError(b, f.AddDNSAllowedIPs([]net.IP{net.ParseIP(host)}))
+
+	benchDialUDP(b, benchmarkSocketAddr)
+}
+
 func BenchmarkCgroupConnectAllowlistMiss(b *testing.B) {
 	requireRootBenchmark(b)
 
 	cgroupPath, restore := moveBenchmarkToCgroup(b, "netfence-connect-miss-bench")
 	defer restore()
 
-	f, err := filter.NewCgroupFilter(cgroupPath, filter.ModeAllowlist)
+	f, err := filter.NewCgroupFilter(cgroupPath, filter.ModeAllowlist, filter.DefaultCarveouts())
 	require.NoError(b, err)
 	defer f.Close()
 

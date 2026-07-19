@@ -87,6 +87,7 @@ type DaemonEvent struct {
 	//	*DaemonEvent_Subscribed
 	//	*DaemonEvent_Unsubscribed
 	//	*DaemonEvent_Heartbeat
+	//	*DaemonEvent_CommandResult
 	Event         isDaemonEvent_Event `protobuf_oneof:"event"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -165,6 +166,15 @@ func (x *DaemonEvent) GetHeartbeat() *Heartbeat {
 	return nil
 }
 
+func (x *DaemonEvent) GetCommandResult() *CommandResult {
+	if x != nil {
+		if x, ok := x.Event.(*DaemonEvent_CommandResult); ok {
+			return x.CommandResult
+		}
+	}
+	return nil
+}
+
 type isDaemonEvent_Event interface {
 	isDaemonEvent_Event()
 }
@@ -189,6 +199,12 @@ type DaemonEvent_Heartbeat struct {
 	Heartbeat *Heartbeat `protobuf:"bytes,4,opt,name=heartbeat,proto3,oneof"`
 }
 
+type DaemonEvent_CommandResult struct {
+	// Outcome of a ControlCommand that carried a command_id (see
+	// ControlCommand.command_id / CommandResult).
+	CommandResult *CommandResult `protobuf:"bytes,5,opt,name=command_result,json=commandResult,proto3,oneof"`
+}
+
 func (*DaemonEvent_Sync) isDaemonEvent_Event() {}
 
 func (*DaemonEvent_Subscribed) isDaemonEvent_Event() {}
@@ -197,8 +213,23 @@ func (*DaemonEvent_Unsubscribed) isDaemonEvent_Event() {}
 
 func (*DaemonEvent_Heartbeat) isDaemonEvent_Event() {}
 
+func (*DaemonEvent_CommandResult) isDaemonEvent_Event() {}
+
 // SyncRequest is sent when the daemon connects or reconnects.
 // It lists all current attachments so the control plane can resync.
+//
+// SyncRequest is the authoritative reconciliation point on every
+// (re)connect: the control plane MUST treat the attachment list as the
+// daemon's complete current truth, reconciling its own view against it
+// (adding unknown attachments, dropping ones it believed existed but are
+// absent). The daemon purges events queued against a previous connection
+// when it reconnects, but a just-generated event can still race the sync
+// snapshot in either direction, so the control plane MUST apply the
+// idempotency rules documented on Subscribed and Unsubscribed to any event
+// arriving after a SyncRequest. An attachment restored from persisted/pinned
+// state is present in this list and then sends Subscribed after the SyncRequest
+// until one authoritative SubscribedAck applies completely. SyncRequest
+// reconciles attachment inventory; it does not replace that policy handshake.
 type SyncRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Daemon instance identifier (stable across restarts)
@@ -285,7 +316,10 @@ type Attachment struct {
 	// Current DNS filtering mode
 	DnsMode DnsMode `protobuf:"varint,5,opt,name=dns_mode,json=dnsMode,proto3,enum=netfence.v1.DnsMode" json:"dns_mode,omitempty"`
 	// User-defined metadata (VM ID, tenant, etc.)
-	Metadata      map[string]string `protobuf:"bytes,6,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	Metadata map[string]string `protobuf:"bytes,6,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	// TC attach direction for TC attachments (UNSPECIFIED = EGRESS).
+	// Not meaningful for cgroup attachments.
+	TcDirection   TcDirection `protobuf:"varint,7,opt,name=tc_direction,json=tcDirection,proto3,enum=netfence.v1.TcDirection" json:"tc_direction,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -362,7 +396,31 @@ func (x *Attachment) GetMetadata() map[string]string {
 	return nil
 }
 
-// Subscribed notifies that a new filter attachment is now managed.
+func (x *Attachment) GetTcDirection() TcDirection {
+	if x != nil {
+		return x.TcDirection
+	}
+	return TcDirection_TC_DIRECTION_UNSPECIFIED
+}
+
+// Subscribed declares the complete identity/current state of a managed filter
+// attachment. It is sent for a new attachment and re-sent after SyncRequest for
+// a restored attachment until fresh authoritative desired state is applied.
+//
+// Idempotency: the control plane MUST treat a Subscribed for an
+// already-known attachment id as an update to that attachment (and reply
+// with a fresh SubscribedAck), never as a duplicate registration. This
+// re-delivery is legitimate: a Subscribed whose SubscribedAck was still
+// pending when the connection dropped is re-sent on the next connection, and
+// a restored attachment deliberately sends one on every connection until an
+// ack applies completely. It always follows the fresh SyncRequest (which may
+// already list the same attachment). The control plane acknowledges
+// Subscribed, not SyncRequest; it MUST answer each effective declaration with
+// a complete fresh SubscribedAck. One exception is operational, not an
+// idempotency relaxation: after a zero-timeout new attachment consumes an ack
+// that leaves protected policy durably degraded, the daemon reports that state
+// in Heartbeat but does not automatically re-drive Subscribed before restart.
+// The control plane must send a complete BulkUpdate to recover it.
 type Subscribed struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Unique identifier for this attachment
@@ -371,15 +429,18 @@ type Subscribed struct {
 	Target string `protobuf:"bytes,2,opt,name=target,proto3" json:"target,omitempty"`
 	// Type of attachment
 	Type AttachmentType `protobuf:"varint,3,opt,name=type,proto3,enum=netfence.v1.AttachmentType" json:"type,omitempty"`
-	// Initial IP filter policy mode
+	// Current IP filter policy mode
 	Mode PolicyMode `protobuf:"varint,4,opt,name=mode,proto3,enum=netfence.v1.PolicyMode" json:"mode,omitempty"`
-	// Initial DNS filtering mode
+	// Current DNS filtering mode
 	DnsMode DnsMode `protobuf:"varint,5,opt,name=dns_mode,json=dnsMode,proto3,enum=netfence.v1.DnsMode" json:"dns_mode,omitempty"`
 	// DNS server address for this attachment (e.g., "10.0.0.1:53")
 	// Containers should use this as their DNS resolver
 	DnsAddress string `protobuf:"bytes,6,opt,name=dns_address,json=dnsAddress,proto3" json:"dns_address,omitempty"`
 	// User-defined metadata for associating with VM ID, tenant, etc.
-	Metadata      map[string]string `protobuf:"bytes,7,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	Metadata map[string]string `protobuf:"bytes,7,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	// TC attach direction for TC attachments (UNSPECIFIED = EGRESS).
+	// Not meaningful for cgroup attachments.
+	TcDirection   TcDirection `protobuf:"varint,8,opt,name=tc_direction,json=tcDirection,proto3,enum=netfence.v1.TcDirection" json:"tc_direction,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -463,7 +524,20 @@ func (x *Subscribed) GetMetadata() map[string]string {
 	return nil
 }
 
+func (x *Subscribed) GetTcDirection() TcDirection {
+	if x != nil {
+		return x.TcDirection
+	}
+	return TcDirection_TC_DIRECTION_UNSPECIFIED
+}
+
 // Unsubscribed notifies that an attachment is no longer managed.
+//
+// Idempotency: the control plane MUST treat an Unsubscribed for an unknown
+// (or already-removed) attachment id as a no-op. A removal can also be
+// conveyed implicitly by the attachment being absent from the next
+// SyncRequest's list — the control plane must converge to the same state
+// either way.
 type Unsubscribed struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// The attachment that was removed
@@ -580,8 +654,73 @@ type AttachmentStats struct {
 	PacketsBlocked    uint64                 `protobuf:"varint,3,opt,name=packets_blocked,json=packetsBlocked,proto3" json:"packets_blocked,omitempty"`
 	DnsQueriesAllowed uint64                 `protobuf:"varint,4,opt,name=dns_queries_allowed,json=dnsQueriesAllowed,proto3" json:"dns_queries_allowed,omitempty"`
 	DnsQueriesBlocked uint64                 `protobuf:"varint,5,opt,name=dns_queries_blocked,json=dnsQueriesBlocked,proto3" json:"dns_queries_blocked,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	// Cumulative count of control-plane CIDR insertions rejected by protected
+	// LPM-map capacity plus address-bearing DNS responses rejected by exact-map
+	// or logical ownership capacity. A non-zero, growing value means new policy or
+	// DNS admissions are NOT taking effect. For protected CIDR pressure, reduce
+	// rules or raise filter.max_rule_entries; for DNS pressure, reduce
+	// domain/TTL volume or raise the corresponding bounded dns.* ceiling and,
+	// if physically full, filter.max_dns_rule_entries. Both filter map sizes are
+	// load-time: an existing pinned map must be recreated to change capacity.
+	MapFullDrops uint64 `protobuf:"varint,6,opt,name=map_full_drops,json=mapFullDrops,proto3" json:"map_full_drops,omitempty"`
+	// DNS queries that ended in SERVFAIL or another resolver/proxy/admission
+	// failure. Mutually exclusive with dns_queries_allowed (successfully
+	// answered policy-allowed queries) and dns_queries_blocked (policy REFUSED).
+	DnsQueriesErrors uint64 `protobuf:"varint,7,opt,name=dns_queries_errors,json=dnsQueriesErrors,proto3" json:"dns_queries_errors,omitempty"`
+	// Current physical occupancy/capacity and process-generation high-water
+	// marks for the two DNS exact-host maps. Restored provisional pins count in
+	// physical occupancy until authoritative reconciliation.
+	DnsExactIpv4Entries   uint32 `protobuf:"varint,8,opt,name=dns_exact_ipv4_entries,json=dnsExactIpv4Entries,proto3" json:"dns_exact_ipv4_entries,omitempty"`
+	DnsExactIpv4Capacity  uint32 `protobuf:"varint,9,opt,name=dns_exact_ipv4_capacity,json=dnsExactIpv4Capacity,proto3" json:"dns_exact_ipv4_capacity,omitempty"`
+	DnsExactIpv4HighWater uint32 `protobuf:"varint,10,opt,name=dns_exact_ipv4_high_water,json=dnsExactIpv4HighWater,proto3" json:"dns_exact_ipv4_high_water,omitempty"`
+	DnsExactIpv6Entries   uint32 `protobuf:"varint,11,opt,name=dns_exact_ipv6_entries,json=dnsExactIpv6Entries,proto3" json:"dns_exact_ipv6_entries,omitempty"`
+	DnsExactIpv6Capacity  uint32 `protobuf:"varint,12,opt,name=dns_exact_ipv6_capacity,json=dnsExactIpv6Capacity,proto3" json:"dns_exact_ipv6_capacity,omitempty"`
+	DnsExactIpv6HighWater uint32 `protobuf:"varint,13,opt,name=dns_exact_ipv6_high_water,json=dnsExactIpv6HighWater,proto3" json:"dns_exact_ipv6_high_water,omitempty"`
+	// Successfully committed physical DNS-only LRU evictions. Expiry and
+	// policy-driven removal do not increment this counter.
+	DnsLruEvictions uint64 `protobuf:"varint,14,opt,name=dns_lru_evictions,json=dnsLruEvictions,proto3" json:"dns_lru_evictions,omitempty"`
+	// All address-bearing DNS admission failures, including capacity, rolling
+	// budget, exact-map I/O, and rollback ambiguity.
+	DnsAdmissionFailures uint64 `protobuf:"varint,15,opt,name=dns_admission_failures,json=dnsAdmissionFailures,proto3" json:"dns_admission_failures,omitempty"`
+	// Admissions rejected by either the rolling physical-churn budget or the
+	// normalized slow-planning work guard. This is intentionally separate from
+	// map_full_drops because rejection is due to a rolling mutation/attempt
+	// allowance, not inability to represent the state or a raw map insertion.
+	DnsBudgetThrottles uint64 `protobuf:"varint,16,opt,name=dns_budget_throttles,json=dnsBudgetThrottles,proto3" json:"dns_budget_throttles,omitempty"`
+	// Current physical occupancy/capacity and daemon-generation high-water
+	// values for each protected, non-evictable authoritative/system LPM map.
+	// The DNS listener bootstrap is included in protected allow occupancy;
+	// adopted pinned entries initialize high-water for the new daemon process.
+	// A transient inventory failure retains the last proven snapshot and emits
+	// a rate-limited daemon warning rather than publishing guessed counts.
+	ProtectedAllowIpv4Entries   uint32 `protobuf:"varint,17,opt,name=protected_allow_ipv4_entries,json=protectedAllowIpv4Entries,proto3" json:"protected_allow_ipv4_entries,omitempty"`
+	ProtectedAllowIpv4Capacity  uint32 `protobuf:"varint,18,opt,name=protected_allow_ipv4_capacity,json=protectedAllowIpv4Capacity,proto3" json:"protected_allow_ipv4_capacity,omitempty"`
+	ProtectedAllowIpv4HighWater uint32 `protobuf:"varint,19,opt,name=protected_allow_ipv4_high_water,json=protectedAllowIpv4HighWater,proto3" json:"protected_allow_ipv4_high_water,omitempty"`
+	ProtectedAllowIpv6Entries   uint32 `protobuf:"varint,20,opt,name=protected_allow_ipv6_entries,json=protectedAllowIpv6Entries,proto3" json:"protected_allow_ipv6_entries,omitempty"`
+	ProtectedAllowIpv6Capacity  uint32 `protobuf:"varint,21,opt,name=protected_allow_ipv6_capacity,json=protectedAllowIpv6Capacity,proto3" json:"protected_allow_ipv6_capacity,omitempty"`
+	ProtectedAllowIpv6HighWater uint32 `protobuf:"varint,22,opt,name=protected_allow_ipv6_high_water,json=protectedAllowIpv6HighWater,proto3" json:"protected_allow_ipv6_high_water,omitempty"`
+	ProtectedDenyIpv4Entries    uint32 `protobuf:"varint,23,opt,name=protected_deny_ipv4_entries,json=protectedDenyIpv4Entries,proto3" json:"protected_deny_ipv4_entries,omitempty"`
+	ProtectedDenyIpv4Capacity   uint32 `protobuf:"varint,24,opt,name=protected_deny_ipv4_capacity,json=protectedDenyIpv4Capacity,proto3" json:"protected_deny_ipv4_capacity,omitempty"`
+	ProtectedDenyIpv4HighWater  uint32 `protobuf:"varint,25,opt,name=protected_deny_ipv4_high_water,json=protectedDenyIpv4HighWater,proto3" json:"protected_deny_ipv4_high_water,omitempty"`
+	ProtectedDenyIpv6Entries    uint32 `protobuf:"varint,26,opt,name=protected_deny_ipv6_entries,json=protectedDenyIpv6Entries,proto3" json:"protected_deny_ipv6_entries,omitempty"`
+	ProtectedDenyIpv6Capacity   uint32 `protobuf:"varint,27,opt,name=protected_deny_ipv6_capacity,json=protectedDenyIpv6Capacity,proto3" json:"protected_deny_ipv6_capacity,omitempty"`
+	ProtectedDenyIpv6HighWater  uint32 `protobuf:"varint,28,opt,name=protected_deny_ipv6_high_water,json=protectedDenyIpv6HighWater,proto3" json:"protected_deny_ipv6_high_water,omitempty"`
+	// policy_degraded is true while a protected-policy safety record is nonempty;
+	// configured BLOCK_ALL alone is healthy and reports false. The
+	// protected_policy_mutation_in_progress reason is a transient crash journal:
+	// its owning live operation clears it on success and may publish the intended
+	// mode before that final clear. Startup that finds it first proves BLOCK_ALL
+	// and converts it to protected_policy_mutation_interrupted. That interrupted
+	// code and authoritative_protected_policy_failed,
+	// incremental_deny_install_failed, incremental_allow_removal_failed, and
+	// incremental_mode_change_failed are stable degraded reasons (never raw
+	// errors): they hold proven BLOCK_ALL, reject protected incrementals, and
+	// require a complete authoritative LPM+DNS reconcile. Independent DNS
+	// mutation and expiry may continue but cannot reactivate packet policy.
+	PolicyDegraded       bool   `protobuf:"varint,29,opt,name=policy_degraded,json=policyDegraded,proto3" json:"policy_degraded,omitempty"`
+	PolicyDegradedReason string `protobuf:"bytes,30,opt,name=policy_degraded_reason,json=policyDegradedReason,proto3" json:"policy_degraded_reason,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *AttachmentStats) Reset() {
@@ -649,6 +788,181 @@ func (x *AttachmentStats) GetDnsQueriesBlocked() uint64 {
 	return 0
 }
 
+func (x *AttachmentStats) GetMapFullDrops() uint64 {
+	if x != nil {
+		return x.MapFullDrops
+	}
+	return 0
+}
+
+func (x *AttachmentStats) GetDnsQueriesErrors() uint64 {
+	if x != nil {
+		return x.DnsQueriesErrors
+	}
+	return 0
+}
+
+func (x *AttachmentStats) GetDnsExactIpv4Entries() uint32 {
+	if x != nil {
+		return x.DnsExactIpv4Entries
+	}
+	return 0
+}
+
+func (x *AttachmentStats) GetDnsExactIpv4Capacity() uint32 {
+	if x != nil {
+		return x.DnsExactIpv4Capacity
+	}
+	return 0
+}
+
+func (x *AttachmentStats) GetDnsExactIpv4HighWater() uint32 {
+	if x != nil {
+		return x.DnsExactIpv4HighWater
+	}
+	return 0
+}
+
+func (x *AttachmentStats) GetDnsExactIpv6Entries() uint32 {
+	if x != nil {
+		return x.DnsExactIpv6Entries
+	}
+	return 0
+}
+
+func (x *AttachmentStats) GetDnsExactIpv6Capacity() uint32 {
+	if x != nil {
+		return x.DnsExactIpv6Capacity
+	}
+	return 0
+}
+
+func (x *AttachmentStats) GetDnsExactIpv6HighWater() uint32 {
+	if x != nil {
+		return x.DnsExactIpv6HighWater
+	}
+	return 0
+}
+
+func (x *AttachmentStats) GetDnsLruEvictions() uint64 {
+	if x != nil {
+		return x.DnsLruEvictions
+	}
+	return 0
+}
+
+func (x *AttachmentStats) GetDnsAdmissionFailures() uint64 {
+	if x != nil {
+		return x.DnsAdmissionFailures
+	}
+	return 0
+}
+
+func (x *AttachmentStats) GetDnsBudgetThrottles() uint64 {
+	if x != nil {
+		return x.DnsBudgetThrottles
+	}
+	return 0
+}
+
+func (x *AttachmentStats) GetProtectedAllowIpv4Entries() uint32 {
+	if x != nil {
+		return x.ProtectedAllowIpv4Entries
+	}
+	return 0
+}
+
+func (x *AttachmentStats) GetProtectedAllowIpv4Capacity() uint32 {
+	if x != nil {
+		return x.ProtectedAllowIpv4Capacity
+	}
+	return 0
+}
+
+func (x *AttachmentStats) GetProtectedAllowIpv4HighWater() uint32 {
+	if x != nil {
+		return x.ProtectedAllowIpv4HighWater
+	}
+	return 0
+}
+
+func (x *AttachmentStats) GetProtectedAllowIpv6Entries() uint32 {
+	if x != nil {
+		return x.ProtectedAllowIpv6Entries
+	}
+	return 0
+}
+
+func (x *AttachmentStats) GetProtectedAllowIpv6Capacity() uint32 {
+	if x != nil {
+		return x.ProtectedAllowIpv6Capacity
+	}
+	return 0
+}
+
+func (x *AttachmentStats) GetProtectedAllowIpv6HighWater() uint32 {
+	if x != nil {
+		return x.ProtectedAllowIpv6HighWater
+	}
+	return 0
+}
+
+func (x *AttachmentStats) GetProtectedDenyIpv4Entries() uint32 {
+	if x != nil {
+		return x.ProtectedDenyIpv4Entries
+	}
+	return 0
+}
+
+func (x *AttachmentStats) GetProtectedDenyIpv4Capacity() uint32 {
+	if x != nil {
+		return x.ProtectedDenyIpv4Capacity
+	}
+	return 0
+}
+
+func (x *AttachmentStats) GetProtectedDenyIpv4HighWater() uint32 {
+	if x != nil {
+		return x.ProtectedDenyIpv4HighWater
+	}
+	return 0
+}
+
+func (x *AttachmentStats) GetProtectedDenyIpv6Entries() uint32 {
+	if x != nil {
+		return x.ProtectedDenyIpv6Entries
+	}
+	return 0
+}
+
+func (x *AttachmentStats) GetProtectedDenyIpv6Capacity() uint32 {
+	if x != nil {
+		return x.ProtectedDenyIpv6Capacity
+	}
+	return 0
+}
+
+func (x *AttachmentStats) GetProtectedDenyIpv6HighWater() uint32 {
+	if x != nil {
+		return x.ProtectedDenyIpv6HighWater
+	}
+	return 0
+}
+
+func (x *AttachmentStats) GetPolicyDegraded() bool {
+	if x != nil {
+		return x.PolicyDegraded
+	}
+	return false
+}
+
+func (x *AttachmentStats) GetPolicyDegradedReason() string {
+	if x != nil {
+		return x.PolicyDegradedReason
+	}
+	return ""
+}
+
 // ControlCommand represents commands sent from the control plane to the daemon.
 type ControlCommand struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -667,9 +981,20 @@ type ControlCommand struct {
 	//	*ControlCommand_DenyDomain
 	//	*ControlCommand_RemoveDomain
 	//	*ControlCommand_SubscribedAck
-	Command       isControlCommand_Command `protobuf_oneof:"command"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Command isControlCommand_Command `protobuf_oneof:"command"`
+	// Optional control-plane-chosen correlation id for this command. When
+	// non-empty, the daemon reports the command's outcome with a
+	// CommandResult DaemonEvent echoing this value; when empty (the
+	// default), no result is emitted — fully backward-compatible opt-in.
+	// SubscribedAck is excluded (it is itself the ack of a daemon event and
+	// is answered by the Subscribed handshake), as is SyncAck.
+	CommandId string `protobuf:"bytes,13,opt,name=command_id,json=commandId,proto3" json:"command_id,omitempty"`
+	// Optional selector for remove_cidr. UNSPECIFIED preserves the original
+	// wire/API behavior and, like BOTH, removes from both allow and deny lists.
+	// This field is ignored for every other command type.
+	RemoveCidrList RuleList `protobuf:"varint,14,opt,name=remove_cidr_list,json=removeCidrList,proto3,enum=netfence.v1.RuleList" json:"remove_cidr_list,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *ControlCommand) Reset() {
@@ -815,6 +1140,20 @@ func (x *ControlCommand) GetSubscribedAck() *SubscribedAck {
 	return nil
 }
 
+func (x *ControlCommand) GetCommandId() string {
+	if x != nil {
+		return x.CommandId
+	}
+	return ""
+}
+
+func (x *ControlCommand) GetRemoveCidrList() RuleList {
+	if x != nil {
+		return x.RemoveCidrList
+	}
+	return RuleList_RULE_LIST_UNSPECIFIED
+}
+
 type isControlCommand_Command interface {
 	isControlCommand_Command()
 }
@@ -870,7 +1209,8 @@ type ControlCommand_RemoveDomain struct {
 }
 
 type ControlCommand_SubscribedAck struct {
-	// Acknowledge subscription with initial config (sent after receiving Subscribed)
+	// Acknowledge a subscription declaration with complete authoritative config
+	// (sent after receiving Subscribed, including restored declarations)
 	SubscribedAck *SubscribedAck `protobuf:"bytes,12,opt,name=subscribed_ack,json=subscribedAck,proto3,oneof"`
 }
 
@@ -896,6 +1236,86 @@ func (*ControlCommand_RemoveDomain) isControlCommand_Command() {}
 
 func (*ControlCommand_SubscribedAck) isControlCommand_Command() {}
 
+// CommandResult reports the outcome of a ControlCommand that carried a
+// non-empty command_id. success is true only when the command fully
+// applied (parse + filter + bookkeeping); a partially-applied command
+// (e.g. one CIDR of a BulkUpdate failing) reports success=false with the
+// aggregated error. Results are best-effort: a saturated event channel
+// drops them (with a daemon-side warning) rather than blocking command
+// processing, so the control plane must treat a missing result as
+// unknown, not failed.
+type CommandResult struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Echo of ControlCommand.command_id
+	CommandId string `protobuf:"bytes,1,opt,name=command_id,json=commandId,proto3" json:"command_id,omitempty"`
+	// The attachment the command targeted (echo of ControlCommand.id)
+	Id string `protobuf:"bytes,2,opt,name=id,proto3" json:"id,omitempty"`
+	// Whether the command fully applied
+	Success bool `protobuf:"varint,3,opt,name=success,proto3" json:"success,omitempty"`
+	// Error detail when success is false
+	Error         string `protobuf:"bytes,4,opt,name=error,proto3" json:"error,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CommandResult) Reset() {
+	*x = CommandResult{}
+	mi := &file_v1_control_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CommandResult) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CommandResult) ProtoMessage() {}
+
+func (x *CommandResult) ProtoReflect() protoreflect.Message {
+	mi := &file_v1_control_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CommandResult.ProtoReflect.Descriptor instead.
+func (*CommandResult) Descriptor() ([]byte, []int) {
+	return file_v1_control_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *CommandResult) GetCommandId() string {
+	if x != nil {
+		return x.CommandId
+	}
+	return ""
+}
+
+func (x *CommandResult) GetId() string {
+	if x != nil {
+		return x.Id
+	}
+	return ""
+}
+
+func (x *CommandResult) GetSuccess() bool {
+	if x != nil {
+		return x.Success
+	}
+	return false
+}
+
+func (x *CommandResult) GetError() string {
+	if x != nil {
+		return x.Error
+	}
+	return ""
+}
+
 // SyncAck acknowledges that the control plane has processed the SyncRequest.
 type SyncAck struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -905,7 +1325,7 @@ type SyncAck struct {
 
 func (x *SyncAck) Reset() {
 	*x = SyncAck{}
-	mi := &file_v1_control_proto_msgTypes[8]
+	mi := &file_v1_control_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -917,7 +1337,7 @@ func (x *SyncAck) String() string {
 func (*SyncAck) ProtoMessage() {}
 
 func (x *SyncAck) ProtoReflect() protoreflect.Message {
-	mi := &file_v1_control_proto_msgTypes[8]
+	mi := &file_v1_control_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -930,10 +1350,20 @@ func (x *SyncAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SyncAck.ProtoReflect.Descriptor instead.
 func (*SyncAck) Descriptor() ([]byte, []int) {
-	return file_v1_control_proto_rawDescGZIP(), []int{8}
+	return file_v1_control_proto_rawDescGZIP(), []int{9}
 }
 
-// SubscribedAck acknowledges a Subscribed event and provides initial configuration.
+// SubscribedAck acknowledges a Subscribed event and provides complete,
+// authoritative desired state. It configures a new attachment and reconciles a
+// restored attachment's last-known map contents. The daemon applies it by
+// delta: unchanged CIDRs remain installed, stale CIDRs are removed, new CIDRs
+// are added, and control-plane TTLs are replaced exactly. The restore remains
+// pending after any validation or apply failure and is retried after a later
+// connection. For a zero-timeout new attachment, however, a protected-policy
+// apply failure consumes this ack and is signaled by degraded Heartbeat fields;
+// it emits no CommandResult or error Unsubscribed and is not re-driven before
+// restart. Recover that live attachment with a complete BulkUpdate, preferably
+// carrying command_id for an explicit outcome.
 //
 // Design note: This is sent over the bidirectional stream (rather than a separate
 // unary RPC) to ensure the same control plane node that holds the stream connection
@@ -942,13 +1372,13 @@ func (*SyncAck) Descriptor() ([]byte, []int) {
 // that doesn't have the stream, requiring cross-node coordination.
 type SubscribedAck struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Initial IP filter policy mode
+	// Complete desired IP filter policy mode. Must be a known non-UNSPECIFIED value.
 	Mode PolicyMode `protobuf:"varint,1,opt,name=mode,proto3,enum=netfence.v1.PolicyMode" json:"mode,omitempty"`
-	// Initial CIDRs to allow
+	// Complete desired CIDRs to allow (canonical duplicates are invalid).
 	AllowCidrs []*CIDREntry `protobuf:"bytes,2,rep,name=allow_cidrs,json=allowCidrs,proto3" json:"allow_cidrs,omitempty"`
-	// Initial CIDRs to deny
+	// Complete desired CIDRs to deny (canonical duplicates are invalid).
 	DenyCidrs []*CIDREntry `protobuf:"bytes,3,rep,name=deny_cidrs,json=denyCidrs,proto3" json:"deny_cidrs,omitempty"`
-	// Initial DNS configuration
+	// Complete desired DNS configuration. Omitted means disabled with empty lists.
 	Dns           *DnsConfig `protobuf:"bytes,4,opt,name=dns,proto3" json:"dns,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -956,7 +1386,7 @@ type SubscribedAck struct {
 
 func (x *SubscribedAck) Reset() {
 	*x = SubscribedAck{}
-	mi := &file_v1_control_proto_msgTypes[9]
+	mi := &file_v1_control_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -968,7 +1398,7 @@ func (x *SubscribedAck) String() string {
 func (*SubscribedAck) ProtoMessage() {}
 
 func (x *SubscribedAck) ProtoReflect() protoreflect.Message {
-	mi := &file_v1_control_proto_msgTypes[9]
+	mi := &file_v1_control_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -981,7 +1411,7 @@ func (x *SubscribedAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SubscribedAck.ProtoReflect.Descriptor instead.
 func (*SubscribedAck) Descriptor() ([]byte, []int) {
-	return file_v1_control_proto_rawDescGZIP(), []int{9}
+	return file_v1_control_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *SubscribedAck) GetMode() PolicyMode {
@@ -1022,7 +1452,7 @@ type SetMode struct {
 
 func (x *SetMode) Reset() {
 	*x = SetMode{}
-	mi := &file_v1_control_proto_msgTypes[10]
+	mi := &file_v1_control_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1034,7 +1464,7 @@ func (x *SetMode) String() string {
 func (*SetMode) ProtoMessage() {}
 
 func (x *SetMode) ProtoReflect() protoreflect.Message {
-	mi := &file_v1_control_proto_msgTypes[10]
+	mi := &file_v1_control_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1047,7 +1477,7 @@ func (x *SetMode) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetMode.ProtoReflect.Descriptor instead.
 func (*SetMode) Descriptor() ([]byte, []int) {
-	return file_v1_control_proto_rawDescGZIP(), []int{10}
+	return file_v1_control_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *SetMode) GetMode() PolicyMode {
@@ -1057,11 +1487,15 @@ func (x *SetMode) GetMode() PolicyMode {
 	return PolicyMode_POLICY_MODE_UNSPECIFIED
 }
 
-// BulkUpdate sets the complete state for an attachment.
-// Clears existing rules and replaces with the provided state.
+// BulkUpdate sets the complete authoritative state for an attachment. The
+// daemon reconciles by delta; an unchanged CIDR is not removed/re-added, and
+// its control-plane TTL is replaced exactly by the provided lifetime. This is
+// also the live recovery operation for protected-policy degradation: maps and
+// DNS must both apply before the requested mode activates and the durable
+// marker clears. Use command_id when the outcome must be observed.
 type BulkUpdate struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// IP filter policy mode
+	// Complete desired IP filter policy mode. Must be a known non-UNSPECIFIED value.
 	Mode PolicyMode `protobuf:"varint,1,opt,name=mode,proto3,enum=netfence.v1.PolicyMode" json:"mode,omitempty"`
 	// CIDRs to allow
 	AllowCidrs []*CIDREntry `protobuf:"bytes,2,rep,name=allow_cidrs,json=allowCidrs,proto3" json:"allow_cidrs,omitempty"`
@@ -1075,7 +1509,7 @@ type BulkUpdate struct {
 
 func (x *BulkUpdate) Reset() {
 	*x = BulkUpdate{}
-	mi := &file_v1_control_proto_msgTypes[11]
+	mi := &file_v1_control_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1087,7 +1521,7 @@ func (x *BulkUpdate) String() string {
 func (*BulkUpdate) ProtoMessage() {}
 
 func (x *BulkUpdate) ProtoReflect() protoreflect.Message {
-	mi := &file_v1_control_proto_msgTypes[11]
+	mi := &file_v1_control_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1100,7 +1534,7 @@ func (x *BulkUpdate) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BulkUpdate.ProtoReflect.Descriptor instead.
 func (*BulkUpdate) Descriptor() ([]byte, []int) {
-	return file_v1_control_proto_rawDescGZIP(), []int{11}
+	return file_v1_control_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *BulkUpdate) GetMode() PolicyMode {
@@ -1131,25 +1565,65 @@ func (x *BulkUpdate) GetDns() *DnsConfig {
 	return nil
 }
 
-// DnsConfig contains the complete DNS filtering configuration.
+// DnsConfig contains the complete DNS filtering configuration. In every
+// filtering mode, all A/AAAA records across a response's answer, authority,
+// and additional sections are admitted transactionally to the independent
+// exact-host tier before return. This includes default/explicit allows in DNS
+// DENYLIST even when the current packet mode ignores exact allows, preserving
+// cached connectivity across a later packet ALLOWLIST transition. Capacity
+// rejection preserves the existing working set and returns SERVFAIL without
+// an address. Zero limit fields inherit the daemon ceilings.
 type DnsConfig struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// DNS filtering mode
+	// Complete desired DNS filtering mode. Must be a known non-UNSPECIFIED value.
 	Mode DnsMode `protobuf:"varint,1,opt,name=mode,proto3,enum=netfence.v1.DnsMode" json:"mode,omitempty"`
 	// Domains to allow (when mode is ALLOWLIST or to override in DENYLIST)
 	AllowDomains []*DomainEntry `protobuf:"bytes,2,rep,name=allow_domains,json=allowDomains,proto3" json:"allow_domains,omitempty"`
 	// Domains to deny (when mode is DENYLIST or to override in ALLOWLIST)
 	DenyDomains []*DomainEntry `protobuf:"bytes,3,rep,name=deny_domains,json=denyDomains,proto3" json:"deny_domains,omitempty"`
-	// Upstream DNS servers to use for resolution (optional, uses system default
-	// if empty)
+	// Ordered upstream DNS servers for this attachment. Entries are host:port;
+	// IPv6 literals must be bracketed. The daemon canonicalizes and de-duplicates
+	// them in first-seen order and accepts at most 8 unique servers. Empty uses
+	// the daemon-global dns.upstream fallback. Resolution tries each server in
+	// order; a truncated UDP reply is retried over TCP against that same server
+	// before failover continues.
 	UpstreamServers []string `protobuf:"bytes,4,rep,name=upstream_servers,json=upstreamServers,proto3" json:"upstream_servers,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// Per-attachment logical DNS exact-tier ceiling for each IP family. It may
+	// not exceed either the daemon's dns.max_ips_per_family ceiling or the
+	// actual exact HASH map capacity.
+	MaxIpsPerFamily uint32 `protobuf:"varint,5,opt,name=max_ips_per_family,json=maxIpsPerFamily,proto3" json:"max_ips_per_family,omitempty"`
+	// Maximum unique A/AAAA addresses admitted from one response across answer,
+	// authority, and additional sections.
+	MaxIpsPerResponse uint32 `protobuf:"varint,6,opt,name=max_ips_per_response,json=maxIpsPerResponse,proto3" json:"max_ips_per_response,omitempty"`
+	// Maximum unique addresses owned by one authorization owner: an explicit
+	// matched allow-policy domain (including wildcard matches), implicit
+	// DENYLIST query owner, or proxy query owner. Shared IPs count once per
+	// owner even when several query domains hold independent TTL edges.
+	MaxIpsPerPolicyDomain uint32 `protobuf:"varint,7,opt,name=max_ips_per_policy_domain,json=maxIpsPerPolicyDomain,proto3" json:"max_ips_per_policy_domain,omitempty"`
+	// Maximum union of normalized configured policy-rule domains and live query
+	// domains retained in TTL ownership metadata.
+	MaxTrackedDomains uint32 `protobuf:"varint,8,opt,name=max_tracked_domains,json=maxTrackedDomains,proto3" json:"max_tracked_domains,omitempty"`
+	// Maximum (query domain, matched policy owner, IP) TTL ownership edges.
+	// Shared physical IPs still consume one edge for each independent query and
+	// matched owner.
+	MaxOwnershipEdges uint32 `protobuf:"varint,9,opt,name=max_ownership_edges,json=maxOwnershipEdges,proto3" json:"max_ownership_edges,omitempty"`
+	// Per-attachment rolling DNS churn-unit limit. Zero inherits the daemon's
+	// dns.max_churn_units ceiling; a non-zero value may only lower it. A new
+	// physical exact admission costs one unit and each unexpired LRU physical
+	// eviction costs one. Expiry/policy removal and refresh of an already
+	// admitted key cost zero. The same limit also gates stable normalized work
+	// units for ownership-graph pressure planning; attempt units are committed
+	// before projection and retained even when the plan or later filter write
+	// fails. The rolling window is the daemon-global dns.churn_window and cannot
+	// be weakened by a control-plane update.
+	MaxChurnUnits uint32 `protobuf:"varint,10,opt,name=max_churn_units,json=maxChurnUnits,proto3" json:"max_churn_units,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *DnsConfig) Reset() {
 	*x = DnsConfig{}
-	mi := &file_v1_control_proto_msgTypes[12]
+	mi := &file_v1_control_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1161,7 +1635,7 @@ func (x *DnsConfig) String() string {
 func (*DnsConfig) ProtoMessage() {}
 
 func (x *DnsConfig) ProtoReflect() protoreflect.Message {
-	mi := &file_v1_control_proto_msgTypes[12]
+	mi := &file_v1_control_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1174,7 +1648,7 @@ func (x *DnsConfig) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DnsConfig.ProtoReflect.Descriptor instead.
 func (*DnsConfig) Descriptor() ([]byte, []int) {
-	return file_v1_control_proto_rawDescGZIP(), []int{12}
+	return file_v1_control_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *DnsConfig) GetMode() DnsMode {
@@ -1205,7 +1679,52 @@ func (x *DnsConfig) GetUpstreamServers() []string {
 	return nil
 }
 
-// CIDREntry represents a CIDR with optional TTL.
+func (x *DnsConfig) GetMaxIpsPerFamily() uint32 {
+	if x != nil {
+		return x.MaxIpsPerFamily
+	}
+	return 0
+}
+
+func (x *DnsConfig) GetMaxIpsPerResponse() uint32 {
+	if x != nil {
+		return x.MaxIpsPerResponse
+	}
+	return 0
+}
+
+func (x *DnsConfig) GetMaxIpsPerPolicyDomain() uint32 {
+	if x != nil {
+		return x.MaxIpsPerPolicyDomain
+	}
+	return 0
+}
+
+func (x *DnsConfig) GetMaxTrackedDomains() uint32 {
+	if x != nil {
+		return x.MaxTrackedDomains
+	}
+	return 0
+}
+
+func (x *DnsConfig) GetMaxOwnershipEdges() uint32 {
+	if x != nil {
+		return x.MaxOwnershipEdges
+	}
+	return 0
+}
+
+func (x *DnsConfig) GetMaxChurnUnits() uint32 {
+	if x != nil {
+		return x.MaxChurnUnits
+	}
+	return 0
+}
+
+// CIDREntry represents a CIDR with an optional TTL. In complete
+// SubscribedAck/BulkUpdate state, TTLs must be valid and non-negative and
+// replace control-plane lifetimes exactly. Incremental AllowCIDR/DenyCIDR
+// positive-TTL re-adds extend lifetimes monotonically; absent/zero is permanent.
 type CIDREntry struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Cidr          string                 `protobuf:"bytes,1,opt,name=cidr,proto3" json:"cidr,omitempty"`
@@ -1216,7 +1735,7 @@ type CIDREntry struct {
 
 func (x *CIDREntry) Reset() {
 	*x = CIDREntry{}
-	mi := &file_v1_control_proto_msgTypes[13]
+	mi := &file_v1_control_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1228,7 +1747,7 @@ func (x *CIDREntry) String() string {
 func (*CIDREntry) ProtoMessage() {}
 
 func (x *CIDREntry) ProtoReflect() protoreflect.Message {
-	mi := &file_v1_control_proto_msgTypes[13]
+	mi := &file_v1_control_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1241,7 +1760,7 @@ func (x *CIDREntry) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CIDREntry.ProtoReflect.Descriptor instead.
 func (*CIDREntry) Descriptor() ([]byte, []int) {
-	return file_v1_control_proto_rawDescGZIP(), []int{13}
+	return file_v1_control_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *CIDREntry) GetCidr() string {
@@ -1271,7 +1790,7 @@ type DomainEntry struct {
 
 func (x *DomainEntry) Reset() {
 	*x = DomainEntry{}
-	mi := &file_v1_control_proto_msgTypes[14]
+	mi := &file_v1_control_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1283,7 +1802,7 @@ func (x *DomainEntry) String() string {
 func (*DomainEntry) ProtoMessage() {}
 
 func (x *DomainEntry) ProtoReflect() protoreflect.Message {
-	mi := &file_v1_control_proto_msgTypes[14]
+	mi := &file_v1_control_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1296,7 +1815,7 @@ func (x *DomainEntry) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DomainEntry.ProtoReflect.Descriptor instead.
 func (*DomainEntry) Descriptor() ([]byte, []int) {
-	return file_v1_control_proto_rawDescGZIP(), []int{14}
+	return file_v1_control_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *DomainEntry) GetDomain() string {
@@ -1323,7 +1842,7 @@ type SetDnsMode struct {
 
 func (x *SetDnsMode) Reset() {
 	*x = SetDnsMode{}
-	mi := &file_v1_control_proto_msgTypes[15]
+	mi := &file_v1_control_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1335,7 +1854,7 @@ func (x *SetDnsMode) String() string {
 func (*SetDnsMode) ProtoMessage() {}
 
 func (x *SetDnsMode) ProtoReflect() protoreflect.Message {
-	mi := &file_v1_control_proto_msgTypes[15]
+	mi := &file_v1_control_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1348,7 +1867,7 @@ func (x *SetDnsMode) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetDnsMode.ProtoReflect.Descriptor instead.
 func (*SetDnsMode) Descriptor() ([]byte, []int) {
-	return file_v1_control_proto_rawDescGZIP(), []int{15}
+	return file_v1_control_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *SetDnsMode) GetMode() DnsMode {
@@ -1363,7 +1882,9 @@ type DnsQueryRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Attachment ID
 	Id string `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
-	// Domain being queried (e.g., "example.com.")
+	// Wire-canonical, lowercase, fully-qualified domain being queried (for
+	// example, "example.com."). Equivalent DNS presentation escapes are
+	// normalized to one spelling before the policy call.
 	Domain string `protobuf:"bytes,2,opt,name=domain,proto3" json:"domain,omitempty"`
 	// DNS query type (e.g., "A", "AAAA", "CNAME")
 	QueryType     string `protobuf:"bytes,3,opt,name=query_type,json=queryType,proto3" json:"query_type,omitempty"`
@@ -1373,7 +1894,7 @@ type DnsQueryRequest struct {
 
 func (x *DnsQueryRequest) Reset() {
 	*x = DnsQueryRequest{}
-	mi := &file_v1_control_proto_msgTypes[16]
+	mi := &file_v1_control_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1385,7 +1906,7 @@ func (x *DnsQueryRequest) String() string {
 func (*DnsQueryRequest) ProtoMessage() {}
 
 func (x *DnsQueryRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_v1_control_proto_msgTypes[16]
+	mi := &file_v1_control_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1398,7 +1919,7 @@ func (x *DnsQueryRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DnsQueryRequest.ProtoReflect.Descriptor instead.
 func (*DnsQueryRequest) Descriptor() ([]byte, []int) {
-	return file_v1_control_proto_rawDescGZIP(), []int{16}
+	return file_v1_control_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *DnsQueryRequest) GetId() string {
@@ -1427,7 +1948,11 @@ type DnsQueryResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Whether to allow this query
 	Allow bool `protobuf:"varint,1,opt,name=allow,proto3" json:"allow,omitempty"`
-	// If allowed, whether to add resolved IPs to the filter
+	// If allowed, whether every returned/upstream A/AAAA address may be admitted
+	// transactionally to the attachment's bounded exact tier. In filtering
+	// PROXY mode, an address-bearing response with false is converted to
+	// SERVFAIL; non-address answers may still pass. DNS_MODE_DISABLED is the
+	// explicit pass-through mode.
 	AddToFilter bool `protobuf:"varint,2,opt,name=add_to_filter,json=addToFilter,proto3" json:"add_to_filter,omitempty"`
 	// Optional: override IPs to return (if empty, daemon queries upstream)
 	Ips []string `protobuf:"bytes,3,rep,name=ips,proto3" json:"ips,omitempty"`
@@ -1439,7 +1964,7 @@ type DnsQueryResponse struct {
 
 func (x *DnsQueryResponse) Reset() {
 	*x = DnsQueryResponse{}
-	mi := &file_v1_control_proto_msgTypes[17]
+	mi := &file_v1_control_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1451,7 +1976,7 @@ func (x *DnsQueryResponse) String() string {
 func (*DnsQueryResponse) ProtoMessage() {}
 
 func (x *DnsQueryResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_v1_control_proto_msgTypes[17]
+	mi := &file_v1_control_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1464,7 +1989,7 @@ func (x *DnsQueryResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DnsQueryResponse.ProtoReflect.Descriptor instead.
 func (*DnsQueryResponse) Descriptor() ([]byte, []int) {
-	return file_v1_control_proto_rawDescGZIP(), []int{17}
+	return file_v1_control_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *DnsQueryResponse) GetAllow() bool {
@@ -1499,14 +2024,15 @@ var File_v1_control_proto protoreflect.FileDescriptor
 
 const file_v1_control_proto_rawDesc = "" +
 	"\n" +
-	"\x10v1/control.proto\x12\vnetfence.v1\x1a\x1egoogle/protobuf/duration.proto\x1a\x0ev1/types.proto\"\xfa\x01\n" +
+	"\x10v1/control.proto\x12\vnetfence.v1\x1a\x1egoogle/protobuf/duration.proto\x1a\x0ev1/types.proto\"\xbf\x02\n" +
 	"\vDaemonEvent\x12.\n" +
 	"\x04sync\x18\x01 \x01(\v2\x18.netfence.v1.SyncRequestH\x00R\x04sync\x129\n" +
 	"\n" +
 	"subscribed\x18\x02 \x01(\v2\x17.netfence.v1.SubscribedH\x00R\n" +
 	"subscribed\x12?\n" +
 	"\funsubscribed\x18\x03 \x01(\v2\x19.netfence.v1.UnsubscribedH\x00R\funsubscribed\x126\n" +
-	"\theartbeat\x18\x04 \x01(\v2\x16.netfence.v1.HeartbeatH\x00R\theartbeatB\a\n" +
+	"\theartbeat\x18\x04 \x01(\v2\x16.netfence.v1.HeartbeatH\x00R\theartbeat\x12C\n" +
+	"\x0ecommand_result\x18\x05 \x01(\v2\x1a.netfence.v1.CommandResultH\x00R\rcommandResultB\a\n" +
 	"\x05event\"\x82\x02\n" +
 	"\vSyncRequest\x12\x1b\n" +
 	"\tdaemon_id\x18\x01 \x01(\tR\bdaemonId\x12\x1a\n" +
@@ -1515,7 +2041,7 @@ const file_v1_control_proto_rawDesc = "" +
 	"\bmetadata\x18\x04 \x03(\v2&.netfence.v1.SyncRequest.MetadataEntryR\bmetadata\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xc3\x02\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x80\x03\n" +
 	"\n" +
 	"Attachment\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x16\n" +
@@ -1523,10 +2049,11 @@ const file_v1_control_proto_rawDesc = "" +
 	"\x04type\x18\x03 \x01(\x0e2\x1b.netfence.v1.AttachmentTypeR\x04type\x12+\n" +
 	"\x04mode\x18\x04 \x01(\x0e2\x17.netfence.v1.PolicyModeR\x04mode\x12/\n" +
 	"\bdns_mode\x18\x05 \x01(\x0e2\x14.netfence.v1.DnsModeR\adnsMode\x12A\n" +
-	"\bmetadata\x18\x06 \x03(\v2%.netfence.v1.Attachment.MetadataEntryR\bmetadata\x1a;\n" +
+	"\bmetadata\x18\x06 \x03(\v2%.netfence.v1.Attachment.MetadataEntryR\bmetadata\x12;\n" +
+	"\ftc_direction\x18\a \x01(\x0e2\x18.netfence.v1.TcDirectionR\vtcDirection\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xe4\x02\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xa1\x03\n" +
 	"\n" +
 	"Subscribed\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x16\n" +
@@ -1536,7 +2063,8 @@ const file_v1_control_proto_rawDesc = "" +
 	"\bdns_mode\x18\x05 \x01(\x0e2\x14.netfence.v1.DnsModeR\adnsMode\x12\x1f\n" +
 	"\vdns_address\x18\x06 \x01(\tR\n" +
 	"dnsAddress\x12A\n" +
-	"\bmetadata\x18\a \x03(\v2%.netfence.v1.Subscribed.MetadataEntryR\bmetadata\x1a;\n" +
+	"\bmetadata\x18\a \x03(\v2%.netfence.v1.Subscribed.MetadataEntryR\bmetadata\x12;\n" +
+	"\ftc_direction\x18\b \x01(\x0e2\x18.netfence.v1.TcDirectionR\vtcDirection\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"l\n" +
@@ -1545,13 +2073,39 @@ const file_v1_control_proto_rawDesc = "" +
 	"\x06reason\x18\x02 \x01(\x0e2\x1e.netfence.v1.UnsubscribeReasonR\x06reason\x12\x14\n" +
 	"\x05error\x18\x03 \x01(\tR\x05error\"?\n" +
 	"\tHeartbeat\x122\n" +
-	"\x05stats\x18\x01 \x03(\v2\x1c.netfence.v1.AttachmentStatsR\x05stats\"\xd3\x01\n" +
+	"\x05stats\x18\x01 \x03(\v2\x1c.netfence.v1.AttachmentStatsR\x05stats\"\x82\r\n" +
 	"\x0fAttachmentStats\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12'\n" +
 	"\x0fpackets_allowed\x18\x02 \x01(\x04R\x0epacketsAllowed\x12'\n" +
 	"\x0fpackets_blocked\x18\x03 \x01(\x04R\x0epacketsBlocked\x12.\n" +
 	"\x13dns_queries_allowed\x18\x04 \x01(\x04R\x11dnsQueriesAllowed\x12.\n" +
-	"\x13dns_queries_blocked\x18\x05 \x01(\x04R\x11dnsQueriesBlocked\"\x85\x05\n" +
+	"\x13dns_queries_blocked\x18\x05 \x01(\x04R\x11dnsQueriesBlocked\x12$\n" +
+	"\x0emap_full_drops\x18\x06 \x01(\x04R\fmapFullDrops\x12,\n" +
+	"\x12dns_queries_errors\x18\a \x01(\x04R\x10dnsQueriesErrors\x123\n" +
+	"\x16dns_exact_ipv4_entries\x18\b \x01(\rR\x13dnsExactIpv4Entries\x125\n" +
+	"\x17dns_exact_ipv4_capacity\x18\t \x01(\rR\x14dnsExactIpv4Capacity\x128\n" +
+	"\x19dns_exact_ipv4_high_water\x18\n" +
+	" \x01(\rR\x15dnsExactIpv4HighWater\x123\n" +
+	"\x16dns_exact_ipv6_entries\x18\v \x01(\rR\x13dnsExactIpv6Entries\x125\n" +
+	"\x17dns_exact_ipv6_capacity\x18\f \x01(\rR\x14dnsExactIpv6Capacity\x128\n" +
+	"\x19dns_exact_ipv6_high_water\x18\r \x01(\rR\x15dnsExactIpv6HighWater\x12*\n" +
+	"\x11dns_lru_evictions\x18\x0e \x01(\x04R\x0fdnsLruEvictions\x124\n" +
+	"\x16dns_admission_failures\x18\x0f \x01(\x04R\x14dnsAdmissionFailures\x120\n" +
+	"\x14dns_budget_throttles\x18\x10 \x01(\x04R\x12dnsBudgetThrottles\x12?\n" +
+	"\x1cprotected_allow_ipv4_entries\x18\x11 \x01(\rR\x19protectedAllowIpv4Entries\x12A\n" +
+	"\x1dprotected_allow_ipv4_capacity\x18\x12 \x01(\rR\x1aprotectedAllowIpv4Capacity\x12D\n" +
+	"\x1fprotected_allow_ipv4_high_water\x18\x13 \x01(\rR\x1bprotectedAllowIpv4HighWater\x12?\n" +
+	"\x1cprotected_allow_ipv6_entries\x18\x14 \x01(\rR\x19protectedAllowIpv6Entries\x12A\n" +
+	"\x1dprotected_allow_ipv6_capacity\x18\x15 \x01(\rR\x1aprotectedAllowIpv6Capacity\x12D\n" +
+	"\x1fprotected_allow_ipv6_high_water\x18\x16 \x01(\rR\x1bprotectedAllowIpv6HighWater\x12=\n" +
+	"\x1bprotected_deny_ipv4_entries\x18\x17 \x01(\rR\x18protectedDenyIpv4Entries\x12?\n" +
+	"\x1cprotected_deny_ipv4_capacity\x18\x18 \x01(\rR\x19protectedDenyIpv4Capacity\x12B\n" +
+	"\x1eprotected_deny_ipv4_high_water\x18\x19 \x01(\rR\x1aprotectedDenyIpv4HighWater\x12=\n" +
+	"\x1bprotected_deny_ipv6_entries\x18\x1a \x01(\rR\x18protectedDenyIpv6Entries\x12?\n" +
+	"\x1cprotected_deny_ipv6_capacity\x18\x1b \x01(\rR\x19protectedDenyIpv6Capacity\x12B\n" +
+	"\x1eprotected_deny_ipv6_high_water\x18\x1c \x01(\rR\x1aprotectedDenyIpv6HighWater\x12'\n" +
+	"\x0fpolicy_degraded\x18\x1d \x01(\bR\x0epolicyDegraded\x124\n" +
+	"\x16policy_degraded_reason\x18\x1e \x01(\tR\x14policyDegradedReason\"\xe5\x05\n" +
 	"\x0eControlCommand\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x121\n" +
 	"\bsync_ack\x18\x02 \x01(\v2\x14.netfence.v1.SyncAckH\x00R\asyncAck\x121\n" +
@@ -1570,8 +2124,17 @@ const file_v1_control_proto_rawDesc = "" +
 	" \x01(\v2\x18.netfence.v1.DomainEntryH\x00R\n" +
 	"denyDomain\x12%\n" +
 	"\rremove_domain\x18\v \x01(\tH\x00R\fremoveDomain\x12C\n" +
-	"\x0esubscribed_ack\x18\f \x01(\v2\x1a.netfence.v1.SubscribedAckH\x00R\rsubscribedAckB\t\n" +
-	"\acommand\"\t\n" +
+	"\x0esubscribed_ack\x18\f \x01(\v2\x1a.netfence.v1.SubscribedAckH\x00R\rsubscribedAck\x12\x1d\n" +
+	"\n" +
+	"command_id\x18\r \x01(\tR\tcommandId\x12?\n" +
+	"\x10remove_cidr_list\x18\x0e \x01(\x0e2\x15.netfence.v1.RuleListR\x0eremoveCidrListB\t\n" +
+	"\acommand\"n\n" +
+	"\rCommandResult\x12\x1d\n" +
+	"\n" +
+	"command_id\x18\x01 \x01(\tR\tcommandId\x12\x0e\n" +
+	"\x02id\x18\x02 \x01(\tR\x02id\x12\x18\n" +
+	"\asuccess\x18\x03 \x01(\bR\asuccess\x12\x14\n" +
+	"\x05error\x18\x04 \x01(\tR\x05error\"\t\n" +
 	"\aSyncAck\"\xd6\x01\n" +
 	"\rSubscribedAck\x12+\n" +
 	"\x04mode\x18\x01 \x01(\x0e2\x17.netfence.v1.PolicyModeR\x04mode\x127\n" +
@@ -1589,12 +2152,19 @@ const file_v1_control_proto_rawDesc = "" +
 	"allowCidrs\x125\n" +
 	"\n" +
 	"deny_cidrs\x18\x03 \x03(\v2\x16.netfence.v1.CIDREntryR\tdenyCidrs\x12(\n" +
-	"\x03dns\x18\x04 \x01(\v2\x16.netfence.v1.DnsConfigR\x03dns\"\xdc\x01\n" +
+	"\x03dns\x18\x04 \x01(\v2\x16.netfence.v1.DnsConfigR\x03dns\"\xfc\x03\n" +
 	"\tDnsConfig\x12(\n" +
 	"\x04mode\x18\x01 \x01(\x0e2\x14.netfence.v1.DnsModeR\x04mode\x12=\n" +
 	"\rallow_domains\x18\x02 \x03(\v2\x18.netfence.v1.DomainEntryR\fallowDomains\x12;\n" +
 	"\fdeny_domains\x18\x03 \x03(\v2\x18.netfence.v1.DomainEntryR\vdenyDomains\x12)\n" +
-	"\x10upstream_servers\x18\x04 \x03(\tR\x0fupstreamServers\"L\n" +
+	"\x10upstream_servers\x18\x04 \x03(\tR\x0fupstreamServers\x12+\n" +
+	"\x12max_ips_per_family\x18\x05 \x01(\rR\x0fmaxIpsPerFamily\x12/\n" +
+	"\x14max_ips_per_response\x18\x06 \x01(\rR\x11maxIpsPerResponse\x128\n" +
+	"\x19max_ips_per_policy_domain\x18\a \x01(\rR\x15maxIpsPerPolicyDomain\x12.\n" +
+	"\x13max_tracked_domains\x18\b \x01(\rR\x11maxTrackedDomains\x12.\n" +
+	"\x13max_ownership_edges\x18\t \x01(\rR\x11maxOwnershipEdges\x12&\n" +
+	"\x0fmax_churn_units\x18\n" +
+	" \x01(\rR\rmaxChurnUnits\"L\n" +
 	"\tCIDREntry\x12\x12\n" +
 	"\x04cidr\x18\x01 \x01(\tR\x04cidr\x12+\n" +
 	"\x03ttl\x18\x02 \x01(\v2\x19.google.protobuf.DurationR\x03ttl\"T\n" +
@@ -1637,7 +2207,7 @@ func file_v1_control_proto_rawDescGZIP() []byte {
 }
 
 var file_v1_control_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_v1_control_proto_msgTypes = make([]protoimpl.MessageInfo, 21)
+var file_v1_control_proto_msgTypes = make([]protoimpl.MessageInfo, 22)
 var file_v1_control_proto_goTypes = []any{
 	(UnsubscribeReason)(0),      // 0: netfence.v1.UnsubscribeReason
 	(*DaemonEvent)(nil),         // 1: netfence.v1.DaemonEvent
@@ -1648,73 +2218,80 @@ var file_v1_control_proto_goTypes = []any{
 	(*Heartbeat)(nil),           // 6: netfence.v1.Heartbeat
 	(*AttachmentStats)(nil),     // 7: netfence.v1.AttachmentStats
 	(*ControlCommand)(nil),      // 8: netfence.v1.ControlCommand
-	(*SyncAck)(nil),             // 9: netfence.v1.SyncAck
-	(*SubscribedAck)(nil),       // 10: netfence.v1.SubscribedAck
-	(*SetMode)(nil),             // 11: netfence.v1.SetMode
-	(*BulkUpdate)(nil),          // 12: netfence.v1.BulkUpdate
-	(*DnsConfig)(nil),           // 13: netfence.v1.DnsConfig
-	(*CIDREntry)(nil),           // 14: netfence.v1.CIDREntry
-	(*DomainEntry)(nil),         // 15: netfence.v1.DomainEntry
-	(*SetDnsMode)(nil),          // 16: netfence.v1.SetDnsMode
-	(*DnsQueryRequest)(nil),     // 17: netfence.v1.DnsQueryRequest
-	(*DnsQueryResponse)(nil),    // 18: netfence.v1.DnsQueryResponse
-	nil,                         // 19: netfence.v1.SyncRequest.MetadataEntry
-	nil,                         // 20: netfence.v1.Attachment.MetadataEntry
-	nil,                         // 21: netfence.v1.Subscribed.MetadataEntry
-	(AttachmentType)(0),         // 22: netfence.v1.AttachmentType
-	(PolicyMode)(0),             // 23: netfence.v1.PolicyMode
-	(DnsMode)(0),                // 24: netfence.v1.DnsMode
-	(*durationpb.Duration)(nil), // 25: google.protobuf.Duration
+	(*CommandResult)(nil),       // 9: netfence.v1.CommandResult
+	(*SyncAck)(nil),             // 10: netfence.v1.SyncAck
+	(*SubscribedAck)(nil),       // 11: netfence.v1.SubscribedAck
+	(*SetMode)(nil),             // 12: netfence.v1.SetMode
+	(*BulkUpdate)(nil),          // 13: netfence.v1.BulkUpdate
+	(*DnsConfig)(nil),           // 14: netfence.v1.DnsConfig
+	(*CIDREntry)(nil),           // 15: netfence.v1.CIDREntry
+	(*DomainEntry)(nil),         // 16: netfence.v1.DomainEntry
+	(*SetDnsMode)(nil),          // 17: netfence.v1.SetDnsMode
+	(*DnsQueryRequest)(nil),     // 18: netfence.v1.DnsQueryRequest
+	(*DnsQueryResponse)(nil),    // 19: netfence.v1.DnsQueryResponse
+	nil,                         // 20: netfence.v1.SyncRequest.MetadataEntry
+	nil,                         // 21: netfence.v1.Attachment.MetadataEntry
+	nil,                         // 22: netfence.v1.Subscribed.MetadataEntry
+	(AttachmentType)(0),         // 23: netfence.v1.AttachmentType
+	(PolicyMode)(0),             // 24: netfence.v1.PolicyMode
+	(DnsMode)(0),                // 25: netfence.v1.DnsMode
+	(TcDirection)(0),            // 26: netfence.v1.TcDirection
+	(RuleList)(0),               // 27: netfence.v1.RuleList
+	(*durationpb.Duration)(nil), // 28: google.protobuf.Duration
 }
 var file_v1_control_proto_depIdxs = []int32{
 	2,  // 0: netfence.v1.DaemonEvent.sync:type_name -> netfence.v1.SyncRequest
 	4,  // 1: netfence.v1.DaemonEvent.subscribed:type_name -> netfence.v1.Subscribed
 	5,  // 2: netfence.v1.DaemonEvent.unsubscribed:type_name -> netfence.v1.Unsubscribed
 	6,  // 3: netfence.v1.DaemonEvent.heartbeat:type_name -> netfence.v1.Heartbeat
-	3,  // 4: netfence.v1.SyncRequest.attachments:type_name -> netfence.v1.Attachment
-	19, // 5: netfence.v1.SyncRequest.metadata:type_name -> netfence.v1.SyncRequest.MetadataEntry
-	22, // 6: netfence.v1.Attachment.type:type_name -> netfence.v1.AttachmentType
-	23, // 7: netfence.v1.Attachment.mode:type_name -> netfence.v1.PolicyMode
-	24, // 8: netfence.v1.Attachment.dns_mode:type_name -> netfence.v1.DnsMode
-	20, // 9: netfence.v1.Attachment.metadata:type_name -> netfence.v1.Attachment.MetadataEntry
-	22, // 10: netfence.v1.Subscribed.type:type_name -> netfence.v1.AttachmentType
-	23, // 11: netfence.v1.Subscribed.mode:type_name -> netfence.v1.PolicyMode
-	24, // 12: netfence.v1.Subscribed.dns_mode:type_name -> netfence.v1.DnsMode
-	21, // 13: netfence.v1.Subscribed.metadata:type_name -> netfence.v1.Subscribed.MetadataEntry
-	0,  // 14: netfence.v1.Unsubscribed.reason:type_name -> netfence.v1.UnsubscribeReason
-	7,  // 15: netfence.v1.Heartbeat.stats:type_name -> netfence.v1.AttachmentStats
-	9,  // 16: netfence.v1.ControlCommand.sync_ack:type_name -> netfence.v1.SyncAck
-	11, // 17: netfence.v1.ControlCommand.set_mode:type_name -> netfence.v1.SetMode
-	14, // 18: netfence.v1.ControlCommand.allow_cidr:type_name -> netfence.v1.CIDREntry
-	14, // 19: netfence.v1.ControlCommand.deny_cidr:type_name -> netfence.v1.CIDREntry
-	12, // 20: netfence.v1.ControlCommand.bulk_update:type_name -> netfence.v1.BulkUpdate
-	16, // 21: netfence.v1.ControlCommand.set_dns_mode:type_name -> netfence.v1.SetDnsMode
-	15, // 22: netfence.v1.ControlCommand.allow_domain:type_name -> netfence.v1.DomainEntry
-	15, // 23: netfence.v1.ControlCommand.deny_domain:type_name -> netfence.v1.DomainEntry
-	10, // 24: netfence.v1.ControlCommand.subscribed_ack:type_name -> netfence.v1.SubscribedAck
-	23, // 25: netfence.v1.SubscribedAck.mode:type_name -> netfence.v1.PolicyMode
-	14, // 26: netfence.v1.SubscribedAck.allow_cidrs:type_name -> netfence.v1.CIDREntry
-	14, // 27: netfence.v1.SubscribedAck.deny_cidrs:type_name -> netfence.v1.CIDREntry
-	13, // 28: netfence.v1.SubscribedAck.dns:type_name -> netfence.v1.DnsConfig
-	23, // 29: netfence.v1.SetMode.mode:type_name -> netfence.v1.PolicyMode
-	23, // 30: netfence.v1.BulkUpdate.mode:type_name -> netfence.v1.PolicyMode
-	14, // 31: netfence.v1.BulkUpdate.allow_cidrs:type_name -> netfence.v1.CIDREntry
-	14, // 32: netfence.v1.BulkUpdate.deny_cidrs:type_name -> netfence.v1.CIDREntry
-	13, // 33: netfence.v1.BulkUpdate.dns:type_name -> netfence.v1.DnsConfig
-	24, // 34: netfence.v1.DnsConfig.mode:type_name -> netfence.v1.DnsMode
-	15, // 35: netfence.v1.DnsConfig.allow_domains:type_name -> netfence.v1.DomainEntry
-	15, // 36: netfence.v1.DnsConfig.deny_domains:type_name -> netfence.v1.DomainEntry
-	25, // 37: netfence.v1.CIDREntry.ttl:type_name -> google.protobuf.Duration
-	24, // 38: netfence.v1.SetDnsMode.mode:type_name -> netfence.v1.DnsMode
-	1,  // 39: netfence.v1.ControlPlane.Connect:input_type -> netfence.v1.DaemonEvent
-	17, // 40: netfence.v1.ControlPlane.QueryDns:input_type -> netfence.v1.DnsQueryRequest
-	8,  // 41: netfence.v1.ControlPlane.Connect:output_type -> netfence.v1.ControlCommand
-	18, // 42: netfence.v1.ControlPlane.QueryDns:output_type -> netfence.v1.DnsQueryResponse
-	41, // [41:43] is the sub-list for method output_type
-	39, // [39:41] is the sub-list for method input_type
-	39, // [39:39] is the sub-list for extension type_name
-	39, // [39:39] is the sub-list for extension extendee
-	0,  // [0:39] is the sub-list for field type_name
+	9,  // 4: netfence.v1.DaemonEvent.command_result:type_name -> netfence.v1.CommandResult
+	3,  // 5: netfence.v1.SyncRequest.attachments:type_name -> netfence.v1.Attachment
+	20, // 6: netfence.v1.SyncRequest.metadata:type_name -> netfence.v1.SyncRequest.MetadataEntry
+	23, // 7: netfence.v1.Attachment.type:type_name -> netfence.v1.AttachmentType
+	24, // 8: netfence.v1.Attachment.mode:type_name -> netfence.v1.PolicyMode
+	25, // 9: netfence.v1.Attachment.dns_mode:type_name -> netfence.v1.DnsMode
+	21, // 10: netfence.v1.Attachment.metadata:type_name -> netfence.v1.Attachment.MetadataEntry
+	26, // 11: netfence.v1.Attachment.tc_direction:type_name -> netfence.v1.TcDirection
+	23, // 12: netfence.v1.Subscribed.type:type_name -> netfence.v1.AttachmentType
+	24, // 13: netfence.v1.Subscribed.mode:type_name -> netfence.v1.PolicyMode
+	25, // 14: netfence.v1.Subscribed.dns_mode:type_name -> netfence.v1.DnsMode
+	22, // 15: netfence.v1.Subscribed.metadata:type_name -> netfence.v1.Subscribed.MetadataEntry
+	26, // 16: netfence.v1.Subscribed.tc_direction:type_name -> netfence.v1.TcDirection
+	0,  // 17: netfence.v1.Unsubscribed.reason:type_name -> netfence.v1.UnsubscribeReason
+	7,  // 18: netfence.v1.Heartbeat.stats:type_name -> netfence.v1.AttachmentStats
+	10, // 19: netfence.v1.ControlCommand.sync_ack:type_name -> netfence.v1.SyncAck
+	12, // 20: netfence.v1.ControlCommand.set_mode:type_name -> netfence.v1.SetMode
+	15, // 21: netfence.v1.ControlCommand.allow_cidr:type_name -> netfence.v1.CIDREntry
+	15, // 22: netfence.v1.ControlCommand.deny_cidr:type_name -> netfence.v1.CIDREntry
+	13, // 23: netfence.v1.ControlCommand.bulk_update:type_name -> netfence.v1.BulkUpdate
+	17, // 24: netfence.v1.ControlCommand.set_dns_mode:type_name -> netfence.v1.SetDnsMode
+	16, // 25: netfence.v1.ControlCommand.allow_domain:type_name -> netfence.v1.DomainEntry
+	16, // 26: netfence.v1.ControlCommand.deny_domain:type_name -> netfence.v1.DomainEntry
+	11, // 27: netfence.v1.ControlCommand.subscribed_ack:type_name -> netfence.v1.SubscribedAck
+	27, // 28: netfence.v1.ControlCommand.remove_cidr_list:type_name -> netfence.v1.RuleList
+	24, // 29: netfence.v1.SubscribedAck.mode:type_name -> netfence.v1.PolicyMode
+	15, // 30: netfence.v1.SubscribedAck.allow_cidrs:type_name -> netfence.v1.CIDREntry
+	15, // 31: netfence.v1.SubscribedAck.deny_cidrs:type_name -> netfence.v1.CIDREntry
+	14, // 32: netfence.v1.SubscribedAck.dns:type_name -> netfence.v1.DnsConfig
+	24, // 33: netfence.v1.SetMode.mode:type_name -> netfence.v1.PolicyMode
+	24, // 34: netfence.v1.BulkUpdate.mode:type_name -> netfence.v1.PolicyMode
+	15, // 35: netfence.v1.BulkUpdate.allow_cidrs:type_name -> netfence.v1.CIDREntry
+	15, // 36: netfence.v1.BulkUpdate.deny_cidrs:type_name -> netfence.v1.CIDREntry
+	14, // 37: netfence.v1.BulkUpdate.dns:type_name -> netfence.v1.DnsConfig
+	25, // 38: netfence.v1.DnsConfig.mode:type_name -> netfence.v1.DnsMode
+	16, // 39: netfence.v1.DnsConfig.allow_domains:type_name -> netfence.v1.DomainEntry
+	16, // 40: netfence.v1.DnsConfig.deny_domains:type_name -> netfence.v1.DomainEntry
+	28, // 41: netfence.v1.CIDREntry.ttl:type_name -> google.protobuf.Duration
+	25, // 42: netfence.v1.SetDnsMode.mode:type_name -> netfence.v1.DnsMode
+	1,  // 43: netfence.v1.ControlPlane.Connect:input_type -> netfence.v1.DaemonEvent
+	18, // 44: netfence.v1.ControlPlane.QueryDns:input_type -> netfence.v1.DnsQueryRequest
+	8,  // 45: netfence.v1.ControlPlane.Connect:output_type -> netfence.v1.ControlCommand
+	19, // 46: netfence.v1.ControlPlane.QueryDns:output_type -> netfence.v1.DnsQueryResponse
+	45, // [45:47] is the sub-list for method output_type
+	43, // [43:45] is the sub-list for method input_type
+	43, // [43:43] is the sub-list for extension type_name
+	43, // [43:43] is the sub-list for extension extendee
+	0,  // [0:43] is the sub-list for field type_name
 }
 
 func init() { file_v1_control_proto_init() }
@@ -1728,6 +2305,7 @@ func file_v1_control_proto_init() {
 		(*DaemonEvent_Subscribed)(nil),
 		(*DaemonEvent_Unsubscribed)(nil),
 		(*DaemonEvent_Heartbeat)(nil),
+		(*DaemonEvent_CommandResult)(nil),
 	}
 	file_v1_control_proto_msgTypes[7].OneofWrappers = []any{
 		(*ControlCommand_SyncAck)(nil),
@@ -1748,7 +2326,7 @@ func file_v1_control_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_v1_control_proto_rawDesc), len(file_v1_control_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   21,
+			NumMessages:   22,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

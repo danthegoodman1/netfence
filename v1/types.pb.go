@@ -131,6 +131,73 @@ func (AttachmentType) EnumDescriptor() ([]byte, []int) {
 	return file_v1_types_proto_rawDescGZIP(), []int{1}
 }
 
+// TcDirection selects which TCX hook a TC (interface) filter attaches to.
+// It is only meaningful for interface targets; for cgroup targets it is
+// ignored (cgroup filters hook socket operations, not an interface).
+//
+// Picking the correct direction depends on which side of the link the
+// interface is on:
+//   - EGRESS is correct when the interface transmits the workload's outbound
+//     traffic: an uplink like eth0, or an interface inside the workload's own
+//     network namespace. There the packet's destination address is the true
+//     external destination.
+//   - INGRESS is correct for host-side veth peers and VM tap devices (e.g.
+//     "fcr-*"). The workload's outbound traffic arrives at the host ON that
+//     interface (ingress); attaching egress there would instead see
+//     host-to-workload return traffic and filter by the workload's own
+//     address rather than the true destination.
+type TcDirection int32
+
+const (
+	// Treated as TC_DIRECTION_EGRESS (preserves pre-direction behavior).
+	TcDirection_TC_DIRECTION_UNSPECIFIED TcDirection = 0
+	// Filter packets transmitted out through the interface.
+	TcDirection_TC_DIRECTION_EGRESS TcDirection = 1
+	// Filter packets received by the host from the interface.
+	TcDirection_TC_DIRECTION_INGRESS TcDirection = 2
+)
+
+// Enum value maps for TcDirection.
+var (
+	TcDirection_name = map[int32]string{
+		0: "TC_DIRECTION_UNSPECIFIED",
+		1: "TC_DIRECTION_EGRESS",
+		2: "TC_DIRECTION_INGRESS",
+	}
+	TcDirection_value = map[string]int32{
+		"TC_DIRECTION_UNSPECIFIED": 0,
+		"TC_DIRECTION_EGRESS":      1,
+		"TC_DIRECTION_INGRESS":     2,
+	}
+)
+
+func (x TcDirection) Enum() *TcDirection {
+	p := new(TcDirection)
+	*p = x
+	return p
+}
+
+func (x TcDirection) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (TcDirection) Descriptor() protoreflect.EnumDescriptor {
+	return file_v1_types_proto_enumTypes[2].Descriptor()
+}
+
+func (TcDirection) Type() protoreflect.EnumType {
+	return &file_v1_types_proto_enumTypes[2]
+}
+
+func (x TcDirection) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use TcDirection.Descriptor instead.
+func (TcDirection) EnumDescriptor() ([]byte, []int) {
+	return file_v1_types_proto_rawDescGZIP(), []int{2}
+}
+
 // DnsMode defines the DNS filtering behavior.
 type DnsMode int32
 
@@ -175,11 +242,11 @@ func (x DnsMode) String() string {
 }
 
 func (DnsMode) Descriptor() protoreflect.EnumDescriptor {
-	return file_v1_types_proto_enumTypes[2].Descriptor()
+	return file_v1_types_proto_enumTypes[3].Descriptor()
 }
 
 func (DnsMode) Type() protoreflect.EnumType {
-	return &file_v1_types_proto_enumTypes[2]
+	return &file_v1_types_proto_enumTypes[3]
 }
 
 func (x DnsMode) Number() protoreflect.EnumNumber {
@@ -188,7 +255,62 @@ func (x DnsMode) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use DnsMode.Descriptor instead.
 func (DnsMode) EnumDescriptor() ([]byte, []int) {
-	return file_v1_types_proto_rawDescGZIP(), []int{2}
+	return file_v1_types_proto_rawDescGZIP(), []int{3}
+}
+
+// RuleList identifies one protected CIDR policy list. UNSPECIFIED is used by
+// remove operations to preserve the legacy behavior of removing the CIDR from
+// both lists. BOTH is its explicit spelling for new clients.
+type RuleList int32
+
+const (
+	RuleList_RULE_LIST_UNSPECIFIED RuleList = 0
+	RuleList_RULE_LIST_ALLOW       RuleList = 1
+	RuleList_RULE_LIST_DENY        RuleList = 2
+	RuleList_RULE_LIST_BOTH        RuleList = 3
+)
+
+// Enum value maps for RuleList.
+var (
+	RuleList_name = map[int32]string{
+		0: "RULE_LIST_UNSPECIFIED",
+		1: "RULE_LIST_ALLOW",
+		2: "RULE_LIST_DENY",
+		3: "RULE_LIST_BOTH",
+	}
+	RuleList_value = map[string]int32{
+		"RULE_LIST_UNSPECIFIED": 0,
+		"RULE_LIST_ALLOW":       1,
+		"RULE_LIST_DENY":        2,
+		"RULE_LIST_BOTH":        3,
+	}
+)
+
+func (x RuleList) Enum() *RuleList {
+	p := new(RuleList)
+	*p = x
+	return p
+}
+
+func (x RuleList) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (RuleList) Descriptor() protoreflect.EnumDescriptor {
+	return file_v1_types_proto_enumTypes[4].Descriptor()
+}
+
+func (RuleList) Type() protoreflect.EnumType {
+	return &file_v1_types_proto_enumTypes[4]
+}
+
+func (x RuleList) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use RuleList.Descriptor instead.
+func (RuleList) EnumDescriptor() ([]byte, []int) {
+	return file_v1_types_proto_rawDescGZIP(), []int{4}
 }
 
 var File_v1_types_proto protoreflect.FileDescriptor
@@ -206,13 +328,22 @@ const file_v1_types_proto_rawDesc = "" +
 	"\x0eAttachmentType\x12\x1f\n" +
 	"\x1bATTACHMENT_TYPE_UNSPECIFIED\x10\x00\x12\x16\n" +
 	"\x12ATTACHMENT_TYPE_TC\x10\x01\x12\x1a\n" +
-	"\x16ATTACHMENT_TYPE_CGROUP\x10\x02*}\n" +
+	"\x16ATTACHMENT_TYPE_CGROUP\x10\x02*^\n" +
+	"\vTcDirection\x12\x1c\n" +
+	"\x18TC_DIRECTION_UNSPECIFIED\x10\x00\x12\x17\n" +
+	"\x13TC_DIRECTION_EGRESS\x10\x01\x12\x18\n" +
+	"\x14TC_DIRECTION_INGRESS\x10\x02*}\n" +
 	"\aDnsMode\x12\x18\n" +
 	"\x14DNS_MODE_UNSPECIFIED\x10\x00\x12\x15\n" +
 	"\x11DNS_MODE_DISABLED\x10\x01\x12\x16\n" +
 	"\x12DNS_MODE_ALLOWLIST\x10\x02\x12\x15\n" +
 	"\x11DNS_MODE_DENYLIST\x10\x03\x12\x12\n" +
-	"\x0eDNS_MODE_PROXY\x10\x04B1Z/github.com/danthegoodman1/netfence/api/v1;apiv1b\x06proto3"
+	"\x0eDNS_MODE_PROXY\x10\x04*b\n" +
+	"\bRuleList\x12\x19\n" +
+	"\x15RULE_LIST_UNSPECIFIED\x10\x00\x12\x13\n" +
+	"\x0fRULE_LIST_ALLOW\x10\x01\x12\x12\n" +
+	"\x0eRULE_LIST_DENY\x10\x02\x12\x12\n" +
+	"\x0eRULE_LIST_BOTH\x10\x03B1Z/github.com/danthegoodman1/netfence/api/v1;apiv1b\x06proto3"
 
 var (
 	file_v1_types_proto_rawDescOnce sync.Once
@@ -226,11 +357,13 @@ func file_v1_types_proto_rawDescGZIP() []byte {
 	return file_v1_types_proto_rawDescData
 }
 
-var file_v1_types_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
+var file_v1_types_proto_enumTypes = make([]protoimpl.EnumInfo, 5)
 var file_v1_types_proto_goTypes = []any{
 	(PolicyMode)(0),     // 0: netfence.v1.PolicyMode
 	(AttachmentType)(0), // 1: netfence.v1.AttachmentType
-	(DnsMode)(0),        // 2: netfence.v1.DnsMode
+	(TcDirection)(0),    // 2: netfence.v1.TcDirection
+	(DnsMode)(0),        // 3: netfence.v1.DnsMode
+	(RuleList)(0),       // 4: netfence.v1.RuleList
 }
 var file_v1_types_proto_depIdxs = []int32{
 	0, // [0:0] is the sub-list for method output_type
@@ -250,7 +383,7 @@ func file_v1_types_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_v1_types_proto_rawDesc), len(file_v1_types_proto_rawDesc)),
-			NumEnums:      3,
+			NumEnums:      5,
 			NumMessages:   0,
 			NumExtensions: 0,
 			NumServices:   0,

@@ -32,6 +32,23 @@ func BenchmarkServerListWithConcurrentStats(b *testing.B) {
 	})
 }
 
+func BenchmarkTTLRegistrySeedAdoptedMaxCapacity(b *testing.B) {
+	const perMap = 4096
+	allowed, denied := protectedCapacitySeedCIDRs(b, perMap)
+	b.ReportAllocs()
+	b.ReportMetric(float64(perMap*4), "rules/seed")
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		registry := newTTLRegistry()
+		if err := registry.seedAdopted(allowed, denied); err != nil {
+			b.Fatal(err)
+		}
+		if got := registry.len(); got != perMap*4 {
+			b.Fatalf("seeded registry has %d rules, want %d", got, perMap*4)
+		}
+	}
+}
+
 func newBenchmarkServer(b *testing.B, attachmentCount int) *Server {
 	b.Helper()
 
@@ -74,10 +91,17 @@ func newBenchmarkServer(b *testing.B, attachmentCount int) *Server {
 			b.Fatal(err)
 		}
 		ff := &fakeFilter{stats: filter.Stats{Allowed: uint64(i), Blocked: uint64(i / 2)}}
+		reg := newTTLRegistry()
+		sink, err := server.newDNSFilterSink(id, ff)
+		if err != nil {
+			b.Fatal(err)
+		}
 		server.attachments[id] = &attachmentState{
-			info:   attachment,
-			filter: ff,
-			dns:    NewDNSServer(id, attachment.DnsAddress, cfg.DNS.Upstream, zerolog.Nop(), ff, nil),
+			info:    attachment,
+			filter:  ff,
+			dns:     NewDNSServer(id, attachment.DnsAddress, cfg.DNS.Upstream, zerolog.Nop(), sink, nil, sink.LimitCeilings()),
+			dnsSink: sink,
+			ttls:    reg,
 		}
 	}
 	return server
