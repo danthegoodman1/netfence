@@ -422,8 +422,8 @@ func (s *Server) rollbackRestoreStart(resources []*restoreStartResource) error {
 					}
 					persistCleanup(resource, "recreated filter detach failure")
 				}
-				resource.state.ttls = newTTLRegistry()
 			}
+			resource.state.ttls = newTTLRegistry()
 		}
 		resource.state.filter = nil
 		resource.state.dns = nil

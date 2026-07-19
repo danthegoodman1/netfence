@@ -42,10 +42,10 @@ func snapshotProtectedRegistry(reg *ttlRegistry) map[ttlKey]protectedRegistryEnt
 	out := make(map[ttlKey]protectedRegistryEntrySnapshot, len(reg.entries))
 	for key, entry := range reg.entries {
 		out[key] = protectedRegistryEntrySnapshot{
-			systemLive: entry.systemLive,
-			cpLive:     entry.cpLive,
-			cpDeadline: entry.cpDeadline,
-			inFilter:   entry.inFilter,
+			systemLive: entry.system,
+			cpLive:     entry.policyOwned(),
+			cpDeadline: entry.deadline,
+			inFilter:   entry.registryPresent,
 		}
 	}
 	return out

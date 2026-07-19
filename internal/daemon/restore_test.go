@@ -291,7 +291,7 @@ func TestRestoreDNSSetupFailureAbortsAndRetainsDurableRow(t *testing.T) {
 			before, err := env.st.GetAttachment(env.id)
 			require.NoError(t, err)
 			if tt.adopted {
-				env.adopted = &fakeFilter{mode: filter.ModeAllowlist}
+				env.adopted = &fakeFilter{mode: filter.ModeAllowlist, allowed: []string{"198.51.100.10/32"}}
 				env.mkPinDir(t)
 			}
 			if tt.serve {
@@ -314,6 +314,18 @@ func TestRestoreDNSSetupFailureAbortsAndRetainsDurableRow(t *testing.T) {
 			}
 			assertRestoreDurableOwnershipRetained(t, env, before)
 			assertDNSPortFree(t, env.port)
+
+			if tt.adopted {
+				// Abort resets the watcher and adopted bookkeeping. Retrying this
+				// same Server must inventory the pins again rather than reject a
+				// second seed (including a non-empty inventory).
+				env.adopted = &fakeFilter{mode: filter.ModeAllowlist, allowed: []string{"198.51.100.10/32"}}
+				env.server.bindDNSServer = (*DNSServer).Bind
+				env.server.serveDNSServer = (*DNSServer).Serve
+				stubRestoreWatcher(env.server)
+				require.NoError(t, env.server.Start())
+				env.server.Stop()
+			}
 		})
 	}
 }

@@ -213,7 +213,7 @@ func TestGetRulesMarksSystemAliasesProvisionalAndRemovalRetry(t *testing.T) {
 	require.NoError(t, reg.addSystem(ff, alias, listAllow))
 	retry := mustCIDR(t, "192.0.2.0/24")
 	reg.mu.Lock()
-	reg.entries[ttlKey{cidr: retry.String(), list: listAllow}] = ttlEntry{cidr: retry, inFilter: true}
+	reg.entries[ttlKey{cidr: retry.String(), list: listAllow}] = protectedEntry{cidr: retry, registryPresent: true}
 	reg.mu.Unlock()
 	rules, err := server.GetRules(context.Background(), &apiv1.GetRulesRequest{Id: id})
 	require.NoError(t, err)

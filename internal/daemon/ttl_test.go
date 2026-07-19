@@ -65,7 +65,7 @@ func assertProtectedCurrent(t testing.TB, reg *ttlRegistry, allow4, allow6, deny
 	t.Helper()
 	reg.mu.Lock()
 	defer reg.mu.Unlock()
-	assert.Equal(t, protectedRuleCurrent{allow4: allow4, allow6: allow6, deny4: deny4, deny6: deny6}, reg.protectedCurrent)
+	assert.Equal(t, protectedRuleCurrent{allow4, allow6, deny4, deny6}, reg.protectedCurrent)
 }
 
 func TestProtectedCurrentCountersTrackPhysicalTransitionsAndFailures(t *testing.T) {
@@ -106,10 +106,10 @@ func TestProtectedCurrentCountersTrackPhysicalTransitionsAndFailures(t *testing.
 	ff.removeAllowErr = nil
 	require.NoError(t, reg.clear(ff))
 	assertProtectedCurrent(t, reg, 0, 0, 0, 0)
-	assert.Equal(t, uint32(1), reg.allowedIPv4HighWater.Load())
-	assert.Equal(t, uint32(1), reg.allowedIPv6HighWater.Load())
-	assert.Equal(t, uint32(1), reg.deniedIPv4HighWater.Load())
-	assert.Equal(t, uint32(1), reg.deniedIPv6HighWater.Load())
+	assert.Equal(t, uint32(1), reg.protectedHighWater[protectedAllow4])
+	assert.Equal(t, uint32(1), reg.protectedHighWater[protectedAllow6])
+	assert.Equal(t, uint32(1), reg.protectedHighWater[protectedDeny4])
+	assert.Equal(t, uint32(1), reg.protectedHighWater[protectedDeny6])
 
 	expiring := mustCIDR(t, "203.0.113.9/32")
 	require.NoError(t, reg.addCP(ff, expiring, listAllow, time.Second, now))
@@ -164,10 +164,10 @@ func TestSeedAdoptedMaxCapacityIsAtomicAndTracksHighWaterWithoutMapWrites(t *tes
 	require.NoError(t, reg.seedAdopted(allowed, denied))
 	assert.Equal(t, perMap*4, reg.len())
 	assertProtectedCurrent(t, reg, perMap, perMap, perMap, perMap)
-	assert.Equal(t, uint32(perMap), reg.allowedIPv4HighWater.Load())
-	assert.Equal(t, uint32(perMap), reg.allowedIPv6HighWater.Load())
-	assert.Equal(t, uint32(perMap), reg.deniedIPv4HighWater.Load())
-	assert.Equal(t, uint32(perMap), reg.deniedIPv6HighWater.Load())
+	assert.Equal(t, uint32(perMap), reg.protectedHighWater[protectedAllow4])
+	assert.Equal(t, uint32(perMap), reg.protectedHighWater[protectedAllow6])
+	assert.Equal(t, uint32(perMap), reg.protectedHighWater[protectedDeny4])
+	assert.Equal(t, uint32(perMap), reg.protectedHighWater[protectedDeny6])
 
 	beforeCurrent := reg.protectedCurrent
 	beforeLen := reg.len()
