@@ -988,9 +988,13 @@ type ControlCommand struct {
 	// default), no result is emitted — fully backward-compatible opt-in.
 	// SubscribedAck is excluded (it is itself the ack of a daemon event and
 	// is answered by the Subscribed handshake), as is SyncAck.
-	CommandId     string `protobuf:"bytes,13,opt,name=command_id,json=commandId,proto3" json:"command_id,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	CommandId string `protobuf:"bytes,13,opt,name=command_id,json=commandId,proto3" json:"command_id,omitempty"`
+	// Optional selector for remove_cidr. UNSPECIFIED preserves the original
+	// wire/API behavior and, like BOTH, removes from both allow and deny lists.
+	// This field is ignored for every other command type.
+	RemoveCidrList RuleList `protobuf:"varint,14,opt,name=remove_cidr_list,json=removeCidrList,proto3,enum=netfence.v1.RuleList" json:"remove_cidr_list,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *ControlCommand) Reset() {
@@ -1141,6 +1145,13 @@ func (x *ControlCommand) GetCommandId() string {
 		return x.CommandId
 	}
 	return ""
+}
+
+func (x *ControlCommand) GetRemoveCidrList() RuleList {
+	if x != nil {
+		return x.RemoveCidrList
+	}
+	return RuleList_RULE_LIST_UNSPECIFIED
 }
 
 type isControlCommand_Command interface {
@@ -2094,7 +2105,7 @@ const file_v1_control_proto_rawDesc = "" +
 	"\x1cprotected_deny_ipv6_capacity\x18\x1b \x01(\rR\x19protectedDenyIpv6Capacity\x12B\n" +
 	"\x1eprotected_deny_ipv6_high_water\x18\x1c \x01(\rR\x1aprotectedDenyIpv6HighWater\x12'\n" +
 	"\x0fpolicy_degraded\x18\x1d \x01(\bR\x0epolicyDegraded\x124\n" +
-	"\x16policy_degraded_reason\x18\x1e \x01(\tR\x14policyDegradedReason\"\xa4\x05\n" +
+	"\x16policy_degraded_reason\x18\x1e \x01(\tR\x14policyDegradedReason\"\xe5\x05\n" +
 	"\x0eControlCommand\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x121\n" +
 	"\bsync_ack\x18\x02 \x01(\v2\x14.netfence.v1.SyncAckH\x00R\asyncAck\x121\n" +
@@ -2115,7 +2126,8 @@ const file_v1_control_proto_rawDesc = "" +
 	"\rremove_domain\x18\v \x01(\tH\x00R\fremoveDomain\x12C\n" +
 	"\x0esubscribed_ack\x18\f \x01(\v2\x1a.netfence.v1.SubscribedAckH\x00R\rsubscribedAck\x12\x1d\n" +
 	"\n" +
-	"command_id\x18\r \x01(\tR\tcommandIdB\t\n" +
+	"command_id\x18\r \x01(\tR\tcommandId\x12?\n" +
+	"\x10remove_cidr_list\x18\x0e \x01(\x0e2\x15.netfence.v1.RuleListR\x0eremoveCidrListB\t\n" +
 	"\acommand\"n\n" +
 	"\rCommandResult\x12\x1d\n" +
 	"\n" +
@@ -2224,7 +2236,8 @@ var file_v1_control_proto_goTypes = []any{
 	(PolicyMode)(0),             // 24: netfence.v1.PolicyMode
 	(DnsMode)(0),                // 25: netfence.v1.DnsMode
 	(TcDirection)(0),            // 26: netfence.v1.TcDirection
-	(*durationpb.Duration)(nil), // 27: google.protobuf.Duration
+	(RuleList)(0),               // 27: netfence.v1.RuleList
+	(*durationpb.Duration)(nil), // 28: google.protobuf.Duration
 }
 var file_v1_control_proto_depIdxs = []int32{
 	2,  // 0: netfence.v1.DaemonEvent.sync:type_name -> netfence.v1.SyncRequest
@@ -2255,29 +2268,30 @@ var file_v1_control_proto_depIdxs = []int32{
 	16, // 25: netfence.v1.ControlCommand.allow_domain:type_name -> netfence.v1.DomainEntry
 	16, // 26: netfence.v1.ControlCommand.deny_domain:type_name -> netfence.v1.DomainEntry
 	11, // 27: netfence.v1.ControlCommand.subscribed_ack:type_name -> netfence.v1.SubscribedAck
-	24, // 28: netfence.v1.SubscribedAck.mode:type_name -> netfence.v1.PolicyMode
-	15, // 29: netfence.v1.SubscribedAck.allow_cidrs:type_name -> netfence.v1.CIDREntry
-	15, // 30: netfence.v1.SubscribedAck.deny_cidrs:type_name -> netfence.v1.CIDREntry
-	14, // 31: netfence.v1.SubscribedAck.dns:type_name -> netfence.v1.DnsConfig
-	24, // 32: netfence.v1.SetMode.mode:type_name -> netfence.v1.PolicyMode
-	24, // 33: netfence.v1.BulkUpdate.mode:type_name -> netfence.v1.PolicyMode
-	15, // 34: netfence.v1.BulkUpdate.allow_cidrs:type_name -> netfence.v1.CIDREntry
-	15, // 35: netfence.v1.BulkUpdate.deny_cidrs:type_name -> netfence.v1.CIDREntry
-	14, // 36: netfence.v1.BulkUpdate.dns:type_name -> netfence.v1.DnsConfig
-	25, // 37: netfence.v1.DnsConfig.mode:type_name -> netfence.v1.DnsMode
-	16, // 38: netfence.v1.DnsConfig.allow_domains:type_name -> netfence.v1.DomainEntry
-	16, // 39: netfence.v1.DnsConfig.deny_domains:type_name -> netfence.v1.DomainEntry
-	27, // 40: netfence.v1.CIDREntry.ttl:type_name -> google.protobuf.Duration
-	25, // 41: netfence.v1.SetDnsMode.mode:type_name -> netfence.v1.DnsMode
-	1,  // 42: netfence.v1.ControlPlane.Connect:input_type -> netfence.v1.DaemonEvent
-	18, // 43: netfence.v1.ControlPlane.QueryDns:input_type -> netfence.v1.DnsQueryRequest
-	8,  // 44: netfence.v1.ControlPlane.Connect:output_type -> netfence.v1.ControlCommand
-	19, // 45: netfence.v1.ControlPlane.QueryDns:output_type -> netfence.v1.DnsQueryResponse
-	44, // [44:46] is the sub-list for method output_type
-	42, // [42:44] is the sub-list for method input_type
-	42, // [42:42] is the sub-list for extension type_name
-	42, // [42:42] is the sub-list for extension extendee
-	0,  // [0:42] is the sub-list for field type_name
+	27, // 28: netfence.v1.ControlCommand.remove_cidr_list:type_name -> netfence.v1.RuleList
+	24, // 29: netfence.v1.SubscribedAck.mode:type_name -> netfence.v1.PolicyMode
+	15, // 30: netfence.v1.SubscribedAck.allow_cidrs:type_name -> netfence.v1.CIDREntry
+	15, // 31: netfence.v1.SubscribedAck.deny_cidrs:type_name -> netfence.v1.CIDREntry
+	14, // 32: netfence.v1.SubscribedAck.dns:type_name -> netfence.v1.DnsConfig
+	24, // 33: netfence.v1.SetMode.mode:type_name -> netfence.v1.PolicyMode
+	24, // 34: netfence.v1.BulkUpdate.mode:type_name -> netfence.v1.PolicyMode
+	15, // 35: netfence.v1.BulkUpdate.allow_cidrs:type_name -> netfence.v1.CIDREntry
+	15, // 36: netfence.v1.BulkUpdate.deny_cidrs:type_name -> netfence.v1.CIDREntry
+	14, // 37: netfence.v1.BulkUpdate.dns:type_name -> netfence.v1.DnsConfig
+	25, // 38: netfence.v1.DnsConfig.mode:type_name -> netfence.v1.DnsMode
+	16, // 39: netfence.v1.DnsConfig.allow_domains:type_name -> netfence.v1.DomainEntry
+	16, // 40: netfence.v1.DnsConfig.deny_domains:type_name -> netfence.v1.DomainEntry
+	28, // 41: netfence.v1.CIDREntry.ttl:type_name -> google.protobuf.Duration
+	25, // 42: netfence.v1.SetDnsMode.mode:type_name -> netfence.v1.DnsMode
+	1,  // 43: netfence.v1.ControlPlane.Connect:input_type -> netfence.v1.DaemonEvent
+	18, // 44: netfence.v1.ControlPlane.QueryDns:input_type -> netfence.v1.DnsQueryRequest
+	8,  // 45: netfence.v1.ControlPlane.Connect:output_type -> netfence.v1.ControlCommand
+	19, // 46: netfence.v1.ControlPlane.QueryDns:output_type -> netfence.v1.DnsQueryResponse
+	45, // [45:47] is the sub-list for method output_type
+	43, // [43:45] is the sub-list for method input_type
+	43, // [43:43] is the sub-list for extension type_name
+	43, // [43:43] is the sub-list for extension extendee
+	0,  // [0:43] is the sub-list for field type_name
 }
 
 func init() { file_v1_control_proto_init() }

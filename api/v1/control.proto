@@ -276,6 +276,11 @@ message ControlCommand {
   // SubscribedAck is excluded (it is itself the ack of a daemon event and
   // is answered by the Subscribed handshake), as is SyncAck.
   string command_id = 13;
+
+  // Optional selector for remove_cidr. UNSPECIFIED preserves the original
+  // wire/API behavior and, like BOTH, removes from both allow and deny lists.
+  // This field is ignored for every other command type.
+  RuleList remove_cidr_list = 14;
 }
 
 // CommandResult reports the outcome of a ControlCommand that carried a

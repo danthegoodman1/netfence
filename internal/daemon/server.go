@@ -199,6 +199,7 @@ const (
 
 var errPolicyDegraded = errors.New("attachment protected policy is degraded; a complete authoritative reconcile is required")
 var errProtectedPolicyDurablyDegraded = errors.New("attachment was durably placed in proven BLOCK_ALL degradation")
+var errAttachmentUnavailable = errors.New("attachment not found or unavailable")
 
 func (s *attachmentState) finishSetup(committed bool) {
 	if s == nil || s.setupDone == nil {
@@ -2668,7 +2669,7 @@ func (s *Server) dnsLimitCeilingsForAttachment(id string) (dnsAdmissionLimits, e
 	defer s.mu.RUnlock()
 	state := s.attachments[id]
 	if state == nil || state.cleanupNeeded || state.mutationsClosed {
-		return dnsAdmissionLimits{}, fmt.Errorf("attachment not found or unavailable: %s", id)
+		return dnsAdmissionLimits{}, fmt.Errorf("%w: %s", errAttachmentUnavailable, id)
 	}
 	if state.dns == nil {
 		return s.dnsAdmissionCeilings, nil
@@ -2681,7 +2682,7 @@ func (s *Server) dnsChurnCeilingForAttachment(id string) (dnsChurnLimits, error)
 	defer s.mu.RUnlock()
 	state := s.attachments[id]
 	if state == nil || state.cleanupNeeded || state.mutationsClosed {
-		return dnsChurnLimits{}, fmt.Errorf("attachment not found or unavailable: %s", id)
+		return dnsChurnLimits{}, fmt.Errorf("%w: %s", errAttachmentUnavailable, id)
 	}
 	if state.dns == nil {
 		return s.dnsChurnCeiling, nil
@@ -3132,6 +3133,41 @@ func (s *Server) RemoveDeniedCIDR(id string, cidr *net.IPNet) error {
 		return err
 	}
 	return reg.remove(ebpfFilter, cidr, listDeny)
+}
+
+// RemoveCIDRRule implements the shared control-plane/local remove selector.
+// UNSPECIFIED is intentionally the historical both-list operation. Selector
+// validation happens before the first attachment mutation so unknown enum
+// values are exact no-ops. The legacy both-list operation retains its
+// allow-then-deny ordering and reports every attempted removal.
+func (s *Server) RemoveCIDRRule(id string, cidr *net.IPNet, list apiv1.RuleList) error {
+	if cidr == nil {
+		return fmt.Errorf("CIDR is required")
+	}
+	switch list {
+	case apiv1.RuleList_RULE_LIST_ALLOW:
+		if err := s.RemoveAllowedCIDR(id, cidr); err != nil {
+			return fmt.Errorf("removing from allowlist: %w", err)
+		}
+		return nil
+	case apiv1.RuleList_RULE_LIST_DENY:
+		if err := s.RemoveDeniedCIDR(id, cidr); err != nil {
+			return fmt.Errorf("removing from denylist: %w", err)
+		}
+		return nil
+	case apiv1.RuleList_RULE_LIST_UNSPECIFIED, apiv1.RuleList_RULE_LIST_BOTH:
+		allowErr := s.RemoveAllowedCIDR(id, cidr)
+		if allowErr != nil {
+			allowErr = fmt.Errorf("removing from allowlist: %w", allowErr)
+		}
+		denyErr := s.RemoveDeniedCIDR(id, cidr)
+		if denyErr != nil {
+			denyErr = fmt.Errorf("removing from denylist: %w", denyErr)
+		}
+		return errors.Join(allowErr, denyErr)
+	default:
+		return fmt.Errorf("invalid CIDR rule list: %d", list)
+	}
 }
 
 // ReconcileCIDRs applies one complete protected policy projection. The filter

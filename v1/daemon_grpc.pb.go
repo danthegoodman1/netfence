@@ -20,10 +20,12 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	DaemonService_Attach_FullMethodName    = "/netfence.v1.DaemonService/Attach"
-	DaemonService_Detach_FullMethodName    = "/netfence.v1.DaemonService/Detach"
-	DaemonService_List_FullMethodName      = "/netfence.v1.DaemonService/List"
-	DaemonService_GetStatus_FullMethodName = "/netfence.v1.DaemonService/GetStatus"
+	DaemonService_Attach_FullMethodName       = "/netfence.v1.DaemonService/Attach"
+	DaemonService_Detach_FullMethodName       = "/netfence.v1.DaemonService/Detach"
+	DaemonService_List_FullMethodName         = "/netfence.v1.DaemonService/List"
+	DaemonService_GetStatus_FullMethodName    = "/netfence.v1.DaemonService/GetStatus"
+	DaemonService_ApplyCommand_FullMethodName = "/netfence.v1.DaemonService/ApplyCommand"
+	DaemonService_GetRules_FullMethodName     = "/netfence.v1.DaemonService/GetRules"
 )
 
 // DaemonServiceClient is the client API for DaemonService service.
@@ -42,6 +44,15 @@ type DaemonServiceClient interface {
 	List(ctx context.Context, in *ListRequest, opts ...grpc.CallOption) (*ListResponse, error)
 	// GetStatus returns the current daemon status.
 	GetStatus(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*DaemonStatus, error)
+	// ApplyCommand applies one existing policy mutation command locally. The
+	// attachment id and mutation are carried by ControlCommand exactly as they
+	// are on the control-plane stream. Sync/ack variants and unknown commands
+	// are rejected before mutation. BulkUpdate is the complete authoritative
+	// operation and the only local recovery path for stable degradation.
+	ApplyCommand(ctx context.Context, in *ControlCommand, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	// GetRules returns a serialized snapshot of protected-policy ownership,
+	// expirations, DNS policy, and degradation state for one attachment.
+	GetRules(ctx context.Context, in *GetRulesRequest, opts ...grpc.CallOption) (*GetRulesResponse, error)
 }
 
 type daemonServiceClient struct {
@@ -92,6 +103,26 @@ func (c *daemonServiceClient) GetStatus(ctx context.Context, in *emptypb.Empty, 
 	return out, nil
 }
 
+func (c *daemonServiceClient) ApplyCommand(ctx context.Context, in *ControlCommand, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, DaemonService_ApplyCommand_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *daemonServiceClient) GetRules(ctx context.Context, in *GetRulesRequest, opts ...grpc.CallOption) (*GetRulesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetRulesResponse)
+	err := c.cc.Invoke(ctx, DaemonService_GetRules_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // DaemonServiceServer is the server API for DaemonService service.
 // All implementations must embed UnimplementedDaemonServiceServer
 // for forward compatibility.
@@ -108,6 +139,15 @@ type DaemonServiceServer interface {
 	List(context.Context, *ListRequest) (*ListResponse, error)
 	// GetStatus returns the current daemon status.
 	GetStatus(context.Context, *emptypb.Empty) (*DaemonStatus, error)
+	// ApplyCommand applies one existing policy mutation command locally. The
+	// attachment id and mutation are carried by ControlCommand exactly as they
+	// are on the control-plane stream. Sync/ack variants and unknown commands
+	// are rejected before mutation. BulkUpdate is the complete authoritative
+	// operation and the only local recovery path for stable degradation.
+	ApplyCommand(context.Context, *ControlCommand) (*emptypb.Empty, error)
+	// GetRules returns a serialized snapshot of protected-policy ownership,
+	// expirations, DNS policy, and degradation state for one attachment.
+	GetRules(context.Context, *GetRulesRequest) (*GetRulesResponse, error)
 	mustEmbedUnimplementedDaemonServiceServer()
 }
 
@@ -129,6 +169,12 @@ func (UnimplementedDaemonServiceServer) List(context.Context, *ListRequest) (*Li
 }
 func (UnimplementedDaemonServiceServer) GetStatus(context.Context, *emptypb.Empty) (*DaemonStatus, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetStatus not implemented")
+}
+func (UnimplementedDaemonServiceServer) ApplyCommand(context.Context, *ControlCommand) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method ApplyCommand not implemented")
+}
+func (UnimplementedDaemonServiceServer) GetRules(context.Context, *GetRulesRequest) (*GetRulesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetRules not implemented")
 }
 func (UnimplementedDaemonServiceServer) mustEmbedUnimplementedDaemonServiceServer() {}
 func (UnimplementedDaemonServiceServer) testEmbeddedByValue()                       {}
@@ -223,6 +269,42 @@ func _DaemonService_GetStatus_Handler(srv interface{}, ctx context.Context, dec 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _DaemonService_ApplyCommand_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ControlCommand)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DaemonServiceServer).ApplyCommand(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: DaemonService_ApplyCommand_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DaemonServiceServer).ApplyCommand(ctx, req.(*ControlCommand))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _DaemonService_GetRules_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetRulesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DaemonServiceServer).GetRules(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: DaemonService_GetRules_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DaemonServiceServer).GetRules(ctx, req.(*GetRulesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // DaemonService_ServiceDesc is the grpc.ServiceDesc for DaemonService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -245,6 +327,14 @@ var DaemonService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetStatus",
 			Handler:    _DaemonService_GetStatus_Handler,
+		},
+		{
+			MethodName: "ApplyCommand",
+			Handler:    _DaemonService_ApplyCommand_Handler,
+		},
+		{
+			MethodName: "GetRules",
+			Handler:    _DaemonService_GetRules_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

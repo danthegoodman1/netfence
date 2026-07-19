@@ -12,6 +12,7 @@ Non-goals: L7/protocol-aware filtering, per-port rules, inbound (ingress-to-work
 - Fail-closed by default in enforcing modes; every fail-open path must be an explicit, documented decision.
 - Capacity behavior is source-aware and deterministic: control-plane CIDRs and deny rules are never silently evicted; only regenerable DNS-derived allow entries may be reclaimed, expired first and then LRU within a configured per-attachment eviction budget. Memory, ownership metadata, and churn are bounded; once the budget is exhausted, preserve the working set, reject new DNS admissions explicitly, and fail closed.
 - Enforcement logic lives in one place: shared BPF header for the two programs, shared Go rule-map core for the two filter types.
+- Complexity is part of the safety budget: each policy fact and lifecycle transition has one authoritative owner, transactional plumbing is shared where semantics match, and new production machinery must replace or simplify an existing path rather than grow a parallel one.
 - Every enforcement claim gets a traffic-level test in the Docker Linux gate (AGENTS.md); macOS results are never evidence.
 - Preserve the measured warm-path numbers (README "Performance snapshot"): connected-socket overhead must stay ~noise; re-run `make bench-docker` after each BPF change.
 - API changes are allowed (proto is pre-1.0), but each one ships with README + proto-comment updates in the same commit.
@@ -210,29 +211,36 @@ Goal:
 The daemon is usable and inspectable without a control plane, and the local API can express everything the CP protocol can.
 
 Scope:
-- 6A — Local rule management: `DaemonService` has only Attach/Detach/List/GetStatus — with no CP configured an attachment is stuck in DISABLED forever and rules can't be inspected. Add SetMode/AllowCIDR/DenyCIDR/RemoveCIDR/DNS-rule RPCs (mirroring ControlCommand semantics) plus a GetRules/inspect RPC, and `netfenced rules <id>` / `netfenced set-mode` CLI.
+- 6A — Compact local rule management: add one local `ApplyCommand(ControlCommand)` mutation RPC and one `GetRules` inspection RPC. `ApplyCommand` accepts only the existing policy mutation variants (including `BulkUpdate` for complete recovery), rejects ack/sync variants, and routes through the same parsing, admission, fail-closed, TTL, DNS, and degradation code as the control plane. Do not create one RPC/request type per operation or a parallel local desired-state model. CLI commands (`rules`, `set-mode`, CIDR/domain add/remove, DNS mode, and full-state apply) are thin encoders for this single RPC.
 - 6B — API warts: `remove_cidr` removes from both allow and deny lists with no way to target one (control.proto:140-141) — add an optional list selector; document equal-specificity deny-wins for domain rules (dns.go `evaluateDomainLocked`).
 - 6C — Socket hardening note: document the 0660 unix-socket trust boundary (whoever reaches it controls host eBPF) and make the group configurable.
 
+Non-goals:
+- Exposing DNS-derived exact-IP cache entries as desired rules, adding local-vs-control-plane ownership arbitration, or duplicating the Phase 5 rollback/crash matrix for a shared mutation path.
+- Separate generated RPC handlers and request messages for every CLI verb.
+
 Completion gate:
-`netfenced attach` → `set-mode allowlist` → `allow-cidr` → traffic verified, all with no control plane configured; rules inspectable via CLI.
+`netfenced attach` → `set-mode allowlist` → `allow-cidr` → traffic verified, all with no control plane configured; rules inspectable via CLI. The final Phase 6 diff uses exactly one mutation RPC and one inspection RPC and adds at most 800 net handwritten production/schema lines; generated bindings and focused tests are measured and reported separately. Exceeding the handwritten budget requires an explicit design review before completion.
 
 Testing plan:
-- Integration: standalone (no-CP) lifecycle test driving only the local API; CLI smoke tests in the Docker gate.
+- Unit: table-driven command-variant, enum, TTL, canonicalization, selector, and true-no-op validation through the shared parser; prove the local adapter reaches the existing full reconcile/degradation path without re-testing its complete internal fault matrix.
+- Unit: socket group name/numeric/default resolution, final 0660 mode/GID, and fail-closed cleanup on permission setup errors.
+- Integration: one standalone no-control-plane lifecycle using the compiled CLI over the Unix socket; prove attach, mode/CIDR mutation, traffic, inspection, command failure exit status, and detach.
 
 Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 6A: rule-management + inspect RPCs and CLI | Missing: proto, server, CLI, standalone e2e. |
-| Incomplete | Work | 6B: remove-cidr selector; domain-precedence docs | Missing: proto field + README. |
-| Incomplete | Work | 6C: configurable socket group + trust-boundary doc | Missing: config + doc. |
-| Incomplete | Gate | Standalone no-CP lifecycle test green | Missing: test. |
+| Complete | Work | 6A: compact shared rule mutation + inspect API and thin CLI | Added exactly two local RPCs: `ApplyCommand(ControlCommand)` and `GetRules`. A single prepared dispatcher is shared with control-plane mutation handling; local calls whitelist only policy variants, validate before admission, reuse complete `BulkUpdate` recovery, and add no local ownership/rollback model. `GetRules` returns a deterministic userspace snapshot of desired/system/provisional/removal-retry state, live normalized DNS policy, and degradation without protected-map inventory or exact-cache exposure. One compact CLI file encodes every required verb through the shared RPC and protojson full-state apply/inspection. |
+| Complete | Work | 6B: remove-cidr selector; domain-precedence docs | Added backward-compatible `ControlCommand.remove_cidr_list` outside the legacy oneof; UNSPECIFIED and BOTH remove from both lists, while ALLOW/DENY target one list and unknown values reject before mutation. Shared strict duration parsing also closes the prior negative-TTL-to-permanent bug for control-plane and local CIDR increments. README documents packet-list mode semantics plus most-specific domain matching and equal-specificity deny-wins. |
+| Complete | Work | 6C: configurable socket group + trust-boundary doc | `socket_group`/`NETFENCE_SOCKET_GROUP` accepts empty effective GID, numeric GID, or group name; rejects negative, malformed, lookup, `gid_t` overflow, and `0xffffffff` sentinel values before filesystem mutation. The daemon binds in a private staging directory, applies configured group and 0660 mode before Linux no-replace publication, and inode-checks cleanup so a replacement is preserved. README states that filesystem access is the entire local API authentication boundary and grants host eBPF authority; standalone restart requires complete local rule replay. |
+| Complete | Test | Focused shared-path, validation, socket, and compiled-CLI coverage | Focused tables cover all nine mutation variants, nil/ack/unknown commands, modes, CIDR/domain/TTL/selector validation, true no-ops, canonical TTL extension, one degraded full recovery, staged attach, deterministic inspection, GID boundaries, secure socket publication, permission failure cleanup, and replacement-safe close. `TestCgroupStandaloneCompiledCLILifecycle` builds/spawns the real binary with no control plane and drives the real CLI through disabled→allowlist traffic, CIDR allow, denylist deny/removal, DNS commands, full protojson apply, inspection, invalid-command no-op/nonzero exit, targeted removal, and detach. No Phase 5 safety test was deleted or duplicated. |
+| Complete | Gate | Standalone no-CP lifecycle and Phase 6 size budget green | Independent skeptical review accepted the exact frozen tree. Final authoritative runs passed: `make check-docker` (integration 176.001s), `make test-docker` (integration 156.122s; compiled lifecycle 1.44s), `make test-docker-cgroup` (54.109s; lifecycle 1.45s), `make test-docker-tc` (69.265s), and `make bench-docker`. Handwritten production is +716 net and schema +58 net, totaling +774 net (26 below the 800-line cap); focused tests are +526, generated bindings +431 net, and README +130 net. In-run socket medians are 3.075 µs baseline, 3.005 µs protected LPM, 3.109 µs exact, and 1.782 µs miss. Uniform absolute host drift also affected untouched controls while allocations remained identical, so the reviewer found no attributable dataplane or DNS regression. |
 
 ## Phase 7: Simplification and dead-weight removal
 
 Goal:
-One source of truth for enforcement logic and zero unused code, with no behavior change (guarded by the existing Docker gate staying green).
+One source of truth for enforcement logic, zero unused code, and an architectural correction of the Phase 5 complexity footprint without weakening protected non-eviction, DNS expired-first/LRU budgeting, or fail-closed recovery. This phase is not complete after superficial deduplication: it must materially reduce the number of policy owners, transaction/recovery paths, and handwritten production lines.
 
 Scope:
 - 7A — Go filter dedup: `TCFilter` and `CgroupFilter` duplicate ~200 lines of identical map logic (AllowIP/DenyIP/Remove*/ClearRules/GetStats/SetMode/GetMode differ only in the objects struct) — extract a shared rule-maps core; filters keep only attach/close.
@@ -240,13 +248,21 @@ Scope:
 - 7C — Dead code: delete unused `pkg/gologger` (its `init()` mutates global zerolog state if ever imported), `GetCgroupPath`, `FindCgroupByPID`, `TCFilter.InterfaceName`, `CgroupFilter.CgroupPath`; rename misleading `pkg/filter/main.go` (library file, not a main).
 - 7D — Endianness robustness: cgroup BPF localhost/link-local checks are little-endian-only (`filter_cgroup.c:90-107` vs the TC program's `bpf_ntohl` versions), and Go key marshaling relies on a LittleEndian trick (`main.go:32-56`) — normalize BPF helpers to byte-order-safe forms and switch LPM key `Addr` to `[4]byte`/`[16]byte`.
 - 7E — `handleDNS` lock structure: the per-branch RLock/RUnlock dance (dns.go:198-260) makes every new mode a leak hazard — compute the decision in one locked helper, act unlocked.
-- 7F — Config knobs: heartbeat interval (30s) and reconnect backoff base (5s) hardcoded; DNS `allocatePort` can't skip externally-occupied ports (bind-test on allocate). Fold in while touching the files.
+- 7F — Bounded correctness cleanup: make DNS `allocatePort` bind-test candidates so it skips externally occupied ports. Defer heartbeat/reconnect configurability and other new knobs until after the reduction unless a change produces a net simplification.
+- 7G — Phase 5 simplification audit: categorize the `d4f5151^..HEAD` and post-Phase 6 growth into handwritten production, tests, schemas/docs, and generated code; identify the largest production state machines, redundant state representations, and duplicate mutation/snapshot/rollback paths. Record which safety invariant requires each remaining path before refactoring.
+- 7H — Structural consolidation: route control-plane and local mutations through one authoritative policy-reconcile entry point; share one transactional inventory/preflight/apply/rollback-verification/degradation scaffold wherever protected-LPM and exact-DNS semantics permit it, while keeping their different eviction and ordering rules explicit; remove redundant TTL/DNS ownership bookkeeping that can be derived from an authoritative state; and simplify attachment lifecycle orchestration rather than merely moving code between files. Retain focused tests for every distinct safety invariant, but do not count test, generated-code, schema/doc, whitespace, or file-move deletion toward the production reduction target.
+
+Out of scope:
+- New policy behavior, API surface, telemetry dimensions, configuration knobs, and compatibility layers. Existing compatibility may be removed only through an explicit design decision with upgrade/migration evidence.
+- Weakening fail-closed behavior, protected-rule non-eviction, deterministic DNS reclamation, bounded churn/work, or crash recovery to meet a line-count target.
 
 Completion gate:
-`make check-docker` and full `make test-docker` green with a net-negative diff (target ≥400 lines removed); `make bench-docker` unchanged.
+Freeze and report a categorized post-Phase 6 baseline before refactoring. Phase 7 then removes at least 3,000 net handwritten production lines, with 4,000–5,000 as the working target, and satisfies the structural consolidation in 7H; tests, docs, schemas, generated bindings, formatting-only churn, and code moved between files are reported separately and do not count. `make check-docker`, `make test-docker`, `make test-docker-cgroup`, `make test-docker-tc`, and `make bench-docker` all remain green and performance stays within the accepted bounds. If removing 3,000 lines would require weakening an invariant or obscuring code, stop for an explicit design review with hotspot and dependency evidence rather than declaring the phase complete or gaming the count.
 
 Testing plan:
-- Existing Docker-gate suites are the regression harness; no new behavior to test beyond bind-test unit coverage.
+- Existing Docker-gate suites remain the primary regression harness; add only focused equivalence or bind-test coverage for changed seams.
+- Before implementation, record categorized main/post-takeover/post-Phase 6 line counts plus a map of policy owners and transaction/recovery paths; use it to choose reductions, not as a retrospective justification.
+- Record categorized before/after line counts, the largest simplified files/paths, structural paths removed, and benchmark medians; reviewer must audit that retained paths have distinct semantics and that deleted tests were redundant rather than unique safety evidence.
 
 Status ledger:
 
@@ -257,5 +273,7 @@ Status ledger:
 | Incomplete | Work | 7C: delete gologger + unused helpers; rename main.go | Missing: deletions (verified unused via grep 2026-07-17). |
 | Incomplete | Work | 7D: endian-safe BPF helpers + byte-array LPM keys | Missing: refactor + bpfeb build check. |
 | Incomplete | Work | 7E: handleDNS single-lock decision helper | Missing: refactor. |
-| Incomplete | Work | 7F: heartbeat/backoff knobs; port bind-test | Missing: implementation. |
-| Incomplete | Gate | Net-negative diff with full gate + bench green | Missing: final run. |
+| Incomplete | Work | 7F: occupied-port bind-test without new configuration growth | Missing: focused implementation and unit coverage. |
+| Incomplete | Work | 7G: evidence-backed Phase 5/post-Phase 6 architecture audit | Baseline `d4f5151^..9f73782`: 10,415 handwritten production additions, 12,540 test additions, 397 generated additions, and 451 schema/docs additions. A 2026-07-19 working-tree audit versus `main` measured +12,801 net handwritten production, +21,596 tests, +1,115 generated, and +1,208 schema/docs lines. Missing: frozen post-Phase 6 baseline, hotspot dependency map, and invariant-to-path inventory. |
+| Incomplete | Work | 7H: consolidate policy ownership and transaction/recovery paths | Missing: one shared mutation/reconcile entry, shared transactional scaffold where semantics match, removal of redundant derived state, and skeptical equivalence review. |
+| Incomplete | Gate | ≥3,000 handwritten production lines removed, 4,000–5,000 working target, structural gate + full Docker gate green | Missing: categorized post-Phase 6 baseline/final diff, structural-path deletion evidence, skeptical safety audit, and final authoritative runs. |

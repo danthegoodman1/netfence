@@ -6,6 +6,7 @@ option go_package = "github.com/danthegoodman1/netfence/api/v1;apiv1";
 
 import "google/protobuf/empty.proto";
 import "google/protobuf/timestamp.proto";
+import "v1/control.proto";
 import "v1/types.proto";
 
 // DaemonService is the local API exposed by the daemon.
@@ -23,6 +24,48 @@ service DaemonService {
 
   // GetStatus returns the current daemon status.
   rpc GetStatus(google.protobuf.Empty) returns (DaemonStatus);
+
+  // ApplyCommand applies one existing policy mutation command locally. The
+  // attachment id and mutation are carried by ControlCommand exactly as they
+  // are on the control-plane stream. Sync/ack variants and unknown commands
+  // are rejected before mutation. BulkUpdate is the complete authoritative
+  // operation and the only local recovery path for stable degradation.
+  rpc ApplyCommand(ControlCommand) returns (google.protobuf.Empty);
+
+  // GetRules returns a serialized snapshot of protected-policy ownership,
+  // expirations, DNS policy, and degradation state for one attachment.
+  rpc GetRules(GetRulesRequest) returns (GetRulesResponse);
+}
+
+message GetRulesRequest { string id = 1; }
+
+// CIDRRule describes one registry entry. policy_owned includes rules received
+// from either the local API or control plane. system_owned identifies daemon
+// infrastructure such as the DNS-listener bootstrap route. A rule can have
+// both owners. expires_at is absent for permanent/non-policy ownership.
+// provisional identifies protected policy re-adopted from pinned kernel maps
+// that has not yet been replaced by a complete authoritative update.
+message CIDRRule {
+  string cidr = 1;
+  RuleList list = 2;
+  bool policy_owned = 3;
+  bool system_owned = 4;
+  google.protobuf.Timestamp expires_at = 5;
+  bool provisional = 6;
+  // installed is the registry's last committed kernel-map state. An installed
+  // rule with neither owner is a failed-removal retry, not desired policy.
+  bool installed = 7;
+}
+
+message GetRulesResponse {
+  string id = 1;
+  PolicyMode mode = 2;
+  repeated CIDRRule cidrs = 3;
+  // Live effective DNS policy, normalized by the daemon. This is configured
+  // policy only; DNS-derived exact-host cache entries are intentionally absent.
+  DnsConfig dns = 4;
+  bool policy_degraded = 5;
+  string policy_degraded_reason = 6;
 }
 
 // AttachRequest specifies what to attach the eBPF filter to.

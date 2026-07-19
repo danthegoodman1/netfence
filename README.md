@@ -4,7 +4,9 @@ _Like Envoy xDS, but for eBPF filters._
 
 Netfence runs as a daemon on your VM/container hosts and automatically injects eBPF filter programs into cgroups and network interfaces, with a built-in DNS server that resolves allowed domains and populates the IP allowlist.
 
-Netfence daemons connect to a central control plane that you implement via gRPC to synchronize allowlists/denylists with your backend.
+Netfence daemons can be driven through their local Unix-socket API alone, or
+connect to a central control plane that you implement via gRPC to synchronize
+allowlists/denylists with your backend.
 
 Your control plane pushes network rules like `ALLOW *.pypi.org` or `ALLOW 10.0.0.0/16` to attached interfaces/cgroups. When a VM/container queries DNS, Netfence resolves it, adds the IPs to the eBPF filter, and drops traffic to unknown IPs before it leaves the host with warmed-path overhead that is effectively indistinguishable from a normal socket connect in current benchmarks.
 
@@ -326,11 +328,14 @@ Stable degraded/interrupted reasons hold packet enforcement in proven
 Independent DNS configuration changes and DNS TTL expiry may continue under
 that proven hold, but cannot clear the stable reason or reactivate packet
 policy. Recovery from a stable reason requires one complete LPM **and** DNS
-desired state: send `BulkUpdate` (or answer a restored attachment's fresh
-`Subscribed` with `SubscribedAck`). Netfence stages the full protected state,
+desired state: apply `BulkUpdate` through the control plane or local API (or
+answer a restored attachment's fresh `Subscribed` with `SubscribedAck`).
+Netfence stages the full protected state,
 applies the authoritative DNS state, activates the requested mode, and clears
 the durable reason only after every step succeeds. Prefer a unique `command_id`
-on recovery `BulkUpdate` and require a successful `CommandResult`.
+on a control-plane recovery `BulkUpdate` and require a successful
+`CommandResult`; the local API rejects `command_id` because its unary RPC result
+already reports success or failure.
 
 Heartbeats expose current physical entries, hard capacity, and
 daemon-generation high-water independently for all four protected maps. The
@@ -348,8 +353,8 @@ restart rather than assuming enforcement reopened.
 ## Per host
 
 Run the daemon, which:
-- Exposes a local gRPC API (`DaemonService`) for attaching/detaching filters
-- Connects to your control plane via bidirectional stream (`ControlPlane.Connect`)
+- Exposes a local gRPC API (`DaemonService`) for attachments, policy, and inspection
+- Optionally connects to your control plane via bidirectional stream (`ControlPlane.Connect`)
 - Loads and manages eBPF programs
 
 **Start the daemon:**
@@ -367,6 +372,38 @@ netfenced start --config /etc/netfence/config.yaml
 ```bash
 netfenced status
 ```
+
+With no `control_plane.url`, a new attachment commits in disabled packet/DNS
+mode and can be configured immediately through the local API or CLI. No
+control-plane process is required for the standalone workflow documented under
+“Per attachment.”
+
+### Local Unix-socket trust boundary
+
+The local gRPC API has no per-RPC authentication. Filesystem access to its Unix
+socket is the authorization boundary, and every process that can connect is a
+fully trusted host-network administrator: it can attach or detach host eBPF
+programs, replace packet and DNS policy, and open or close workload traffic.
+Keep socket-group membership narrow and protect the socket's parent directory.
+
+```yaml
+# Defaults to /var/run/netfence.sock.
+socket: /run/netfence/netfence.sock
+# Unix group name or numeric GID. Empty/unset uses the daemon's effective GID.
+socket_group: netfence-admin
+```
+
+`NETFENCE_SOCKET` and `NETFENCE_SOCKET_GROUP` are the equivalent environment
+variables. At startup the daemon binds the socket in a private staging
+directory, sets its group and mode `0660` while it is unreachable, and then
+publishes it atomically. The daemon removes any pre-existing Unix socket at the
+configured target—it does not distinguish a stale socket from one owned by
+another live daemon—so exactly one daemon must own a socket path. It refuses to
+remove a non-socket target. On Linux, no-replace rename prevents overwriting a
+new path created after that removal; shutdown removes the published path only
+while it still identifies the daemon's own socket inode. An invalid group,
+ownership/mode failure, or non-socket target fails startup without publishing a
+permissive endpoint.
 
 ### Control-plane transport security (TLS / mTLS / bearer token)
 
@@ -525,15 +562,19 @@ Notes on re-adopted state:
   removes keys left ownerless, and preserves a key only when it separately has
   a normal live owner. A non-canonical/colliding inventory aborts restore
   without guessing or partially publishing ownership metadata.
-- If no control plane is configured or reachable, no automatic rule changes
-  occur: an adopted pinned map continues enforcing its last-known contents. A
-  restore that cannot adopt valid pins recreates the attachment in its
-  persisted mode with empty maps (fail-closed for allowlist/block-all) and
-  uses the same `SubscribedAck` handshake to repopulate it.
-- DNS domain rules and per-attachment upstream overrides are authoritative
-  control-plane state and are not persisted. A restored attachment whose last
-  DNS mode was ALLOWLIST, DENYLIST, or PROXY starts its resolver in an empty
-  ALLOWLIST posture, returning `REFUSED` until a valid complete
+- There is no persisted local desired-state document. If no control plane is
+  configured or reachable, no automatic rule changes occur: an adopted pinned
+  map continues enforcing its last-known protected CIDRs, represented in the
+  userspace registry as provisional until a complete update. A restore that
+  cannot adopt valid pins recreates the attachment in its persisted mode with
+  empty maps (fail-closed for allowlist/block-all). A standalone orchestrator
+  must replay `netfenced apply-rules` after every daemon restart to replace the
+  provisional packet state and restore its complete desired state and TTLs.
+- DNS domain rules, per-attachment upstream overrides, and attachment DNS
+  limits are runtime desired state supplied through either the local API or
+  control plane; they are not persisted. A restored attachment whose last DNS
+  mode was ALLOWLIST, DENYLIST, or PROXY starts its resolver in an empty
+  ALLOWLIST posture, returning `REFUSED` until a complete `BulkUpdate` or
   `SubscribedAck` applies. An explicitly DISABLED DNS mode remains forwarding.
   If either committed UDP/TCP listener later dies unexpectedly, the attachment
   is quarantined in IP `BLOCK_ALL` and reported as an error unsubscribe.
@@ -580,9 +621,16 @@ side of the link the interface is on:
 Direction only applies to interface (TC) attachments; it is ignored for
 cgroup attachments.
 
-- Daemon attaches eBPF filter to the target
-- Daemon sends `Subscribed{id, target, type, metadata}` to the control plane and waits for `SubscribedAck` with initial config (mode, CIDRs, DNS rules)
-- If the control plane doesn't respond within the timeout (default 5s, configurable via `control_plane.subscribe_ack_timeout`), the attachment is rolled back and the attach call fails. Validation and other pre-commit failures follow the same ordinary rollback rule.
+- Daemon attaches an eBPF filter to the target.
+- When `control_plane.url` is configured, the daemon sends
+  `Subscribed{id, target, type, metadata}` and waits for `SubscribedAck` with
+  initial config (mode, CIDRs, DNS rules). If the control plane does not respond
+  within the timeout (default 5s, configurable via
+  `control_plane.subscribe_ack_timeout`), the attachment is rolled back and the
+  attach call fails. Validation and other pre-commit failures follow the same
+  ordinary rollback rule.
+- With no control plane configured, attach commits immediately in disabled mode;
+  use the local policy commands below to configure it.
 - A valid initial policy that reaches a protected-map/store failure is the deliberate committed-error exception: the daemon retains the attachment in durable `BLOCK_ALL` instead of destructively rolling it back. With a bounded timeout, `Attach` returns an error containing the retained attachment ID; the caller can discover that ID by matching the target in `List`, and the control plane must recover it with a complete `BulkUpdate`.
 - With `subscribe_ack_timeout: 0`, a new `Attach` returns after queuing
   `Subscribed`; a later ack is still validated and applied. This zero value
@@ -615,6 +663,86 @@ netfenced list
 netfenced list --all  # fetch all pages
 ```
 
+### Local policy and inspection
+
+Every local mutation is a thin CLI encoding of the single
+`DaemonService.ApplyCommand(ControlCommand)` RPC. Supply the attachment ID
+returned by `attach`:
+
+```bash
+# Packet policy and protected CIDRs.
+netfenced set-mode <id> allowlist
+netfenced allow-cidr <id> 10.0.0.0/8
+netfenced allow-cidr <id> 192.0.2.10/32 --ttl 5m
+netfenced deny-cidr <id> 10.20.0.0/16
+netfenced remove-cidr <id> 10.20.0.0/16 --list deny
+# --list accepts allow, deny, or both (the default).
+
+# DNS policy.
+netfenced set-dns-mode <id> denylist
+netfenced allow-domain <id> example.com --subdomains
+netfenced deny-domain <id> blocked.example.com
+netfenced remove-domain <id> blocked.example.com
+
+# Deterministic current-policy inspection as protobuf JSON.
+netfenced rules <id>
+```
+
+Packet modes are `disabled`, `allowlist`, `denylist`, and `block-all`; DNS modes
+are `disabled`, `allowlist`, `denylist`, and `proxy`. DNS `proxy` requires a
+reachable configured control plane. Domain matching uses the most-specific
+matching suffix; when equally specific allow and deny rules both match, deny
+wins. CIDRs and domains are canonicalized. Negative, malformed, or otherwise
+invalid TTLs, enums, CIDRs, domains, selectors, and nested messages are rejected
+before mutation, so an invalid command is a policy no-op.
+
+For a complete replacement, `apply-rules` reads the existing `BulkUpdate`
+protobuf JSON shape from a file or stdin:
+
+```bash
+cat >rules.json <<'JSON'
+{
+  "mode": "POLICY_MODE_ALLOWLIST",
+  "allowCidrs": [{"cidr": "10.0.0.0/8"}],
+  "dns": {
+    "mode": "DNS_MODE_DENYLIST",
+    "denyDomains": [{"domain": "blocked.example.com", "includeSubdomains": true}]
+  }
+}
+JSON
+netfenced apply-rules <id> --file rules.json
+# Equivalent stdin form:
+netfenced apply-rules <id> --file - < rules.json
+```
+
+`ApplyCommand` accepts only `SetMode`, `AllowCIDR`, `DenyCIDR`, `RemoveCIDR`,
+`BulkUpdate`, `SetDnsMode`, `AllowDomain`, `DenyDomain`, and `RemoveDomain`.
+Stream-only sync/ack variants, unknown or empty commands, and local
+`command_id` values are rejected. `BulkUpdate` is also the only local operation
+that can recover a stable degraded packet policy; it must contain the complete
+LPM and DNS desired state.
+
+The optional `ControlCommand.remove_cidr_list` selector can target the allow
+list, deny list, or both when the command variant is `RemoveCIDR`. Its legacy
+unspecified value and explicit `BOTH` both remove from both lists, preserving
+the original protocol behavior.
+
+Local and control-plane mutations share one parser, mutation barrier, TTL
+registry, fail-closed recovery path, and policy owner. There is deliberately no
+local-versus-control-plane ownership arbitration: conflicting operations on an
+individual policy list take effect in their committed order, regardless of
+source. In particular, a later complete control-plane `BulkUpdate` or
+`SubscribedAck` can replace local state.
+
+`GetRules`/`netfenced rules` returns a coherent, deterministic userspace
+registry snapshot. Each CIDR reports allow/deny list, local-or-control-plane
+`policyOwned`, daemon `systemOwned`, absolute `expiresAt`, restored
+`provisional`, and last committed kernel `installed` state. An installed entry
+with neither owner is a failed-removal retry, not desired policy. DNS output is
+the live, normalized effective `DnsConfig`. Inspection intentionally does not
+enumerate protected kernel maps or expose dynamically resolved DNS exact-host
+cache entries; use heartbeat telemetry for protected-map occupancy.
+
 ## On the control plane (you implement this)
 
 Implement `ControlPlane.Connect` RPC - a bidirectional stream:
@@ -643,9 +771,11 @@ grpc.NewServer(grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
 - `SyncAck` after receiving SyncRequest
 - `SubscribedAck{mode, cidrs, dns_config}` after receiving Subscribed (required - daemon waits for this)
 - `SetMode{mode}` - change IP filter policy mode
-- `AllowCIDR{cidr, ttl}` / `DenyCIDR` / `RemoveCIDR`
+- `AllowCIDR{cidr, ttl}` / `DenyCIDR` / `RemoveCIDR` (optionally select
+  allow, deny, or both; unspecified retains legacy “both” behavior)
 - `SetDnsMode{mode}` - change DNS filtering mode
-- `AllowDomain{domain}` / `DenyDomain` / `RemoveDomain`
+- `AllowDomain{domain}` / `DenyDomain` / `RemoveDomain` (most-specific match
+  wins; deny wins an equal-specificity tie)
 - `BulkUpdate{mode, cidrs, dns_config}` - full state sync
 
 When the control plane receives `Subscribed`, it must reply with a complete

@@ -60,3 +60,13 @@ enum DnsMode {
   // Proxy - forward all queries to control plane for decision
   DNS_MODE_PROXY = 4;
 }
+
+// RuleList identifies one protected CIDR policy list. UNSPECIFIED is used by
+// remove operations to preserve the legacy behavior of removing the CIDR from
+// both lists. BOTH is its explicit spelling for new clients.
+enum RuleList {
+  RULE_LIST_UNSPECIFIED = 0;
+  RULE_LIST_ALLOW = 1;
+  RULE_LIST_DENY = 2;
+  RULE_LIST_BOTH = 3;
+}

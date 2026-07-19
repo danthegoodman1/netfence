@@ -16,7 +16,10 @@ type Config struct {
 	DataDir      string             `mapstructure:"data_dir"`
 	LogLevel     string             `mapstructure:"log_level"`
 	Socket       string             `mapstructure:"socket"`
-	Metadata     map[string]string  `mapstructure:"metadata"`
+	// SocketGroup is the Unix group name or numeric GID allowed to use the
+	// mode-0660 local control socket. Empty keeps the daemon's effective GID.
+	SocketGroup string            `mapstructure:"socket_group"`
+	Metadata    map[string]string `mapstructure:"metadata"`
 	// TTLJanitorInterval is how often the daemon scans attachments for
 	// expired TTL'd rules and removes them from the eBPF filters. It bounds
 	// how long past its TTL an entry can linger. Zero (or unset) falls back
@@ -165,6 +168,7 @@ func Load(configPath string) (*Config, error) {
 	v.SetDefault("dns.upstream", "8.8.8.8:53")
 	v.SetDefault("log_level", "info")
 	v.SetDefault("socket", "/var/run/netfence.sock")
+	v.SetDefault("socket_group", "")
 	v.SetDefault("dns.min_filter_ttl", 60*time.Second)
 	v.SetDefault("dns.max_churn_units", 8192)
 	v.SetDefault("dns.churn_window", time.Minute)

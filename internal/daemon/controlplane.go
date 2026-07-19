@@ -802,96 +802,6 @@ func (c *ControlPlaneClient) handleCommandForEpoch(cmd *apiv1.ControlCommand, ep
 		c.logger.Debug().Msg("received sync ack")
 		reportResult = false
 
-	case *apiv1.ControlCommand_SetMode:
-		c.logger.Debug().Str("id", cmd.Id).Str("mode", v.SetMode.Mode.String()).Msg("received set mode")
-		if err = c.server.SetFilterMode(cmd.Id, v.SetMode.Mode); err != nil {
-			if !isReportedProtectedPressure(err) {
-				c.logger.Error().Err(err).Str("id", cmd.Id).Msg("failed to set filter mode")
-			}
-			err = fmt.Errorf("setting filter mode: %w", err)
-		}
-
-	case *apiv1.ControlCommand_AllowCidr:
-		c.logger.Debug().Str("id", cmd.Id).Str("cidr", v.AllowCidr.Cidr).Msg("received allow cidr")
-		cidr, parseErr := filter.ParseCIDR(v.AllowCidr.Cidr)
-		if parseErr != nil {
-			c.logger.Error().Err(parseErr).Str("id", cmd.Id).Str("cidr", v.AllowCidr.Cidr).Msg("failed to parse CIDR")
-			err = fmt.Errorf("parsing CIDR %q: %w", v.AllowCidr.Cidr, parseErr)
-		} else if err = c.server.AllowCIDR(cmd.Id, cidr, v.AllowCidr.GetTtl().AsDuration()); err != nil {
-			if !isReportedProtectedPressure(err) {
-				c.logger.Error().Err(err).Str("id", cmd.Id).Msg("failed to allow CIDR")
-			}
-			err = fmt.Errorf("allowing CIDR %q: %w", v.AllowCidr.Cidr, err)
-		}
-
-	case *apiv1.ControlCommand_DenyCidr:
-		c.logger.Debug().Str("id", cmd.Id).Str("cidr", v.DenyCidr.Cidr).Msg("received deny cidr")
-		cidr, parseErr := filter.ParseCIDR(v.DenyCidr.Cidr)
-		if parseErr != nil {
-			c.logger.Error().Err(parseErr).Str("id", cmd.Id).Str("cidr", v.DenyCidr.Cidr).Msg("failed to parse CIDR")
-			err = fmt.Errorf("parsing CIDR %q: %w", v.DenyCidr.Cidr, parseErr)
-		} else if err = c.server.DenyCIDR(cmd.Id, cidr, v.DenyCidr.GetTtl().AsDuration()); err != nil {
-			if !isReportedProtectedPressure(err) {
-				c.logger.Error().Err(err).Str("id", cmd.Id).Msg("failed to deny CIDR")
-			}
-			err = fmt.Errorf("denying CIDR %q: %w", v.DenyCidr.Cidr, err)
-		}
-
-	case *apiv1.ControlCommand_RemoveCidr:
-		c.logger.Debug().Str("id", cmd.Id).Str("cidr", v.RemoveCidr).Msg("received remove cidr")
-		cidr, parseErr := filter.ParseCIDR(v.RemoveCidr)
-		if parseErr != nil {
-			c.logger.Error().Err(parseErr).Str("id", cmd.Id).Str("cidr", v.RemoveCidr).Msg("failed to parse CIDR")
-			err = fmt.Errorf("parsing CIDR %q: %w", v.RemoveCidr, parseErr)
-			break
-		}
-		var allowErr, denyErr error
-		if allowErr = c.server.RemoveAllowedCIDR(cmd.Id, cidr); allowErr != nil {
-			if !isReportedProtectedPressure(allowErr) {
-				c.logger.Warn().Err(allowErr).Str("id", cmd.Id).Msg("failed to remove CIDR from allowlist")
-			}
-			allowErr = fmt.Errorf("removing from allowlist: %w", allowErr)
-		}
-		if denyErr = c.server.RemoveDeniedCIDR(cmd.Id, cidr); denyErr != nil {
-			if !isReportedProtectedPressure(denyErr) {
-				c.logger.Warn().Err(denyErr).Str("id", cmd.Id).Msg("failed to remove CIDR from denylist")
-			}
-			denyErr = fmt.Errorf("removing from denylist: %w", denyErr)
-		}
-		err = errors.Join(allowErr, denyErr)
-
-	case *apiv1.ControlCommand_BulkUpdate:
-		c.logger.Debug().Str("id", cmd.Id).Msg("received bulk update")
-		err = c.applyBulkUpdate(cmd.Id, v.BulkUpdate)
-
-	case *apiv1.ControlCommand_SetDnsMode:
-		c.logger.Debug().Str("id", cmd.Id).Str("mode", v.SetDnsMode.Mode.String()).Msg("received set dns mode")
-		if err = c.server.SetDnsMode(cmd.Id, v.SetDnsMode.Mode); err != nil {
-			c.logger.Error().Err(err).Str("id", cmd.Id).Msg("failed to set dns mode")
-			err = fmt.Errorf("setting DNS mode: %w", err)
-		}
-
-	case *apiv1.ControlCommand_AllowDomain:
-		c.logger.Debug().Str("id", cmd.Id).Str("domain", v.AllowDomain.Domain).Msg("received allow domain")
-		if err = c.server.AllowDomain(cmd.Id, v.AllowDomain.Domain, v.AllowDomain.IncludeSubdomains); err != nil {
-			c.logger.Error().Err(err).Str("id", cmd.Id).Msg("failed to allow domain")
-			err = fmt.Errorf("allowing domain %q: %w", v.AllowDomain.Domain, err)
-		}
-
-	case *apiv1.ControlCommand_DenyDomain:
-		c.logger.Debug().Str("id", cmd.Id).Str("domain", v.DenyDomain.Domain).Msg("received deny domain")
-		if err = c.server.DenyDomain(cmd.Id, v.DenyDomain.Domain, v.DenyDomain.IncludeSubdomains); err != nil {
-			c.logger.Error().Err(err).Str("id", cmd.Id).Msg("failed to deny domain")
-			err = fmt.Errorf("denying domain %q: %w", v.DenyDomain.Domain, err)
-		}
-
-	case *apiv1.ControlCommand_RemoveDomain:
-		c.logger.Debug().Str("id", cmd.Id).Str("domain", v.RemoveDomain).Msg("received remove domain")
-		if err = c.server.RemoveDomain(cmd.Id, v.RemoveDomain); err != nil {
-			c.logger.Error().Err(err).Str("id", cmd.Id).Msg("failed to remove domain")
-			err = fmt.Errorf("removing domain %q: %w", v.RemoveDomain, err)
-		}
-
 	case *apiv1.ControlCommand_SubscribedAck:
 		c.logger.Debug().Str("id", cmd.Id).Msg("received subscribed ack")
 		reportResult = false
@@ -919,8 +829,10 @@ func (c *ControlPlaneClient) handleCommandForEpoch(cmd *apiv1.ControlCommand, ep
 		}
 
 	default:
-		c.logger.Warn().Str("id", cmd.Id).Msg("received unknown command")
-		err = fmt.Errorf("unknown command type")
+		err = c.server.ApplyPolicyCommand(cmd)
+		if err != nil && !isReportedProtectedPressure(err) {
+			c.logger.Error().Err(err).Str("id", cmd.Id).Msg("failed to apply policy command")
+		}
 	}
 
 	if reportResult {
@@ -1161,7 +1073,7 @@ func (c *ControlPlaneClient) validateSubscribedAck(id string, ack *apiv1.Subscri
 		dnsLimitOverridesFromProto(dnsConfig), churnCeiling, dnsConfig.MaxChurnUnits); err != nil {
 		return fmt.Errorf("validating DNS configuration: %w", err)
 	}
-	_, _, err = c.parseBulkCIDRs(id, &apiv1.BulkUpdate{
+	_, _, err = c.server.parseBulkCIDRs(id, &apiv1.BulkUpdate{
 		Mode:       ack.Mode,
 		AllowCidrs: ack.AllowCidrs,
 		DenyCidrs:  ack.DenyCidrs,
@@ -1186,7 +1098,15 @@ func (c *ControlPlaneClient) applySubscribedAck(id string, ack *apiv1.Subscribed
 	})
 }
 
-// applyBulkUpdate reconciles the attachment to the declared state with
+// applyBulkUpdate routes control-plane complete state through the same server
+// transaction used by the local API. Keeping this wrapper preserves the
+// control-plane command boundary (and its focused tests) without duplicating
+// any validation, fail-closed staging, DNS, or recovery behavior.
+func (c *ControlPlaneClient) applyBulkUpdate(id string, update *apiv1.BulkUpdate) error {
+	return c.server.ApplyRules(id, update)
+}
+
+// ApplyRules reconciles the attachment to the declared state with
 // add/remove deltas instead of the old wipe-then-rebuild: a rule present in
 // both the old and new state is never removed from the kernel map, so a
 // control-plane resync opens no transient allow/block window. CIDR reconcile
@@ -1195,62 +1115,95 @@ func (c *ControlPlaneClient) applySubscribedAck(id string, ack *apiv1.Subscribed
 // promptly removes blocked or provisional keys. Any validation/parse error
 // aborts BEFORE any mutation. The returned error aggregates every failed step
 // — a partially-applied bulk update is a failure, never reported as success.
-func (c *ControlPlaneClient) applyBulkUpdate(id string, update *apiv1.BulkUpdate) error {
+func (s *Server) ApplyRules(id string, update *apiv1.BulkUpdate) error {
+	prepared, err := s.prepareBulkUpdate(id, update)
+	if err != nil {
+		return err
+	}
+	return s.applyPreparedRules(id, prepared)
+}
+
+type preparedBulkUpdate struct {
+	update      *apiv1.BulkUpdate
+	preparedDNS *preparedDNSRules
+	allowCIDRs  []parsedCIDR
+	denyCIDRs   []parsedCIDR
+}
+
+// prepareBulkUpdate validates every nested field before attachment mutation
+// admission. It is shared by stream and local commands; applyPreparedRules is
+// the only mutating authoritative implementation.
+func (s *Server) prepareBulkUpdate(id string, update *apiv1.BulkUpdate) (*preparedBulkUpdate, error) {
 	if update == nil {
-		return fmt.Errorf("bulk update is nil")
+		return nil, fmt.Errorf("bulk update is nil")
 	}
 	if err := validateFullDesiredModes(update.Mode, update.Dns); err != nil {
-		return err
+		return nil, err
+	}
+	allowCIDRs, denyCIDRs, err := s.parseBulkCIDRs(id, update)
+	if err != nil {
+		return nil, err
 	}
 	dnsConfig := update.Dns
 	if dnsConfig == nil {
 		dnsConfig = &apiv1.DnsConfig{Mode: apiv1.DnsMode_DNS_MODE_DISABLED}
 	}
-	dnsCeilings, err := c.server.dnsLimitCeilingsForAttachment(id)
+	dnsCeilings, err := s.dnsLimitCeilingsForAttachment(id)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	dnsChurnCeiling, err := c.server.dnsChurnCeilingForAttachment(id)
+	dnsChurnCeiling, err := s.dnsChurnCeilingForAttachment(id)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	preparedDNS, err := prepareDNSRules(dnsConfig.Mode, dnsConfig.AllowDomains, dnsConfig.DenyDomains,
-		dnsConfig.UpstreamServers, c.server.defaultDNSUpstream, dnsCeilings,
+		dnsConfig.UpstreamServers, s.defaultDNSUpstream, dnsCeilings,
 		dnsLimitOverridesFromProto(dnsConfig), dnsChurnCeiling, dnsConfig.MaxChurnUnits)
 	if err != nil {
-		return fmt.Errorf("validating DNS configuration: %w", err)
+		return nil, fmt.Errorf("validating DNS configuration: %w", err)
 	}
-	allowCIDRs, denyCIDRs, parseErr := c.parseBulkCIDRs(id, update)
-	if parseErr != nil {
-		return parseErr
+	return &preparedBulkUpdate{
+		update:      update,
+		preparedDNS: preparedDNS,
+		allowCIDRs:  allowCIDRs,
+		denyCIDRs:   denyCIDRs,
+	}, nil
+}
+
+func (s *Server) applyPreparedRules(id string, prepared *preparedBulkUpdate) error {
+	if prepared == nil || prepared.update == nil || prepared.preparedDNS == nil {
+		return fmt.Errorf("prepared bulk update is nil")
 	}
-	state, done, admissionErr := c.server.beginAttachmentMutation(id)
+	update := prepared.update
+	preparedDNS := prepared.preparedDNS
+	allowCIDRs, denyCIDRs := prepared.allowCIDRs, prepared.denyCIDRs
+	state, done, admissionErr := s.beginAttachmentMutation(id)
 	if admissionErr != nil {
 		return admissionErr
 	}
 	if state.dns != nil {
 		if preflightErr := state.dns.preflightPreparedRules(preparedDNS); preflightErr != nil {
-			return c.server.finishDNSMutation(state, done, fmt.Errorf("preflighting DNS configuration: %w", preflightErr))
+			return s.finishDNSMutation(state, done, fmt.Errorf("preflighting DNS configuration: %w", preflightErr))
 		}
 	}
 
 	// ReconcileCIDRs owns the mode write too, sandwiching it between the
 	// two list reconciles (new mode's list first) so no mode pair opens a
 	// transient allow/block window — see its doc comment.
-	degradedActivationHeld, holdErr := c.server.holdAuthoritativeRecoveryIfNeededAdmitted(id, state)
+	degradedActivationHeld, holdErr := s.holdAuthoritativeRecoveryIfNeededAdmitted(id, state)
 	if holdErr != nil {
-		return c.server.finishDNSMutation(state, done, fmt.Errorf("preparing authoritative BLOCK_ALL recovery hold: %w", holdErr))
+		return s.finishDNSMutation(state, done, fmt.Errorf("preparing authoritative BLOCK_ALL recovery hold: %w", holdErr))
 	}
-	degradedActivationHeld, reconcileErr := c.server.stageAuthoritativeCIDRsAdmitted(id, state, update.Mode, allowCIDRs, denyCIDRs, degradedActivationHeld)
+	degradedActivationHeld, reconcileErr := s.stageAuthoritativeCIDRsAdmitted(id, state, update.Mode, allowCIDRs, denyCIDRs, degradedActivationHeld)
 	if reconcileErr != nil {
 		if !errors.Is(reconcileErr, errProtectedPolicyDurablyDegraded) {
-			c.logger.Error().Err(reconcileErr).Str("id", id).Msg("failed to reconcile CIDRs in bulk update")
+			s.logger.Error().Err(reconcileErr).Str("id", id).Msg("failed to reconcile CIDRs in bulk update")
 		}
 		reconcileErr = fmt.Errorf("reconciling CIDRs: %w", reconcileErr)
 		// A valid protected-policy projection that cannot complete is now
 		// durable BLOCK_ALL. Do not apply the DNS half of the authoritative
 		// update or claim partial recovery; a later complete retry owns both.
-		return c.server.finishDNSMutation(state, done, reconcileErr)
+		return s.finishDNSMutation(state, done, reconcileErr)
 	}
 
 	// Apply the prepared authoritative DNS state after the CIDR delta. The
@@ -1259,28 +1212,28 @@ func (c *ControlPlaneClient) applyBulkUpdate(id string, update *apiv1.BulkUpdate
 	// whose queries no longer have an authorizing policy owner.
 	var dnsErr error
 	if update.Dns == nil {
-		if dnsErr = c.server.replaceDNSPreparedAdmitted(id, state, preparedDNS); dnsErr != nil {
-			c.logger.Error().Err(dnsErr).Str("id", id).Msg("failed to clear DNS rules in bulk update")
+		if dnsErr = s.replaceDNSPreparedAdmitted(id, state, preparedDNS); dnsErr != nil {
+			s.logger.Error().Err(dnsErr).Str("id", id).Msg("failed to clear DNS rules in bulk update")
 			dnsErr = fmt.Errorf("clearing DNS rules: %w", dnsErr)
 		}
-	} else if dnsErr = c.server.replaceDNSPreparedAdmitted(id, state, preparedDNS); dnsErr != nil {
-		c.logger.Error().Err(dnsErr).Str("id", id).Msg("failed to replace DNS rules in bulk update")
+	} else if dnsErr = s.replaceDNSPreparedAdmitted(id, state, preparedDNS); dnsErr != nil {
+		s.logger.Error().Err(dnsErr).Str("id", id).Msg("failed to replace DNS rules in bulk update")
 		dnsErr = fmt.Errorf("replacing DNS rules: %w", dnsErr)
 	}
 	if dnsErr != nil && degradedActivationHeld {
 		// The pre-existing durable marker and effective BLOCK_ALL intentionally
 		// remain until a later complete retry succeeds. Convert a transient
 		// in-progress marker to the stable failure reason before returning.
-		degradeErr := c.server.enterPolicyDegradedAdmitted(id, state, policyDegradedAuthoritative, dnsErr)
-		return c.server.finishDNSMutation(state, done, errors.Join(dnsErr, degradeErr))
+		degradeErr := s.enterPolicyDegradedAdmitted(id, state, policyDegradedAuthoritative, dnsErr)
+		return s.finishDNSMutation(state, done, errors.Join(dnsErr, degradeErr))
 	}
 	if degradedActivationHeld {
-		if activationErr := c.server.activateAuthoritativePolicyAdmitted(id, state, update.Mode); activationErr != nil {
-			return c.server.finishDNSMutation(state, done, fmt.Errorf("activating recovered protected policy: %w", activationErr))
+		if activationErr := s.activateAuthoritativePolicyAdmitted(id, state, update.Mode); activationErr != nil {
+			return s.finishDNSMutation(state, done, fmt.Errorf("activating recovered protected policy: %w", activationErr))
 		}
 	}
 
-	return c.server.finishDNSMutation(state, done, errors.Join(reconcileErr, dnsErr))
+	return s.finishDNSMutation(state, done, errors.Join(reconcileErr, dnsErr))
 }
 
 // validateFullDesiredModes rejects unknown/UNSPECIFIED enum values before an
@@ -1317,21 +1270,42 @@ type parsedCIDR struct {
 	ttl  time.Duration
 }
 
+// parseIncrementalCIDREntry is shared by control-plane and local unary
+// mutation paths. Validation is deliberately complete before either path
+// enters attachment mutation admission: nil entries, malformed CIDRs, and
+// negative/non-round-trippable protobuf durations are true no-ops. In
+// particular, a malformed negative TTL must never be coerced to the
+// incremental API's ttl<=0 permanent meaning.
+func parseIncrementalCIDREntry(entry *apiv1.CIDREntry) (*net.IPNet, time.Duration, error) {
+	if entry == nil {
+		return nil, 0, fmt.Errorf("CIDR entry is required")
+	}
+	cidr, err := filter.ParseCIDR(entry.Cidr)
+	if err != nil {
+		return nil, 0, fmt.Errorf("parsing CIDR: %w", err)
+	}
+	ttl, err := exactNonNegativeDuration(entry.Ttl)
+	if err != nil {
+		return nil, 0, fmt.Errorf("invalid TTL: %w", err)
+	}
+	return cidr, ttl, nil
+}
+
 // parseBulkCIDRs parses both CIDR lists up front; any invalid entry fails
 // the whole bulk update before anything is mutated.
-func (c *ControlPlaneClient) parseBulkCIDRs(id string, update *apiv1.BulkUpdate) (allowCIDRs, denyCIDRs []parsedCIDR, err error) {
-	allowCIDRs, err = c.parseDesiredCIDRs(id, "allow", update.AllowCidrs)
+func (s *Server) parseBulkCIDRs(id string, update *apiv1.BulkUpdate) (allowCIDRs, denyCIDRs []parsedCIDR, err error) {
+	allowCIDRs, err = s.parseDesiredCIDRs(id, "allow", update.AllowCidrs)
 	if err != nil {
 		return nil, nil, err
 	}
-	denyCIDRs, err = c.parseDesiredCIDRs(id, "deny", update.DenyCidrs)
+	denyCIDRs, err = s.parseDesiredCIDRs(id, "deny", update.DenyCidrs)
 	if err != nil {
 		return nil, nil, err
 	}
 	return allowCIDRs, denyCIDRs, nil
 }
 
-func (c *ControlPlaneClient) parseDesiredCIDRs(id, list string, entries []*apiv1.CIDREntry) ([]parsedCIDR, error) {
+func (s *Server) parseDesiredCIDRs(id, list string, entries []*apiv1.CIDREntry) ([]parsedCIDR, error) {
 	parsed := make([]parsedCIDR, 0, len(entries))
 	seen := make(map[string]struct{}, len(entries))
 	for i, entry := range entries {
@@ -1340,7 +1314,7 @@ func (c *ControlPlaneClient) parseDesiredCIDRs(id, list string, entries []*apiv1
 		}
 		cidr, err := filter.ParseCIDR(entry.Cidr)
 		if err != nil {
-			c.logger.Error().Err(err).Str("id", id).Str("cidr", entry.Cidr).
+			s.logger.Error().Err(err).Str("id", id).Str("cidr", entry.Cidr).
 				Msg("failed to parse CIDR in full desired state")
 			return nil, fmt.Errorf("parsing %s CIDR %q: %w", list, entry.Cidr, err)
 		}

@@ -76,6 +76,236 @@ func (ConnectionState) EnumDescriptor() ([]byte, []int) {
 	return file_v1_daemon_proto_rawDescGZIP(), []int{0}
 }
 
+type GetRulesRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Id            string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetRulesRequest) Reset() {
+	*x = GetRulesRequest{}
+	mi := &file_v1_daemon_proto_msgTypes[0]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetRulesRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetRulesRequest) ProtoMessage() {}
+
+func (x *GetRulesRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_v1_daemon_proto_msgTypes[0]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetRulesRequest.ProtoReflect.Descriptor instead.
+func (*GetRulesRequest) Descriptor() ([]byte, []int) {
+	return file_v1_daemon_proto_rawDescGZIP(), []int{0}
+}
+
+func (x *GetRulesRequest) GetId() string {
+	if x != nil {
+		return x.Id
+	}
+	return ""
+}
+
+// CIDRRule describes one registry entry. policy_owned includes rules received
+// from either the local API or control plane. system_owned identifies daemon
+// infrastructure such as the DNS-listener bootstrap route. A rule can have
+// both owners. expires_at is absent for permanent/non-policy ownership.
+// provisional identifies protected policy re-adopted from pinned kernel maps
+// that has not yet been replaced by a complete authoritative update.
+type CIDRRule struct {
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	Cidr        string                 `protobuf:"bytes,1,opt,name=cidr,proto3" json:"cidr,omitempty"`
+	List        RuleList               `protobuf:"varint,2,opt,name=list,proto3,enum=netfence.v1.RuleList" json:"list,omitempty"`
+	PolicyOwned bool                   `protobuf:"varint,3,opt,name=policy_owned,json=policyOwned,proto3" json:"policy_owned,omitempty"`
+	SystemOwned bool                   `protobuf:"varint,4,opt,name=system_owned,json=systemOwned,proto3" json:"system_owned,omitempty"`
+	ExpiresAt   *timestamppb.Timestamp `protobuf:"bytes,5,opt,name=expires_at,json=expiresAt,proto3" json:"expires_at,omitempty"`
+	Provisional bool                   `protobuf:"varint,6,opt,name=provisional,proto3" json:"provisional,omitempty"`
+	// installed is the registry's last committed kernel-map state. An installed
+	// rule with neither owner is a failed-removal retry, not desired policy.
+	Installed     bool `protobuf:"varint,7,opt,name=installed,proto3" json:"installed,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CIDRRule) Reset() {
+	*x = CIDRRule{}
+	mi := &file_v1_daemon_proto_msgTypes[1]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CIDRRule) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CIDRRule) ProtoMessage() {}
+
+func (x *CIDRRule) ProtoReflect() protoreflect.Message {
+	mi := &file_v1_daemon_proto_msgTypes[1]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CIDRRule.ProtoReflect.Descriptor instead.
+func (*CIDRRule) Descriptor() ([]byte, []int) {
+	return file_v1_daemon_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *CIDRRule) GetCidr() string {
+	if x != nil {
+		return x.Cidr
+	}
+	return ""
+}
+
+func (x *CIDRRule) GetList() RuleList {
+	if x != nil {
+		return x.List
+	}
+	return RuleList_RULE_LIST_UNSPECIFIED
+}
+
+func (x *CIDRRule) GetPolicyOwned() bool {
+	if x != nil {
+		return x.PolicyOwned
+	}
+	return false
+}
+
+func (x *CIDRRule) GetSystemOwned() bool {
+	if x != nil {
+		return x.SystemOwned
+	}
+	return false
+}
+
+func (x *CIDRRule) GetExpiresAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.ExpiresAt
+	}
+	return nil
+}
+
+func (x *CIDRRule) GetProvisional() bool {
+	if x != nil {
+		return x.Provisional
+	}
+	return false
+}
+
+func (x *CIDRRule) GetInstalled() bool {
+	if x != nil {
+		return x.Installed
+	}
+	return false
+}
+
+type GetRulesResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Id    string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	Mode  PolicyMode             `protobuf:"varint,2,opt,name=mode,proto3,enum=netfence.v1.PolicyMode" json:"mode,omitempty"`
+	Cidrs []*CIDRRule            `protobuf:"bytes,3,rep,name=cidrs,proto3" json:"cidrs,omitempty"`
+	// Live effective DNS policy, normalized by the daemon. This is configured
+	// policy only; DNS-derived exact-host cache entries are intentionally absent.
+	Dns                  *DnsConfig `protobuf:"bytes,4,opt,name=dns,proto3" json:"dns,omitempty"`
+	PolicyDegraded       bool       `protobuf:"varint,5,opt,name=policy_degraded,json=policyDegraded,proto3" json:"policy_degraded,omitempty"`
+	PolicyDegradedReason string     `protobuf:"bytes,6,opt,name=policy_degraded_reason,json=policyDegradedReason,proto3" json:"policy_degraded_reason,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
+}
+
+func (x *GetRulesResponse) Reset() {
+	*x = GetRulesResponse{}
+	mi := &file_v1_daemon_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetRulesResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetRulesResponse) ProtoMessage() {}
+
+func (x *GetRulesResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_v1_daemon_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetRulesResponse.ProtoReflect.Descriptor instead.
+func (*GetRulesResponse) Descriptor() ([]byte, []int) {
+	return file_v1_daemon_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *GetRulesResponse) GetId() string {
+	if x != nil {
+		return x.Id
+	}
+	return ""
+}
+
+func (x *GetRulesResponse) GetMode() PolicyMode {
+	if x != nil {
+		return x.Mode
+	}
+	return PolicyMode_POLICY_MODE_UNSPECIFIED
+}
+
+func (x *GetRulesResponse) GetCidrs() []*CIDRRule {
+	if x != nil {
+		return x.Cidrs
+	}
+	return nil
+}
+
+func (x *GetRulesResponse) GetDns() *DnsConfig {
+	if x != nil {
+		return x.Dns
+	}
+	return nil
+}
+
+func (x *GetRulesResponse) GetPolicyDegraded() bool {
+	if x != nil {
+		return x.PolicyDegraded
+	}
+	return false
+}
+
+func (x *GetRulesResponse) GetPolicyDegradedReason() string {
+	if x != nil {
+		return x.PolicyDegradedReason
+	}
+	return ""
+}
+
 // AttachRequest specifies what to attach the eBPF filter to.
 type AttachRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -97,7 +327,7 @@ type AttachRequest struct {
 
 func (x *AttachRequest) Reset() {
 	*x = AttachRequest{}
-	mi := &file_v1_daemon_proto_msgTypes[0]
+	mi := &file_v1_daemon_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -109,7 +339,7 @@ func (x *AttachRequest) String() string {
 func (*AttachRequest) ProtoMessage() {}
 
 func (x *AttachRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_v1_daemon_proto_msgTypes[0]
+	mi := &file_v1_daemon_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -122,7 +352,7 @@ func (x *AttachRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AttachRequest.ProtoReflect.Descriptor instead.
 func (*AttachRequest) Descriptor() ([]byte, []int) {
-	return file_v1_daemon_proto_rawDescGZIP(), []int{0}
+	return file_v1_daemon_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *AttachRequest) GetTarget() isAttachRequest_Target {
@@ -196,7 +426,7 @@ type AttachResponse struct {
 
 func (x *AttachResponse) Reset() {
 	*x = AttachResponse{}
-	mi := &file_v1_daemon_proto_msgTypes[1]
+	mi := &file_v1_daemon_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -208,7 +438,7 @@ func (x *AttachResponse) String() string {
 func (*AttachResponse) ProtoMessage() {}
 
 func (x *AttachResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_v1_daemon_proto_msgTypes[1]
+	mi := &file_v1_daemon_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -221,7 +451,7 @@ func (x *AttachResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AttachResponse.ProtoReflect.Descriptor instead.
 func (*AttachResponse) Descriptor() ([]byte, []int) {
-	return file_v1_daemon_proto_rawDescGZIP(), []int{1}
+	return file_v1_daemon_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *AttachResponse) GetId() string {
@@ -249,7 +479,7 @@ type DetachRequest struct {
 
 func (x *DetachRequest) Reset() {
 	*x = DetachRequest{}
-	mi := &file_v1_daemon_proto_msgTypes[2]
+	mi := &file_v1_daemon_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -261,7 +491,7 @@ func (x *DetachRequest) String() string {
 func (*DetachRequest) ProtoMessage() {}
 
 func (x *DetachRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_v1_daemon_proto_msgTypes[2]
+	mi := &file_v1_daemon_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -274,7 +504,7 @@ func (x *DetachRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DetachRequest.ProtoReflect.Descriptor instead.
 func (*DetachRequest) Descriptor() ([]byte, []int) {
-	return file_v1_daemon_proto_rawDescGZIP(), []int{2}
+	return file_v1_daemon_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *DetachRequest) GetId() string {
@@ -297,7 +527,7 @@ type ListRequest struct {
 
 func (x *ListRequest) Reset() {
 	*x = ListRequest{}
-	mi := &file_v1_daemon_proto_msgTypes[3]
+	mi := &file_v1_daemon_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -309,7 +539,7 @@ func (x *ListRequest) String() string {
 func (*ListRequest) ProtoMessage() {}
 
 func (x *ListRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_v1_daemon_proto_msgTypes[3]
+	mi := &file_v1_daemon_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -322,7 +552,7 @@ func (x *ListRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListRequest.ProtoReflect.Descriptor instead.
 func (*ListRequest) Descriptor() ([]byte, []int) {
-	return file_v1_daemon_proto_rawDescGZIP(), []int{3}
+	return file_v1_daemon_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *ListRequest) GetPageSize() int32 {
@@ -353,7 +583,7 @@ type ListResponse struct {
 
 func (x *ListResponse) Reset() {
 	*x = ListResponse{}
-	mi := &file_v1_daemon_proto_msgTypes[4]
+	mi := &file_v1_daemon_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -365,7 +595,7 @@ func (x *ListResponse) String() string {
 func (*ListResponse) ProtoMessage() {}
 
 func (x *ListResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_v1_daemon_proto_msgTypes[4]
+	mi := &file_v1_daemon_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -378,7 +608,7 @@ func (x *ListResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListResponse.ProtoReflect.Descriptor instead.
 func (*ListResponse) Descriptor() ([]byte, []int) {
-	return file_v1_daemon_proto_rawDescGZIP(), []int{4}
+	return file_v1_daemon_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *ListResponse) GetAttachments() []*AttachmentInfo {
@@ -436,7 +666,7 @@ type AttachmentInfo struct {
 
 func (x *AttachmentInfo) Reset() {
 	*x = AttachmentInfo{}
-	mi := &file_v1_daemon_proto_msgTypes[5]
+	mi := &file_v1_daemon_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -448,7 +678,7 @@ func (x *AttachmentInfo) String() string {
 func (*AttachmentInfo) ProtoMessage() {}
 
 func (x *AttachmentInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_v1_daemon_proto_msgTypes[5]
+	mi := &file_v1_daemon_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -461,7 +691,7 @@ func (x *AttachmentInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AttachmentInfo.ProtoReflect.Descriptor instead.
 func (*AttachmentInfo) Descriptor() ([]byte, []int) {
-	return file_v1_daemon_proto_rawDescGZIP(), []int{5}
+	return file_v1_daemon_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *AttachmentInfo) GetId() string {
@@ -578,7 +808,7 @@ type DaemonStatus struct {
 
 func (x *DaemonStatus) Reset() {
 	*x = DaemonStatus{}
-	mi := &file_v1_daemon_proto_msgTypes[6]
+	mi := &file_v1_daemon_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -590,7 +820,7 @@ func (x *DaemonStatus) String() string {
 func (*DaemonStatus) ProtoMessage() {}
 
 func (x *DaemonStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_v1_daemon_proto_msgTypes[6]
+	mi := &file_v1_daemon_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -603,7 +833,7 @@ func (x *DaemonStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DaemonStatus.ProtoReflect.Descriptor instead.
 func (*DaemonStatus) Descriptor() ([]byte, []int) {
-	return file_v1_daemon_proto_rawDescGZIP(), []int{6}
+	return file_v1_daemon_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *DaemonStatus) GetVersion() string {
@@ -652,7 +882,25 @@ var File_v1_daemon_proto protoreflect.FileDescriptor
 
 const file_v1_daemon_proto_rawDesc = "" +
 	"\n" +
-	"\x0fv1/daemon.proto\x12\vnetfence.v1\x1a\x1bgoogle/protobuf/empty.proto\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x0ev1/types.proto\"\xa5\x02\n" +
+	"\x0fv1/daemon.proto\x12\vnetfence.v1\x1a\x1bgoogle/protobuf/empty.proto\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x10v1/control.proto\x1a\x0ev1/types.proto\"!\n" +
+	"\x0fGetRulesRequest\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\"\x8a\x02\n" +
+	"\bCIDRRule\x12\x12\n" +
+	"\x04cidr\x18\x01 \x01(\tR\x04cidr\x12)\n" +
+	"\x04list\x18\x02 \x01(\x0e2\x15.netfence.v1.RuleListR\x04list\x12!\n" +
+	"\fpolicy_owned\x18\x03 \x01(\bR\vpolicyOwned\x12!\n" +
+	"\fsystem_owned\x18\x04 \x01(\bR\vsystemOwned\x129\n" +
+	"\n" +
+	"expires_at\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\texpiresAt\x12 \n" +
+	"\vprovisional\x18\x06 \x01(\bR\vprovisional\x12\x1c\n" +
+	"\tinstalled\x18\a \x01(\bR\tinstalled\"\x85\x02\n" +
+	"\x10GetRulesResponse\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\x12+\n" +
+	"\x04mode\x18\x02 \x01(\x0e2\x17.netfence.v1.PolicyModeR\x04mode\x12+\n" +
+	"\x05cidrs\x18\x03 \x03(\v2\x15.netfence.v1.CIDRRuleR\x05cidrs\x12(\n" +
+	"\x03dns\x18\x04 \x01(\v2\x16.netfence.v1.DnsConfigR\x03dns\x12'\n" +
+	"\x0fpolicy_degraded\x18\x05 \x01(\bR\x0epolicyDegraded\x124\n" +
+	"\x16policy_degraded_reason\x18\x06 \x01(\tR\x14policyDegradedReason\"\xa5\x02\n" +
 	"\rAttachRequest\x12'\n" +
 	"\x0einterface_name\x18\x01 \x01(\tH\x00R\rinterfaceName\x12!\n" +
 	"\vcgroup_path\x18\x02 \x01(\tH\x00R\n" +
@@ -710,12 +958,14 @@ const file_v1_daemon_proto_rawDesc = "" +
 	"\x1cCONNECTION_STATE_UNSPECIFIED\x10\x00\x12!\n" +
 	"\x1dCONNECTION_STATE_DISCONNECTED\x10\x01\x12\x1f\n" +
 	"\x1bCONNECTION_STATE_CONNECTING\x10\x02\x12\x1e\n" +
-	"\x1aCONNECTION_STATE_CONNECTED\x10\x032\x8d\x02\n" +
+	"\x1aCONNECTION_STATE_CONNECTED\x10\x032\x9b\x03\n" +
 	"\rDaemonService\x12A\n" +
 	"\x06Attach\x12\x1a.netfence.v1.AttachRequest\x1a\x1b.netfence.v1.AttachResponse\x12<\n" +
 	"\x06Detach\x12\x1a.netfence.v1.DetachRequest\x1a\x16.google.protobuf.Empty\x12;\n" +
 	"\x04List\x12\x18.netfence.v1.ListRequest\x1a\x19.netfence.v1.ListResponse\x12>\n" +
-	"\tGetStatus\x12\x16.google.protobuf.Empty\x1a\x19.netfence.v1.DaemonStatusB1Z/github.com/danthegoodman1/netfence/api/v1;apiv1b\x06proto3"
+	"\tGetStatus\x12\x16.google.protobuf.Empty\x1a\x19.netfence.v1.DaemonStatus\x12C\n" +
+	"\fApplyCommand\x12\x1b.netfence.v1.ControlCommand\x1a\x16.google.protobuf.Empty\x12G\n" +
+	"\bGetRules\x12\x1c.netfence.v1.GetRulesRequest\x1a\x1d.netfence.v1.GetRulesResponseB1Z/github.com/danthegoodman1/netfence/api/v1;apiv1b\x06proto3"
 
 var (
 	file_v1_daemon_proto_rawDescOnce sync.Once
@@ -730,49 +980,64 @@ func file_v1_daemon_proto_rawDescGZIP() []byte {
 }
 
 var file_v1_daemon_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_v1_daemon_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
+var file_v1_daemon_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
 var file_v1_daemon_proto_goTypes = []any{
 	(ConnectionState)(0),          // 0: netfence.v1.ConnectionState
-	(*AttachRequest)(nil),         // 1: netfence.v1.AttachRequest
-	(*AttachResponse)(nil),        // 2: netfence.v1.AttachResponse
-	(*DetachRequest)(nil),         // 3: netfence.v1.DetachRequest
-	(*ListRequest)(nil),           // 4: netfence.v1.ListRequest
-	(*ListResponse)(nil),          // 5: netfence.v1.ListResponse
-	(*AttachmentInfo)(nil),        // 6: netfence.v1.AttachmentInfo
-	(*DaemonStatus)(nil),          // 7: netfence.v1.DaemonStatus
-	nil,                           // 8: netfence.v1.AttachRequest.MetadataEntry
-	nil,                           // 9: netfence.v1.AttachmentInfo.MetadataEntry
-	(TcDirection)(0),              // 10: netfence.v1.TcDirection
-	(AttachmentType)(0),           // 11: netfence.v1.AttachmentType
-	(PolicyMode)(0),               // 12: netfence.v1.PolicyMode
-	(DnsMode)(0),                  // 13: netfence.v1.DnsMode
+	(*GetRulesRequest)(nil),       // 1: netfence.v1.GetRulesRequest
+	(*CIDRRule)(nil),              // 2: netfence.v1.CIDRRule
+	(*GetRulesResponse)(nil),      // 3: netfence.v1.GetRulesResponse
+	(*AttachRequest)(nil),         // 4: netfence.v1.AttachRequest
+	(*AttachResponse)(nil),        // 5: netfence.v1.AttachResponse
+	(*DetachRequest)(nil),         // 6: netfence.v1.DetachRequest
+	(*ListRequest)(nil),           // 7: netfence.v1.ListRequest
+	(*ListResponse)(nil),          // 8: netfence.v1.ListResponse
+	(*AttachmentInfo)(nil),        // 9: netfence.v1.AttachmentInfo
+	(*DaemonStatus)(nil),          // 10: netfence.v1.DaemonStatus
+	nil,                           // 11: netfence.v1.AttachRequest.MetadataEntry
+	nil,                           // 12: netfence.v1.AttachmentInfo.MetadataEntry
+	(RuleList)(0),                 // 13: netfence.v1.RuleList
 	(*timestamppb.Timestamp)(nil), // 14: google.protobuf.Timestamp
-	(*emptypb.Empty)(nil),         // 15: google.protobuf.Empty
+	(PolicyMode)(0),               // 15: netfence.v1.PolicyMode
+	(*DnsConfig)(nil),             // 16: netfence.v1.DnsConfig
+	(TcDirection)(0),              // 17: netfence.v1.TcDirection
+	(AttachmentType)(0),           // 18: netfence.v1.AttachmentType
+	(DnsMode)(0),                  // 19: netfence.v1.DnsMode
+	(*emptypb.Empty)(nil),         // 20: google.protobuf.Empty
+	(*ControlCommand)(nil),        // 21: netfence.v1.ControlCommand
 }
 var file_v1_daemon_proto_depIdxs = []int32{
-	8,  // 0: netfence.v1.AttachRequest.metadata:type_name -> netfence.v1.AttachRequest.MetadataEntry
-	10, // 1: netfence.v1.AttachRequest.tc_direction:type_name -> netfence.v1.TcDirection
-	6,  // 2: netfence.v1.ListResponse.attachments:type_name -> netfence.v1.AttachmentInfo
-	11, // 3: netfence.v1.AttachmentInfo.type:type_name -> netfence.v1.AttachmentType
-	12, // 4: netfence.v1.AttachmentInfo.mode:type_name -> netfence.v1.PolicyMode
-	13, // 5: netfence.v1.AttachmentInfo.dns_mode:type_name -> netfence.v1.DnsMode
-	9,  // 6: netfence.v1.AttachmentInfo.metadata:type_name -> netfence.v1.AttachmentInfo.MetadataEntry
-	14, // 7: netfence.v1.AttachmentInfo.attached_at:type_name -> google.protobuf.Timestamp
-	10, // 8: netfence.v1.AttachmentInfo.tc_direction:type_name -> netfence.v1.TcDirection
-	0,  // 9: netfence.v1.DaemonStatus.control_plane_state:type_name -> netfence.v1.ConnectionState
-	1,  // 10: netfence.v1.DaemonService.Attach:input_type -> netfence.v1.AttachRequest
-	3,  // 11: netfence.v1.DaemonService.Detach:input_type -> netfence.v1.DetachRequest
-	4,  // 12: netfence.v1.DaemonService.List:input_type -> netfence.v1.ListRequest
-	15, // 13: netfence.v1.DaemonService.GetStatus:input_type -> google.protobuf.Empty
-	2,  // 14: netfence.v1.DaemonService.Attach:output_type -> netfence.v1.AttachResponse
-	15, // 15: netfence.v1.DaemonService.Detach:output_type -> google.protobuf.Empty
-	5,  // 16: netfence.v1.DaemonService.List:output_type -> netfence.v1.ListResponse
-	7,  // 17: netfence.v1.DaemonService.GetStatus:output_type -> netfence.v1.DaemonStatus
-	14, // [14:18] is the sub-list for method output_type
-	10, // [10:14] is the sub-list for method input_type
-	10, // [10:10] is the sub-list for extension type_name
-	10, // [10:10] is the sub-list for extension extendee
-	0,  // [0:10] is the sub-list for field type_name
+	13, // 0: netfence.v1.CIDRRule.list:type_name -> netfence.v1.RuleList
+	14, // 1: netfence.v1.CIDRRule.expires_at:type_name -> google.protobuf.Timestamp
+	15, // 2: netfence.v1.GetRulesResponse.mode:type_name -> netfence.v1.PolicyMode
+	2,  // 3: netfence.v1.GetRulesResponse.cidrs:type_name -> netfence.v1.CIDRRule
+	16, // 4: netfence.v1.GetRulesResponse.dns:type_name -> netfence.v1.DnsConfig
+	11, // 5: netfence.v1.AttachRequest.metadata:type_name -> netfence.v1.AttachRequest.MetadataEntry
+	17, // 6: netfence.v1.AttachRequest.tc_direction:type_name -> netfence.v1.TcDirection
+	9,  // 7: netfence.v1.ListResponse.attachments:type_name -> netfence.v1.AttachmentInfo
+	18, // 8: netfence.v1.AttachmentInfo.type:type_name -> netfence.v1.AttachmentType
+	15, // 9: netfence.v1.AttachmentInfo.mode:type_name -> netfence.v1.PolicyMode
+	19, // 10: netfence.v1.AttachmentInfo.dns_mode:type_name -> netfence.v1.DnsMode
+	12, // 11: netfence.v1.AttachmentInfo.metadata:type_name -> netfence.v1.AttachmentInfo.MetadataEntry
+	14, // 12: netfence.v1.AttachmentInfo.attached_at:type_name -> google.protobuf.Timestamp
+	17, // 13: netfence.v1.AttachmentInfo.tc_direction:type_name -> netfence.v1.TcDirection
+	0,  // 14: netfence.v1.DaemonStatus.control_plane_state:type_name -> netfence.v1.ConnectionState
+	4,  // 15: netfence.v1.DaemonService.Attach:input_type -> netfence.v1.AttachRequest
+	6,  // 16: netfence.v1.DaemonService.Detach:input_type -> netfence.v1.DetachRequest
+	7,  // 17: netfence.v1.DaemonService.List:input_type -> netfence.v1.ListRequest
+	20, // 18: netfence.v1.DaemonService.GetStatus:input_type -> google.protobuf.Empty
+	21, // 19: netfence.v1.DaemonService.ApplyCommand:input_type -> netfence.v1.ControlCommand
+	1,  // 20: netfence.v1.DaemonService.GetRules:input_type -> netfence.v1.GetRulesRequest
+	5,  // 21: netfence.v1.DaemonService.Attach:output_type -> netfence.v1.AttachResponse
+	20, // 22: netfence.v1.DaemonService.Detach:output_type -> google.protobuf.Empty
+	8,  // 23: netfence.v1.DaemonService.List:output_type -> netfence.v1.ListResponse
+	10, // 24: netfence.v1.DaemonService.GetStatus:output_type -> netfence.v1.DaemonStatus
+	20, // 25: netfence.v1.DaemonService.ApplyCommand:output_type -> google.protobuf.Empty
+	3,  // 26: netfence.v1.DaemonService.GetRules:output_type -> netfence.v1.GetRulesResponse
+	21, // [21:27] is the sub-list for method output_type
+	15, // [15:21] is the sub-list for method input_type
+	15, // [15:15] is the sub-list for extension type_name
+	15, // [15:15] is the sub-list for extension extendee
+	0,  // [0:15] is the sub-list for field type_name
 }
 
 func init() { file_v1_daemon_proto_init() }
@@ -780,8 +1045,9 @@ func file_v1_daemon_proto_init() {
 	if File_v1_daemon_proto != nil {
 		return
 	}
+	file_v1_control_proto_init()
 	file_v1_types_proto_init()
-	file_v1_daemon_proto_msgTypes[0].OneofWrappers = []any{
+	file_v1_daemon_proto_msgTypes[3].OneofWrappers = []any{
 		(*AttachRequest_InterfaceName)(nil),
 		(*AttachRequest_CgroupPath)(nil),
 	}
@@ -791,7 +1057,7 @@ func file_v1_daemon_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_v1_daemon_proto_rawDesc), len(file_v1_daemon_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   9,
+			NumMessages:   12,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

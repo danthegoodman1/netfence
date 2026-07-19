@@ -67,6 +67,9 @@ type ttlEntry struct {
 	// otherwise it expires at cpDeadline.
 	cpLive     bool
 	cpDeadline time.Time
+	// provisional marks policy ownership reconstructed from an adopted pinned
+	// map before a complete authoritative update replaces its lifetime/source.
+	provisional bool
 
 	// inFilter records whether the entry was successfully written to the
 	// eBPF filter, so repeated CP/system adds skip the redundant map syscall.
@@ -222,6 +225,7 @@ func (r *ttlRegistry) addSourceLocked(f filter.Filter, cidr *net.IPNet, list rul
 
 	switch src {
 	case sourceCP:
+		entry.provisional = false
 		if ttl <= 0 {
 			entry.cpLive, entry.cpDeadline = true, time.Time{}
 		} else if !entry.cpPermanent() {
@@ -298,7 +302,7 @@ func (r *ttlRegistry) reconcileCP(f filter.Filter, list ruleList, desired []pars
 		// reconcile already cleared it but its filter Remove failed, cpLive is
 		// already false; continue into the same removal path so every retry keeps
 		// reporting failure until the stale kernel rule is actually gone.
-		entry.cpLive, entry.cpDeadline = false, time.Time{}
+		entry.cpLive, entry.cpDeadline, entry.provisional = false, time.Time{}, false
 		if entry.systemLive {
 			r.entries[key] = entry
 			continue
@@ -350,9 +354,10 @@ func (r *ttlRegistry) seedAdopted(allowed, denied []*net.IPNet) error {
 				continue
 			}
 			seeded[key] = ttlEntry{
-				cidr:     cidr,
-				cpLive:   true,
-				inFilter: true,
+				cidr:        cidr,
+				cpLive:      true,
+				provisional: true,
+				inFilter:    true,
 			}
 			if list == listAllow {
 				seededAllowed = append(seededAllowed, cidr)
@@ -395,6 +400,7 @@ func (r *ttlRegistry) reconcileAuthoritative(f filter.Filter, mode filter.Policy
 		}
 		current.cpLive = false
 		current.cpDeadline = time.Time{}
+		current.provisional = false
 		projected[key] = current
 	}
 	projectList := func(list ruleList, desired []parsedCIDR) {
@@ -405,6 +411,7 @@ func (r *ttlRegistry) reconcileAuthoritative(f filter.Filter, mode filter.Policy
 				entry = ttlEntry{cidr: d.cidr}
 			}
 			entry.cpLive = true
+			entry.provisional = false
 			if d.ttl <= 0 {
 				entry.cpDeadline = time.Time{}
 			} else {
@@ -588,6 +595,7 @@ func (r *ttlRegistry) replaceCPSourceLocked(f filter.Filter, cidr *net.IPNet, li
 	}
 
 	entry.cpLive = true
+	entry.provisional = false
 	if ttl <= 0 {
 		entry.cpDeadline = time.Time{}
 	} else {
@@ -641,7 +649,7 @@ func (r *ttlRegistry) remove(f filter.Filter, cidr *net.IPNet, list ruleList) er
 		return nil
 	}
 	if entry.systemLive {
-		entry.cpLive, entry.cpDeadline = false, time.Time{}
+		entry.cpLive, entry.cpDeadline, entry.provisional = false, time.Time{}, false
 		r.entries[key] = entry
 		return nil
 	}
@@ -691,11 +699,11 @@ func (r *ttlRegistry) clear(f filter.Filter) error {
 	var errs []error
 	for key, entry := range r.entries {
 		if entry.systemLive {
-			entry.cpLive, entry.cpDeadline = false, time.Time{}
+			entry.cpLive, entry.cpDeadline, entry.provisional = false, time.Time{}, false
 			r.entries[key] = entry
 			continue
 		}
-		entry.cpLive, entry.cpDeadline = false, time.Time{}
+		entry.cpLive, entry.cpDeadline, entry.provisional = false, time.Time{}, false
 		if !entry.inFilter {
 			delete(r.entries, key)
 			continue
@@ -735,6 +743,47 @@ func (r *ttlRegistry) purge() {
 	defer r.mu.Unlock()
 	r.entries = make(map[ttlKey]ttlEntry)
 	r.protectedCurrent = protectedRuleCurrent{}
+}
+
+type ttlRuleSnapshot struct {
+	cidr        string
+	list        ruleList
+	policyOwned bool
+	systemOwned bool
+	expiresAt   time.Time
+	provisional bool
+	installed   bool
+}
+
+// snapshotRules returns a deterministic userspace registry view. It performs
+// no protected-map inventory and deliberately retains source-less installed
+// entries so inspection can distinguish a pending removal retry from desired
+// policy. DNS-derived exact-host ownership lives outside this registry.
+func (r *ttlRegistry) snapshotRules() []ttlRuleSnapshot {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	rules := make([]ttlRuleSnapshot, 0, len(r.entries))
+	for key, entry := range r.entries {
+		rules = append(rules, ttlRuleSnapshot{
+			cidr:        key.cidr,
+			list:        key.list,
+			policyOwned: entry.cpLive,
+			systemOwned: entry.systemLive,
+			expiresAt:   entry.cpDeadline,
+			provisional: entry.provisional,
+			installed:   entry.inFilter,
+		})
+	}
+	sort.Slice(rules, func(i, j int) bool {
+		if rules[i].list != rules[j].list {
+			return rules[i].list < rules[j].list
+		}
+		return rules[i].cidr < rules[j].cidr
+	})
+	return rules
 }
 
 // len reports the total number of tracked entries.
@@ -830,7 +879,7 @@ func (r *ttlRegistry) expire(f filter.Filter, now time.Time) []sweptEntry {
 	for key, entry := range r.entries {
 		changed := false
 		if entry.cpLive && !entry.cpDeadline.IsZero() && !entry.cpDeadline.After(now) {
-			entry.cpLive, entry.cpDeadline = false, time.Time{}
+			entry.cpLive, entry.cpDeadline, entry.provisional = false, time.Time{}, false
 			changed = true
 		}
 		if entry.systemLive || entry.cpLive {
