@@ -3,7 +3,6 @@
 package filter
 
 import (
-	"encoding/binary"
 	"net/netip"
 	"os/exec"
 	"path/filepath"
@@ -72,6 +71,16 @@ func TestTCResolverGuardPrecedesCarveoutsAndHandlesAmbiguousPackets(t *testing.T
 						want = 2
 					}
 					require.Equal(t, want, verdict, "v6=%t mode=%s proto=%d port=%d", v6, mode, proto, port)
+					for tags := 1; tags <= 3; tags++ {
+						vlan := resolverVLANPacket(packet, tags)
+						got, _, err := objs.FilterEgress.Test(vlan)
+						require.NoError(t, err)
+						expected := want
+						if tags == 3 {
+							expected = 2
+						}
+						require.Equal(t, expected, got, "v6=%t mode=%s proto=%d port=%d VLAN tags=%d", v6, mode, proto, port, tags)
+					}
 				}
 			}
 			packet := resolverTestPacket(v6, 17, 11001)
@@ -92,30 +101,16 @@ func TestTCResolverGuardPrecedesCarveoutsAndHandlesAmbiguousPackets(t *testing.T
 	}
 }
 
-func resolverTestPacket(v6 bool, proto byte, port uint16) []byte {
-	size := 20
-	if v6 {
-		size = 40
+func resolverVLANPacket(packet []byte, tags int) []byte {
+	out := append([]byte{}, packet[:12]...)
+	out = append(out, 0x81, 0x00)
+	for i := 0; i < tags; i++ {
+		out = append(out, 0, 1)
+		if i+1 < tags {
+			out = append(out, 0x81, 0x00)
+		} else {
+			out = append(out, packet[12:14]...)
+		}
 	}
-	p := make([]byte, 14+size+20)
-	if v6 {
-		binary.BigEndian.PutUint16(p[12:14], 0x86dd)
-		p[14] = 0x60
-		p[20] = proto
-		p[21] = 64
-		binary.BigEndian.PutUint16(p[18:20], 20)
-		p[14+23] = 1
-		p[14+39] = 1
-	} else {
-		binary.BigEndian.PutUint16(p[12:14], 0x0800)
-		p[14] = 0x45
-		p[22] = 64
-		p[23] = proto
-		binary.BigEndian.PutUint16(p[16:18], 40)
-		copy(p[26:30], []byte{127, 0, 0, 1})
-		copy(p[30:34], []byte{127, 0, 0, 1})
-	}
-	binary.BigEndian.PutUint16(p[14+size:16+size], 12345)
-	binary.BigEndian.PutUint16(p[16+size:18+size], port)
-	return p
+	return append(out, packet[14:]...)
 }

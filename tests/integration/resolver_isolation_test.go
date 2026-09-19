@@ -4,7 +4,6 @@ package integration
 
 import (
 	"context"
-	"net"
 	"os"
 	"os/exec"
 	"strconv"
@@ -111,9 +110,6 @@ func exerciseResolverIsolation(t *testing.T, tc bool) {
 			runResolverIsolationQuery(t, aGroup, tc, b.DnsAddress, "secret.test", true, 0)
 			require.Equal(t, before, upstream.udpQueries.Load()+upstream.tcpQueries.Load())
 			// Ensure the listener still works after overload-style failed access.
-			_, port, err := net.SplitHostPort(a.DnsAddress)
-			require.NoError(t, err)
-			require.NotEmpty(t, port)
 			runResolverIsolationQuery(t, aGroup, tc, a.DnsAddress, "allowed.test", false, dns.RcodeSuccess)
 		})
 	}

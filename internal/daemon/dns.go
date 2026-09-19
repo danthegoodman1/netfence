@@ -87,7 +87,7 @@ type DNSServer struct {
 	queryCtx        context.Context
 	cancelQueries   context.CancelFunc
 	resources       dnsResources
-	globalResources *dnsResources
+	globalResources dnsResources
 	queryTimeout    time.Duration
 
 	queriesAllowed atomic.Uint64
@@ -128,10 +128,9 @@ func NewDNSServer(attachmentID, listenAddr, upstream string, logger zerolog.Logg
 		churnCeiling:    churnCeiling,
 	}
 	var resourceConfig config.DNSConfig
-	server.globalResources = &dnsResources{}
 	if concrete, ok := sink.(*dnsFilterSink); ok {
 		resourceConfig = concrete.server.cfg.DNS
-		server.globalResources = concrete.server.dnsResources
+		server.globalResources = *concrete.server.dnsResources
 		concrete.bindDNS(server)
 	}
 	server.resources = dnsResources{

@@ -966,13 +966,6 @@ func (s *Server) Start() error {
 			if owned {
 				continue
 			}
-			schemaState, err := s.inspectPinSchema(orphan)
-			if err != nil {
-				return abortStart(fmt.Errorf("classifying orphaned BPF pin dir %s before cleanup: %w", orphan, err))
-			}
-			if schemaState != filter.PinnedSchemaCurrent {
-				return abortStart(fmt.Errorf("orphaned BPF pin dir %s has an uncommitted schema marker; preserving possible live enforcement for retry/inspection", orphan))
-			}
 			return abortStart(fmt.Errorf("orphaned BPF pin dir %s has no matching attachment; preserving possible live enforcement: restore the matching database or inspect and explicitly remove obsolete pins", orphan))
 		}
 	}

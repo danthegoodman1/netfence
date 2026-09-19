@@ -384,3 +384,20 @@ func (b *fakeExactBackend) contains(key exactIPKey) (bool, error) {
 	_, ok := b.entries[key]
 	return ok, nil
 }
+
+func canonicalExactIPKeys(ips []net.IP) ([]exactIPKey, error) {
+	seen := make(map[exactIPKey]struct{}, len(ips))
+	for _, ip := range ips {
+		key, err := canonicalExactIPKey(ip)
+		if err != nil {
+			return nil, err
+		}
+		seen[key] = struct{}{}
+	}
+	keys := make([]exactIPKey, 0, len(seen))
+	for key := range seen {
+		keys = append(keys, key)
+	}
+	sortExactIPKeys(keys)
+	return keys, nil
+}

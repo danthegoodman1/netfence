@@ -42,7 +42,7 @@ func BenchmarkDNSExactKernel(b *testing.B) {
 				}
 				// Bound sample storage independently of benchmark calibration.
 				samples := make([]int64, 0, 65536)
-				stride := max(1, b.N/cap(samples))
+				stride := max(1, (b.N+cap(samples)-1)/cap(samples))
 				b.ReportAllocs()
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {

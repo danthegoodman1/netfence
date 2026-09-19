@@ -135,7 +135,9 @@ int filter_egress(struct __sk_buff *skb)
 unidentified:
     // Unidentified traffic is closed only in allowlist; denylist blocks only
     // identified IP destinations present in its deny maps.
-    if (*mode == 1 || (g && g->family && (proto == ETH_P_IP || proto == ETH_P_IPV6))) {
+    if (*mode == 1 || (g && g->family &&
+        (proto == ETH_P_IP || proto == ETH_P_IPV6 ||
+         proto == ETH_P_8021Q || proto == ETH_P_8021AD))) {
         increment_stat(1);
         return TC_ACT_SHOT;
     }

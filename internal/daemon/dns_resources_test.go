@@ -23,7 +23,7 @@ func TestDNSQueryLimitsBoundWorkAcrossAttachmentsAndReleaseOnStop(t *testing.T) 
 				<-ctx.Done()
 				return DnsProxyDecision{}, ctx.Err()
 			})
-		s.globalResources = global
+		s.globalResources = *global
 		s.resources.queries = make(chan struct{}, 1)
 		require.NoError(t, s.SetMode(apiv1.DnsMode_DNS_MODE_PROXY))
 		require.NoError(t, s.Start())
@@ -66,7 +66,7 @@ func TestDNSTCPConnectionLimitsIncludeIdleConnections(t *testing.T) {
 	global := &dnsResources{queries: make(chan struct{}, 8), connections: make(chan struct{}, 2)}
 	makeServer := func(id string) *DNSServer {
 		s := NewDNSServer(id, "127.0.0.1:0", "127.0.0.1:1", zerolog.Nop(), nil, nil)
-		s.globalResources = global
+		s.globalResources = *global
 		s.resources.connections = make(chan struct{}, 1)
 		require.NoError(t, s.Start())
 		t.Cleanup(func() { s.Stop() })

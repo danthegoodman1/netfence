@@ -43,30 +43,18 @@ type exactDNSBackend interface {
 	delete(exactIPKey) error
 }
 
-func canonicalExactIPKeys(ips []net.IP) ([]exactIPKey, error) {
-	seen := make(map[exactIPKey]struct{}, len(ips))
-	for i, ip := range ips {
-		if ip == nil {
-			return nil, fmt.Errorf("DNS exact allow IP %d is nil", i)
-		}
-		var key exactIPKey
-		if ip4 := ip.To4(); ip4 != nil {
-			key.family = exactIPv4
-			copy(key.addr[:4], ip4)
-		} else if ip16 := ip.To16(); ip16 != nil {
-			key.family = exactIPv6
-			copy(key.addr[:], ip16)
-		} else {
-			return nil, fmt.Errorf("DNS exact allow IP %d is invalid: %q", i, ip.String())
-		}
-		seen[key] = struct{}{}
+func canonicalExactIPKey(ip net.IP) (exactIPKey, error) {
+	var key exactIPKey
+	if ip4 := ip.To4(); ip4 != nil {
+		key.family = exactIPv4
+		copy(key.addr[:4], ip4)
+	} else if ip16 := ip.To16(); ip16 != nil {
+		key.family = exactIPv6
+		copy(key.addr[:], ip16)
+	} else {
+		return key, fmt.Errorf("DNS exact allow IP is invalid: %q", ip.String())
 	}
-	keys := make([]exactIPKey, 0, len(seen))
-	for key := range seen {
-		keys = append(keys, key)
-	}
-	sortExactIPKeys(keys)
-	return keys, nil
+	return key, nil
 }
 
 func sortExactIPKeys(keys []exactIPKey) {
@@ -78,8 +66,8 @@ func sortExactIPKeys(keys []exactIPKey) {
 	})
 }
 
-func snapshotExactDNS(b exactDNSBackend) (map[exactIPKey]struct{}, DNSAllowOccupancy, error) {
-	snapshot := make(map[exactIPKey]struct{})
+func inventoryExactDNS(b exactDNSBackend) ([]exactIPKey, DNSAllowOccupancy, error) {
+	var inventory []exactIPKey
 	var occupancy DNSAllowOccupancy
 	for _, family := range []exactIPFamily{exactIPv4, exactIPv6} {
 		keys, err := b.keys(family)
@@ -90,8 +78,8 @@ func snapshotExactDNS(b exactDNSBackend) (map[exactIPKey]struct{}, DNSAllowOccup
 			if key.family != family {
 				return nil, occupancy, fmt.Errorf("DNS exact IPv%d backend returned an IPv%d key", family, key.family)
 			}
-			snapshot[key] = struct{}{}
 		}
+		inventory = append(inventory, keys...)
 		capacity, err := b.capacity(family)
 		if err != nil {
 			return nil, occupancy, fmt.Errorf("reading DNS exact IPv%d capacity: %w", family, err)
@@ -104,7 +92,7 @@ func snapshotExactDNS(b exactDNSBackend) (map[exactIPKey]struct{}, DNSAllowOccup
 			occupancy.IPv6Capacity = capacity
 		}
 	}
-	return snapshot, occupancy, nil
+	return inventory, occupancy, nil
 }
 
 // exactDNSState caches counts, not membership. A concrete filter is the sole
@@ -117,7 +105,7 @@ type exactDNSState struct {
 
 func (s *exactDNSState) usage(b exactDNSBackend) (DNSAllowOccupancy, error) {
 	if !s.initialized {
-		_, occupancy, err := snapshotExactDNS(b)
+		_, occupancy, err := inventoryExactDNS(b)
 		if err != nil {
 			return DNSAllowOccupancy{}, err
 		}
@@ -132,27 +120,23 @@ type exactChange struct {
 }
 
 func (s *exactDNSState) replace(b exactDNSBackend, remove, add []net.IP) error {
-	removeKeys, err := canonicalExactIPKeys(remove)
-	if err != nil {
-		return err
-	}
-	addKeys, err := canonicalExactIPKeys(add)
-	if err != nil {
-		return err
-	}
-	if len(removeKeys)+len(addKeys) == 0 {
+	if len(remove)+len(add) == 0 {
 		return nil
+	}
+	// Validate and deduplicate once. Adding wins overlap, preserving survivors.
+	wanted := make(map[exactIPKey]bool, len(remove)+len(add))
+	for adding, ips := range [][]net.IP{remove, add} {
+		for _, ip := range ips {
+			key, err := canonicalExactIPKey(ip)
+			if err != nil {
+				return err
+			}
+			wanted[key] = adding == 1
+		}
 	}
 	occupancy, err := s.usage(b)
 	if err != nil {
 		return err
-	}
-	wanted := make(map[exactIPKey]bool, len(removeKeys)+len(addKeys))
-	for _, key := range removeKeys {
-		wanted[key] = false
-	}
-	for _, key := range addKeys {
-		wanted[key] = true
 	}
 	keys := make([]exactIPKey, 0, len(wanted))
 	for key := range wanted {
@@ -252,13 +236,9 @@ func restoreExactChanges(b exactDNSBackend, changes []exactChange) error {
 }
 
 func listExactDNSIPs(b exactDNSBackend) ([]net.IP, error) {
-	snapshot, _, err := snapshotExactDNS(b)
+	keys, _, err := inventoryExactDNS(b)
 	if err != nil {
 		return nil, err
-	}
-	keys := make([]exactIPKey, 0, len(snapshot))
-	for key := range snapshot {
-		keys = append(keys, key)
 	}
 	sortExactIPKeys(keys)
 	ips := make([]net.IP, 0, len(keys))

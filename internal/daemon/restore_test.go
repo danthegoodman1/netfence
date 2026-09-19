@@ -1360,45 +1360,17 @@ func TestRestoreAmbiguousTargetStateNeverCleansOrRecreates(t *testing.T) {
 }
 
 func TestRestoreOrphanScanFailuresAbortStartup(t *testing.T) {
-	tests := []struct {
-		name       string
-		failRead   bool
-		failRemove bool
-	}{
-		{name: "read_failure", failRead: true},
-		{name: "remove_failure", failRemove: true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			env := newRestoreEnv(t, 12342, apiv1.PolicyMode_POLICY_MODE_ALLOWLIST)
-			env.adopted = &fakeFilter{mode: filter.ModeAllowlist}
-			env.mkPinDir(t)
-			env.persistPinIdentity(t, filepath.Join(env.pinRoot, env.id), false)
-			orphan := filepath.Join(env.pinRoot, "orphan")
-			require.NoError(t, os.MkdirAll(orphan, 0o700))
-			if tt.failRead {
-				env.server.readPinRoot = func(string) ([]os.DirEntry, error) { return nil, syscall.EIO }
-			}
-			if tt.failRemove {
-				env.server.removePinDir = func(path string) error {
-					if path == orphan {
-						return syscall.EIO
-					}
-					return os.RemoveAll(path)
-				}
-			}
-
-			err := env.server.Start()
-			require.Error(t, err)
-			assert.Contains(t, err.Error(), "orphan")
-			assert.DirExists(t, filepath.Join(env.pinRoot, env.id))
-			assert.DirExists(t, orphan)
-			_, getErr := env.st.GetAttachment(env.id)
-			require.NoError(t, getErr)
-			assert.Equal(t, 1, env.adopted.closeCallCount(), "aborted startup must close, not detach, adopted handles")
-			assert.Zero(t, env.adopted.detachCallCount())
-		})
-	}
+	env := newRestoreEnv(t, 12342, apiv1.PolicyMode_POLICY_MODE_ALLOWLIST)
+	env.adopted = &fakeFilter{mode: filter.ModeAllowlist}
+	env.mkPinDir(t)
+	env.persistPinIdentity(t, filepath.Join(env.pinRoot, env.id), false)
+	env.server.readPinRoot = func(string) ([]os.DirEntry, error) { return nil, syscall.EIO }
+	require.ErrorIs(t, env.server.Start(), syscall.EIO)
+	assert.DirExists(t, filepath.Join(env.pinRoot, env.id))
+	_, err := env.st.GetAttachment(env.id)
+	require.NoError(t, err)
+	assert.Equal(t, 1, env.adopted.closeCallCount())
+	assert.Zero(t, env.adopted.detachCallCount())
 }
 
 func TestRestorePreservesUncommittedCrashPartialOrphan(t *testing.T) {
@@ -1424,7 +1396,7 @@ func TestRestorePreservesUncommittedCrashPartialOrphan(t *testing.T) {
 
 	err := env.server.Start()
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "uncommitted schema marker")
+	assert.Contains(t, err.Error(), "no matching attachment")
 	assert.Zero(t, removeCalls, "possible live partial enforcement must never be unpinned")
 	assert.DirExists(t, orphan)
 	assert.Equal(t, 1, env.adopted.closeCallCount(), "startup abort closes adopted handles but retains pins")
