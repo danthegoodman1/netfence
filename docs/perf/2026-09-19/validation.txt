@@ -1,0 +1,70 @@
+Linux Docker validation, 2026-09-19
+
+Command: sudo -n env DOCKER_HOST=unix:///var/run/docker.sock make check-docker
+Revision: dcc1b22 (final production logic; later changes are comments and test synchronization).
+?   	github.com/danthegoodman1/netfence/cmd/netfenced	[no test files]
+ok  	github.com/danthegoodman1/netfence/cmd/netfenced/cmd	2.043s
+ok  	github.com/danthegoodman1/netfence/internal/config	1.024s
+ok  	github.com/danthegoodman1/netfence/internal/daemon	12.353s
+ok  	github.com/danthegoodman1/netfence/internal/store	2.925s
+ok  	github.com/danthegoodman1/netfence/pkg/filter	13.326s
+ok  	github.com/danthegoodman1/netfence/tests/integration	206.368s
+?   	github.com/danthegoodman1/netfence/v1	[no test files]
+
+Command: sudo -n env DOCKER_HOST=unix:///var/run/docker.sock make test-docker test-docker-cgroup test-docker-tc bench-docker
+Revision: 41d4cf8. Exit status: 0.
+Running tests in Docker...
+?   	github.com/danthegoodman1/netfence/cmd/netfenced	[no test files]
+ok  	github.com/danthegoodman1/netfence/cmd/netfenced/cmd	0.008s
+ok  	github.com/danthegoodman1/netfence/internal/config	0.004s
+ok  	github.com/danthegoodman1/netfence/internal/daemon	10.685s
+ok  	github.com/danthegoodman1/netfence/internal/store	1.260s
+ok  	github.com/danthegoodman1/netfence/pkg/filter	8.963s
+--- SKIP: TestHelperUDPFlood (0.00s)
+--- SKIP: TestDNSWorkloadHelperProcess (0.00s)
+--- SKIP: TestCgroupKill9NegativeVerifyPre3A (0.00s)
+--- SKIP: TestResolverIsolationHelper (0.00s)
+ok  	github.com/danthegoodman1/netfence/tests/integration	156.745s
+?   	github.com/danthegoodman1/netfence/v1	[no test files]
+Running cgroup tests in Docker...
+--- SKIP: TestCgroupKill9NegativeVerifyPre3A (0.00s)
+ok  	github.com/danthegoodman1/netfence/tests/integration	53.827s
+Running TC tests in Docker...
+ok  	github.com/danthegoodman1/netfence/tests/integration	71.413s
+Running benchmarks in Docker...
+?   	github.com/danthegoodman1/netfence/cmd/netfenced	[no test files]
+ok  	github.com/danthegoodman1/netfence/cmd/netfenced/cmd	0.006s
+ok  	github.com/danthegoodman1/netfence/internal/config	0.004s
+ok  	github.com/danthegoodman1/netfence/internal/daemon	250.333s
+ok  	github.com/danthegoodman1/netfence/internal/store	14.039s
+ok  	github.com/danthegoodman1/netfence/pkg/filter	69.424s
+ok  	github.com/danthegoodman1/netfence/tests/integration	36.055s
+?   	github.com/danthegoodman1/netfence/v1	[no test files]
+
+Focused listener-quarantine test: Docker test service, -race -count=20; all passed.
+The test now waits for the existing reconciliation lock after mutation admission closes.
+Earlier runs exposed this assertion race and cgroup identity-loss timing; both tests were fixed without relaxing production behavior.
+
+Expected skips: subprocess-only helpers (executed by their parent tests), and the opt-in pre-fix negative verification variant.
+No BPF/cgroup/TC capability skips occurred in the accepted runs.
+
+Selected regression evidence from the complete non-race and targeted suites:
+--- PASS: TestDNSQueryLimitsBoundWorkAcrossAttachmentsAndReleaseOnStop (0.00s)
+--- PASS: TestDNSTCPConnectionLimitsIncludeIdleConnections (0.00s)
+--- PASS: TestDNSQueryDeadlineIncludesProxyAndAllUpstreams (0.10s)
+--- PASS: TestRestoreRecreatedFilterStaysBlockedUntilResolverIsReady (0.03s)
+--- PASS: TestExactStateNormalMutationsNeverInventoryWorkingSet (0.00s)
+--- PASS: TestResolverEndpointPinnedRestoreAndSchemaOnePreservation (0.05s)
+--- PASS: TestMappedCIDRBulkAndIncrementalUseSameKernelKey (0.00s)
+--- PASS: TestCgroupBulkTransitionNeverAllowsDeniedCanary (0.05s)
+--- PASS: TestCgroupSecondDaemonAndWrongStorePreservePinnedEnforcement (1.10s)
+--- PASS: TestCgroupSiblingResolverIsolation (0.12s)
+--- PASS: TestTCSiblingResolverIsolation (2.73s)
+--- PASS: TestCgroupBulkTransitionNeverAllowsDeniedCanary (0.05s)
+--- PASS: TestCgroupSecondDaemonAndWrongStorePreservePinnedEnforcement (1.10s)
+--- PASS: TestCgroupSiblingResolverIsolation (0.11s)
+--- PASS: TestTCSiblingResolverIsolation (2.74s)
+
+Final diagnostic-only revision: cc21dd3.
+Command: sudo -n docker -H unix:///var/run/docker.sock compose run --rm test scripts/test-linux.sh ./pkg/filter -race -run 'Test.*(Pinned|Legacy|Schema|Resolver)'
+Result: PASS; pkg/filter 13.020s; no skips.

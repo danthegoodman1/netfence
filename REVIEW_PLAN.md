@@ -2,7 +2,9 @@
 
 Review date: 2026-09-19. Baseline: `6c477aeac55bedb37c8634477fdaa2b0d23b0883`.
 This is a new plan based on the implementation, independent of earlier roadmaps.
-Implementation is in progress on `codex/enforcement-performance-review`.
+Implementation and the simplification pass are complete on
+`codex/enforcement-performance-review`. See [PERFORMANCE_REVIEW.md](PERFORMANCE_REVIEW.md)
+for measured deltas, retained raw samples, and validation evidence.
 
 ## Overarching goal
 
@@ -63,43 +65,20 @@ work through the compose `test`/`bench` services. Kernel-sensitive tests must ex
 on a host with usable BPF, bpffs, writable cgroups, and privileged networking;
 skips or permission failures are not acceptance evidence.
 
-During the initial review, rootless `make check-docker` completed formatting, BPF
-generation, and vet, and its race tests passed for `cmd/netfenced/cmd`,
-`internal/config`, `internal/daemon`, and `internal/store`. The overall gate
-**failed**: BPF map creation returned `operation not permitted`, and creating test
-cgroups returned `permission denied`. No production kernel-performance claim or
-successful integration gate is made. Log: `/tmp/netfence-review-check.log`.
+All five required Docker gates passed using the system Docker daemon through
+`sudo -n env DOCKER_HOST=unix:///var/run/docker.sock make ...`. Retained
+[validation evidence](docs/perf/2026-09-19/validation.txt) names tested revisions,
+package results, focused regressions, and expected helper/negative-test skips.
+No accepted run skipped real BPF/cgroup/TC coverage for missing capabilities.
+The initial review's D1–D7 diagnostic observations are now covered by permanent
+regressions asserting corrected behavior, as recorded in the phase ledgers.
 
-The system Docker daemon is usable through `sudo -n docker -H
-unix:///var/run/docker.sock`. The isolated baseline's full `check` service passed
-(including privileged integration tests); `/tmp/netfence-clean-baseline-check.log`.
-Implementation evidence below distinguishes focused tests from the final gates.
-
-Seven temporary diagnostic probes passed with `-race` using an external Go
-overlay, leaving production and test sources unchanged. They assert the observed
-current behavior, not the desired fixed behavior. Files are session-local under
-`/tmp/netfence-review-probes`; output is `/tmp/netfence-review-probes.log`.
-
-```sh
-docker compose run --rm -v /tmp/netfence-review-probes:/review:ro test \
-  go test -race -count=1 -v -overlay=/review/overlay.json \
-  -run '^TestReview' ./internal/daemon ./pkg/filter ./cmd/netfenced/cmd
-```
-
-| Diagnostic | Reproduction and observed result |
-| --- | --- |
-| D1: `TestReviewDefaultRestartDeletesCommittedOrphan` | Load default config; use a temporary pin root and a fresh default store; classify an existing attachment directory as current via the test seam; call `Start`. The directory is removed. This proves the cleanup decision, not a real-kernel detach. |
-| D2: `TestReviewSocketPublicationReplacesLiveDaemonEndpoint` | Publish two listeners sequentially at the same socket path without closing the first. Both calls succeed; new connections reach the second listener. |
-| D3: `TestReviewHealthyBulkCanActivateStaleDNSAllow` | Start with IP denylist containing `203.0.113.10/32` and a DNS owner for that exact IP. Replace with empty packet/DNS allowlists; inject `EIO` on exact removal. Result: error returned, live mode ALLOWLIST, stale exact key present, no degraded marker. |
-| D4: `TestReviewSuccessfulBulkHasMixedPacketPolicy` | Same transition without failure; observe the exact-removal call. Packet mode is already ALLOWLIST while the old exact key remains installed. This is a userspace ordering observation; BPF source determines the resulting verdict. |
-| D5: `TestReviewResolverEndpointDoesNotAuthenticateAttachment` | Start restricted A and disabled/forwarding B on the same IP. The same client receives REFUSED from A and an upstream answer from B over both UDP and TCP. No real attachment filter was used in this probe. |
-| D6: `TestReviewMappedCIDRUsesDifferentPhysicalFamilies` | Parse `::ffff:192.0.2.1/128`; inspect incremental key, bulk key, and registry string: IPv4/prefix 128, IPv6/prefix 128, and `192.0.2.1/32`, respectively. |
-| D7: `TestReviewColdExactAddInventoriesWorkingSet` | Seed a counting backend with 4,095 keys; add one unrelated IP. Observe two family inventories visiting 4,095 keys for one put. This is operation-count evidence, not a kernel benchmark. |
-
-For implementation, convert the relevant reproductions into permanent regression
-tests asserting the corrected behavior. Add model/interleaving tests at component
-boundaries and traffic tests for the actual guarantees. Preserve existing failure
-injection, pin migration, DNS ownership, and reconnect tests.
+The requested post-implementation simplification pass (`83e7fbb`) removed duplicate
+exact-transaction normalization, redundant inventory state, obsolete orphan
+classification, and duplicate bulk-apply branches. Existing recovery mechanisms
+and simple nonblocking resource slots remain. Final review also clarified pin
+upgrade diagnostics; the focused pinned/migration/resolver race suite passed
+again after that text-only change (`cc21dd3`).
 
 ## Phase 1: Make startup ownership and persistence safe
 
@@ -131,12 +110,12 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Complete | Work | 1A: Durable default and validation | `config/persistence_test.go`: durable default and explicit ephemeral validation; startup creates the data directory after locking. |
+| Complete | Work | 1A: Durable default and validation | `internal/config/persistence_test.go` covers durable defaults and explicit ephemeral validation; startup creates the data directory after locking. |
 | Complete | Work | 1B: One host-shared process lock | `TestDaemonLockLifetime` uses a child process to verify collision/release; `TestPrepareDaemonSocketPreservesLiveEndpoint` passes with race detection. |
 | Complete | Work | 1C: Preserve orphan pins | `TestRestorePreservesOrphanPinDirs` and existing partial/future-schema preservation tests pass. |
 | Complete | Doc | 1D: Configuration and manual recovery guidance | README documents durable storage, `/run/netfence.lock`, container sharing, and preserved orphan inspection. |
-| Incomplete | Test | 1T: Focused startup/restart tests | Missing: D1/D2 regressions and privileged restart results. |
-| Incomplete | Gate | 1G: No unintended startup removal | Missing: passing 1T with detach/tombstone behavior retained. |
+| Complete | Test | 1T: Focused startup/restart tests | `TestDaemonLockLifetime`, `TestPrepareDaemonSocketPreservesLiveEndpoint`, and privileged `TestCgroupSecondDaemonAndWrongStorePreservePinnedEnforcement` pass. |
+| Complete | Gate | 1G: No unintended startup removal | Full Docker check passes restart, detach/tombstone, wrong-store, and second-daemon regressions; real pins remain enforcing after rejected startup. |
 
 ## Phase 2: Fix packet/DNS update ordering in the existing apply path
 
@@ -177,10 +156,10 @@ Status ledger:
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
 | Complete | Work | 2A: Correct ordering in the existing apply path | `applyPreparedRules` revokes obsolete exact keys before entering ALLOWLIST; permanent healthy-transition success/failure regressions pass. |
-| In Progress | Decision | 2B: Validate ordering and its implementation boundary | Existing protected-map transaction retained; focused ordering and failure tests pass. Needs final continuity/denied-canary gate. |
-| In Progress | Work | 2C: Failure and restart containment | DNS-first failures retain the old inert exact tier; existing degraded recovery tests pass. Needs final restart/traffic evidence. |
-| Incomplete | Test | 2T: Focused faults and denied-canary traffic | Missing: permanent D3/D4 regressions and privileged traffic results. |
-| Incomplete | Gate | 2G: R3 eliminated with an understandable apply order | Missing: passing 2T and existing continuity/recovery tests. |
+| Complete | Decision | 2B: Validate ordering and its implementation boundary | `bulk_order_test.go` verifies healthy transitions and same-ALLOWLIST protected survivors; existing continuity tests pass in the full Docker check. |
+| Complete | Work | 2C: Failure and restart containment | `TestHealthyBulkDNSFirstPersistenceFailureRetainsSafeOldPacketPolicy` preserves the durable old mode; existing degraded recovery and restart tests pass. |
+| Complete | Test | 2T: Focused faults and denied-canary traffic | `bulk_order_test.go` and `TestCgroupBulkTransitionNeverAllowsDeniedCanary` pass; focused traffic run observed 0 allowed / 70,733 blocked over 80 transitions. |
+| Complete | Gate | 2G: R3 eliminated with an understandable apply order | Full Docker check passes ordering, fault, survivor, recovery, and denied-canary tests; existing transaction and degraded-state machinery retained. |
 
 ## Phase 3: Prevent access to sibling DNS endpoints
 
@@ -215,9 +194,9 @@ Status ledger:
 | --- | --- | --- | --- |
 | Complete | Decision | 3A: Narrow endpoint restriction in the current topology | `resolver_endpoint` map and shared BPF helpers restrict the reserved ports before carve-outs and DISABLED. |
 | Complete | Work | 3B: Implement endpoint checks | `TestTCResolverGuardPrecedesCarveoutsAndHandlesAmbiguousPackets` executes actual kernel verdicts for both families/transports and malformed/fragmented input. |
-| In Progress | Work | 3C: Reuse/restore compatibility | Schema 2 pins the guard; schema 1 is preserved with controlled-upgrade error. Port-reuse traffic passes; final pinned regression pending. |
+| Complete | Work | 3C: Reuse/restore compatibility | `TestResolverEndpointPinnedRestoreAndSchemaOnePreservation`, `TestRestoreRecreatedFilterStaysBlockedUntilResolverIsReady`, legacy migrations, and live port-reuse tests pass. |
 | Complete | Test | 3T: Two-workload endpoint regression | `TestCgroupSiblingResolverIsolation` and `TestTCSiblingResolverIsolation`: both families/transports, conflicting policies, zero forbidden upstream observations, DISABLED, port reuse. |
-| Incomplete | Gate | 3G: No sibling-resolver bypass in the supported model | Missing: passing 3T and documented compatibility/limitations. |
+| Complete | Gate | 3G: No sibling-resolver bypass in the supported model | Both cgroup and TC isolation traffic tests pass; README documents schema-1 controlled recreation, immutable endpoint/range, and hook/fragment limitations. |
 
 ## Phase 4: Align CIDR conversion and registry identity
 
@@ -244,8 +223,8 @@ Status ledger:
 | --- | --- | --- | --- |
 | Complete | Work | 4A: Shared conversion and lossless registry identity | `filter.CIDRPrefix` and lossless identity shared by incremental, bulk, and TTL operations; kernel mapped-v6 regression passes. |
 | Complete | Work | 4B: Validation and restore consistency | `TestMappedCIDROwnershipSurvivesBulkRemovalExpiryAndAdoption` and invalid-mask tests pass with race detection. |
-| Incomplete | Test | 4T: Cross-operation CIDR regressions | Missing: permanent D6 regression and real-map validation. |
-| Incomplete | Gate | 4G: Consistent physical identity | Missing: passing 4T without a public API migration. |
+| Complete | Test | 4T: Cross-operation CIDR regressions | `TestCIDRIdentityPreservesFamilyAndMasksHostBits`, `TestMappedCIDRBulkAndIncrementalUseSameKernelKey`, and ownership expiry/adoption regression pass. |
+| Complete | Gate | 4G: Consistent physical identity | Real LPM and registry regressions pass in the full Docker check; public net.IPNet API retained. |
 
 ## Phase 5: Make routine DNS exact mutations scale with the batch
 
@@ -287,11 +266,11 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| In Progress | Test | 5A: Real-backend baseline | Five baseline kernel and resolver samples captured under `/tmp/netfence-baseline*-bench.log`; final controlled before/after report pending. |
+| Complete | Test | 5A: Real-backend baseline | Identical real-kernel and UDP resolver fixtures on main/implementation, five samples each with GOMAXPROCS=4 and CPUs 0–3; retained baseline/after logs under `docs/perf/2026-09-19/`. |
 | Complete | Work | 5B: Bounded exact-map transaction redesign | `exactDNSState` caches only counts/capacities and transaction preimages. Existing ambiguous syscall rollback tests and operation-count tests pass. |
-| Incomplete | Doc | 5D: Before/after performance evidence | Missing: retained real-backend samples, tails, and operation counts. |
-| Incomplete | Test | 5T: Scaling and safety regressions | Missing: operation bounds, fault/adoption tests, and warm-path comparison. |
-| Incomplete | Gate | 5G: Measured scalable admission with intact guarantees | Missing: successful 5T and demonstrated gains in 5D. |
+| Complete | Doc | 5D: Before/after performance evidence | `PERFORMANCE_REVIEW.md` records medians, p50/p95/p99, throughput, allocation deltas, warm/packet overhead, full-capacity planner costs, and measurement boundaries. |
+| Complete | Test | 5T: Scaling and safety regressions | `exact_state_test.go`, existing fault/capacity/adoption tests, full Docker gates, and matched warm/cold benchmarks pass; normal mutations perform zero full inventories after adoption. |
+| Complete | Gate | 5G: Measured scalable admission with intact guarantees | At 4,095 entries: cold queries 3.21 ms → 37.7 µs (85.1×), one-IP pairs 5.88 ms → 1.57 µs (3,740×); real-resolver warm queries do not regress. Rollback/capacity gates pass. |
 
 ## Phase 6: Add simple resolver resource limits
 
@@ -305,7 +284,8 @@ Scope:
   work promptly; overload responses must not create a new blocking backlog.
 - 6B: Apply one query deadline across failover/TCP retries/proxy work, derived from
   the existing shutdown context. Release admission slots on every completion path.
-- 6C: Use existing error counters and rate-limited diagnostics to identify overload.
+- 6C: Use existing error counters to surface overload; retain the existing
+  rate-limited admission diagnostics.
   No new telemetry subsystem, priority scheduler, parallel control-plane dispatcher,
   TTL scheduler rewrite, DNS cache, or connection pool is needed for this phase.
 
@@ -325,9 +305,9 @@ Status ledger:
 | --- | --- | --- | --- |
 | Complete | Work | 6A: Simple admission and connection ceilings | Per-attachment/global nonblocking query and accepted-TCP limits; idle connection and cross-attachment tests pass. |
 | Complete | Work | 6B: Total deadline and slot cleanup | One context deadline spans proxy and upstream attempts; cancellation/deadline/overload release tests pass. |
-| Incomplete | Work | 6C: Minimal overload diagnostics | Missing: existing-counter/log integration without new scheduling infrastructure. |
-| Incomplete | Test | 6T: Bounds, cleanup, and accounting overhead | Missing: deterministic Docker tests and below-saturation performance comparison. |
-| Incomplete | Gate | 6G: Bounded retained resolver work | Missing: passing 6T and existing synchronization tests. |
+| Complete | Work | 6C: Minimal overload diagnostics | `dns.go` increments existing dns_queries_errors on query/connection rejection; resource tests check overload counters and README documents their meaning. |
+| Complete | Test | 6T: Bounds, cleanup, and accounting overhead | `dns_resources_test.go` passes query/TCP ceilings, deadline, overload, cancellation, and slot reuse; real-resolver warm means do not regress, proxy diagnostic costs +0.463 µs (+2.7%) as explicitly reported. |
+| Complete | Gate | 6G: Bounded retained resolver work | Full Docker check/test gates retain synchronization guarantees; resource tests prove bounded work and cleanup. `PERFORMANCE_REVIEW.md` records accounting overhead. |
 
 ## Execution order and stopping rules
 
