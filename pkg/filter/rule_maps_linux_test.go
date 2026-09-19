@@ -32,6 +32,30 @@ func TestLPMKeysUseNetworkOrderByteArrayABI(t *testing.T) {
 	assert.Equal(t, "2001:db8:1234::/48", keyToIPv6CIDR(v6Key).String())
 }
 
+func TestMappedCIDRBulkAndIncrementalUseSameKernelKey(t *testing.T) {
+	maps, _ := newSeededClearRulesMaps(t)
+	c := &ruleMapCore{maps: maps}
+	require.NoError(t, c.ClearRules())
+	v4, err := ParseCIDR("192.0.2.1/32")
+	require.NoError(t, err)
+	v6, err := ParseCIDR("::ffff:192.0.2.1/128")
+	require.NoError(t, err)
+	require.NoError(t, c.AllowIP(v4))
+	require.NoError(t, c.AllowIP(v6))
+	var value uint8
+	require.NoError(t, maps.allowed4.Lookup(ipv4CIDRToKey(v4), &value))
+	require.NoError(t, maps.allowed6.Lookup(ipv6CIDRToKey(v6), &value))
+	require.NoError(t, c.RemoveAllowedIP(v6))
+	require.ErrorIs(t, maps.allowed6.Lookup(ipv6CIDRToKey(v6), &value), ebpf.ErrKeyNotExist)
+	require.NoError(t, maps.allowed4.Lookup(ipv4CIDRToKey(v4), &value))
+	keys, err := canonicalProtectedRuleKeys([]*net.IPNet{v6}, nil)
+	require.NoError(t, err)
+	b := bpfProtectedRuleBackend{allowedIPv4: maps.allowed4, allowedIPv6: maps.allowed6}
+	require.NoError(t, b.put(keys[0]))
+	require.NoError(t, c.RemoveAllowedIP(v6))
+	require.ErrorIs(t, maps.allowed6.Lookup(ipv6CIDRToKey(v6), &value), ebpf.ErrKeyNotExist)
+}
+
 func TestConcreteFiltersShareSixMapClearRules(t *testing.T) {
 	constructors := map[string]func(ruleMapHandles) interface{ ClearRules() error }{
 		"cgroup": func(m ruleMapHandles) interface{ ClearRules() error } {

@@ -137,6 +137,18 @@ func shortSocketTempDir(t *testing.T) string {
 	return dir
 }
 
+func TestPrepareDaemonSocketPreservesLiveEndpoint(t *testing.T) {
+	path := filepath.Join(shortSocketTempDir(t), "daemon.sock")
+	first, _, err := prepareDaemonSocket(path, "", defaultSocketSetupOps())
+	require.NoError(t, err)
+	t.Cleanup(func() { first.Close() })
+	_, _, err = prepareDaemonSocket(path, "", defaultSocketSetupOps())
+	require.ErrorContains(t, err, "already listening")
+	conn, err := net.Dial("unix", path)
+	require.NoError(t, err)
+	conn.Close()
+}
+
 func TestRemoveStaleSocketRemovesOnlyUnixSockets(t *testing.T) {
 	dir, err := os.MkdirTemp("/tmp", "netfence-socket-test-")
 	require.NoError(t, err)

@@ -72,40 +72,26 @@ func canonicalProtectedRuleKeys(allowed, denied []*net.IPNet) ([]protectedRuleKe
 	keys := make(map[protectedRuleKey]struct{}, len(allowed)+len(denied))
 	appendList := func(cidrs []*net.IPNet, deniedList bool) error {
 		for i, cidr := range cidrs {
-			if cidr == nil || cidr.IP == nil || cidr.Mask == nil {
-				return fmt.Errorf("protected CIDR %d is nil", i)
+			prefix, err := CIDRPrefix(cidr)
+			if err != nil {
+				return fmt.Errorf("protected CIDR %d: %w", i, err)
 			}
-			ones, bits := cidr.Mask.Size()
-			if ones < 0 || (bits != 32 && bits != 128) {
-				return fmt.Errorf("protected CIDR %d has an invalid mask", i)
-			}
-			var key protectedRuleKey
-			key.prefixLen = uint32(ones)
-			switch bits {
-			case 32:
-				ip4 := cidr.IP.To4()
-				if ip4 == nil {
-					return fmt.Errorf("protected CIDR %d has a 32-bit mask but is not IPv4", i)
-				}
+			key := protectedRuleKey{prefixLen: uint32(prefix.Bits())}
+			if prefix.Addr().Is4() {
 				if deniedList {
 					key.bucket = protectedDeniedIPv4
 				} else {
 					key.bucket = protectedAllowedIPv4
 				}
-				copy(key.addr[:4], ip4.Mask(cidr.Mask))
-			case 128:
-				ip16 := cidr.IP.To16()
-				if ip16 == nil {
-					return fmt.Errorf("protected CIDR %d has a 128-bit mask but is not IPv6", i)
-				}
+				addr := prefix.Addr().As4()
+				copy(key.addr[:4], addr[:])
+			} else {
 				if deniedList {
 					key.bucket = protectedDeniedIPv6
 				} else {
 					key.bucket = protectedAllowedIPv6
 				}
-				copy(key.addr[:], ip16.Mask(cidr.Mask))
-			default:
-				return fmt.Errorf("protected CIDR %d has unsupported address width %d", i, bits)
+				key.addr = prefix.Addr().As16()
 			}
 			keys[key] = struct{}{}
 		}

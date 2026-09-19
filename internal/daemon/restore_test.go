@@ -851,9 +851,8 @@ func TestRestoreDiscardsPinsWhenTargetGone(t *testing.T) {
 	assert.Empty(t, rows, "store row for a gone target must be deleted")
 }
 
-// TestRestoreRemovesOrphanPinDirs: a pin dir with no store row (crash
-// between pinning and the store save) is unowned state and must be removed.
-func TestRestoreRemovesOrphanPinDirs(t *testing.T) {
+// Missing storage does not establish that pinned enforcement is obsolete.
+func TestRestorePreservesOrphanPinDirs(t *testing.T) {
 	env := newRestoreEnv(t, 12304, apiv1.PolicyMode_POLICY_MODE_ALLOWLIST)
 	env.adopted = &fakeFilter{mode: filter.ModeAllowlist}
 	env.mkPinDir(t)
@@ -862,11 +861,30 @@ func TestRestoreRemovesOrphanPinDirs(t *testing.T) {
 	require.NoError(t, os.MkdirAll(orphan, 0o700))
 	require.NoError(t, os.WriteFile(filepath.Join(orphan, "allowed_ipv4"), []byte{}, 0o600))
 
+	require.ErrorContains(t, env.server.Start(), "no matching attachment")
+
+	assert.DirExists(t, orphan, "orphaned enforcement must be preserved")
+	assert.DirExists(t, filepath.Join(env.pinRoot, env.id), "live attachment's pin dir must be kept")
+}
+
+func TestRestoreRecreatedFilterStaysBlockedUntilResolverIsReady(t *testing.T) {
+	env := newRestoreEnv(t, 12367, apiv1.PolicyMode_POLICY_MODE_DISABLED)
+	var created *fakeFilter
+	env.server.newFilter = func(_, _ string, _ apiv1.AttachmentType, mode apiv1.PolicyMode, _ apiv1.TcDirection, _ uint32) (filter.Filter, error) {
+		require.Equal(t, apiv1.PolicyMode_POLICY_MODE_BLOCK_ALL, mode)
+		created = &fakeFilter{mode: filter.ModeBlockAll}
+		return created, nil
+	}
+	serve := env.server.serveDNSServer
+	env.server.serveDNSServer = func(dns *DNSServer) error {
+		mode, _, _, _ := created.snapshot()
+		require.Equal(t, filter.ModeBlockAll, mode)
+		return serve(dns)
+	}
 	require.NoError(t, env.server.Start())
 	t.Cleanup(env.server.Stop)
-
-	assert.NoDirExists(t, orphan, "orphaned pin dir must be removed")
-	assert.DirExists(t, filepath.Join(env.pinRoot, env.id), "live attachment's pin dir must be kept")
+	mode, _, _, _ := created.snapshot()
+	require.Equal(t, filter.ModeDisabled, mode)
 }
 
 func TestRestoreDurableCleanupUsesPersistedPinPathAcrossConfigChanges(t *testing.T) {
@@ -1427,11 +1445,10 @@ func TestRestoreSameIDCurrentRootDirectoryIsOrphanWhenLiveRowOwnsOldRoot(t *test
 		return os.RemoveAll(path)
 	}
 
-	require.NoError(t, env.server.Start())
-	t.Cleanup(env.server.Stop)
-	assert.Equal(t, []string{currentSameIDDir}, removed)
+	require.ErrorContains(t, env.server.Start(), "no matching attachment")
+	assert.Empty(t, removed)
 	assert.DirExists(t, oldPinDir)
-	assert.NoDirExists(t, currentSameIDDir)
+	assert.DirExists(t, currentSameIDDir)
 	loadPinned, newFilter := env.counts()
 	assert.Equal(t, 1, loadPinned)
 	assert.Zero(t, newFilter)

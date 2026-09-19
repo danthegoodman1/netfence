@@ -38,6 +38,7 @@ func (k exactIPKey) ip() net.IP {
 type exactDNSBackend interface {
 	keys(exactIPFamily) ([]exactIPKey, error)
 	capacity(exactIPFamily) (uint32, error)
+	contains(exactIPKey) (bool, error)
 	put(exactIPKey) error
 	delete(exactIPKey) error
 }
@@ -106,74 +107,31 @@ func snapshotExactDNS(b exactDNSBackend) (map[exactIPKey]struct{}, DNSAllowOccup
 	return snapshot, occupancy, nil
 }
 
-func addExactDNSIPs(b exactDNSBackend, ips []net.IP) error {
-	keys, err := canonicalExactIPKeys(ips)
-	if err != nil {
-		return err
-	}
-	if len(keys) == 0 {
-		return nil
-	}
-	before, occupancy, err := snapshotExactDNS(b)
-	if err != nil {
-		return err
-	}
-	var add4, add6 uint32
-	for _, key := range keys {
-		if _, exists := before[key]; exists {
-			continue
-		}
-		if key.family == exactIPv4 {
-			add4++
-		} else {
-			add6++
-		}
-	}
-	if uint64(occupancy.IPv4Entries)+uint64(add4) > uint64(occupancy.IPv4Capacity) {
-		return fmt.Errorf("%w: IPv4 map has %d/%d entries and batch needs %d new entries", ErrDNSAllowCapacity, occupancy.IPv4Entries, occupancy.IPv4Capacity, add4)
-	}
-	if uint64(occupancy.IPv6Entries)+uint64(add6) > uint64(occupancy.IPv6Capacity) {
-		return fmt.Errorf("%w: IPv6 map has %d/%d entries and batch needs %d new entries", ErrDNSAllowCapacity, occupancy.IPv6Entries, occupancy.IPv6Capacity, add6)
-	}
-	for _, key := range keys {
-		if _, exists := before[key]; exists {
-			continue
-		}
-		if err := b.put(key); err != nil {
-			return exactMutationFailure(b, before, fmt.Errorf("adding DNS exact allow %s: %w", key.ip(), err))
-		}
-	}
-	return nil
+// exactDNSState caches counts, not membership. A concrete filter is the sole
+// writer and holds its mutex across lookup, mutation, rollback and publication.
+// Pinned adoption inventories once; successful transactions touch only their keys.
+type exactDNSState struct {
+	initialized bool
+	occupancy   DNSAllowOccupancy
 }
 
-func removeExactDNSIPs(b exactDNSBackend, ips []net.IP) error {
-	keys, err := canonicalExactIPKeys(ips)
-	if err != nil {
-		return err
-	}
-	if len(keys) == 0 {
-		return nil
-	}
-	before, _, err := snapshotExactDNS(b)
-	if err != nil {
-		return err
-	}
-	for _, key := range keys {
-		if _, exists := before[key]; !exists {
-			continue
+func (s *exactDNSState) usage(b exactDNSBackend) (DNSAllowOccupancy, error) {
+	if !s.initialized {
+		_, occupancy, err := snapshotExactDNS(b)
+		if err != nil {
+			return DNSAllowOccupancy{}, err
 		}
-		if err := b.delete(key); err != nil {
-			return exactMutationFailure(b, before, fmt.Errorf("removing DNS exact allow %s: %w", key.ip(), err))
-		}
+		s.occupancy, s.initialized = occupancy, true
 	}
-	return nil
+	return s.occupancy, nil
 }
 
-// replaceExactDNSIPs applies one final-state transaction. Deletions happen
-// before insertions so a full map can exchange keys, but every validation and
-// final-capacity check happens before the first syscall. A key present in both
-// sets remains present and is not touched.
-func replaceExactDNSIPs(b exactDNSBackend, remove, add []net.IP) error {
+type exactChange struct {
+	key           exactIPKey
+	before, after bool
+}
+
+func (s *exactDNSState) replace(b exactDNSBackend, remove, add []net.IP) error {
 	removeKeys, err := canonicalExactIPKeys(remove)
 	if err != nil {
 		return err
@@ -182,141 +140,115 @@ func replaceExactDNSIPs(b exactDNSBackend, remove, add []net.IP) error {
 	if err != nil {
 		return err
 	}
-	if len(removeKeys) == 0 && len(addKeys) == 0 {
+	if len(removeKeys)+len(addKeys) == 0 {
 		return nil
 	}
-	before, occupancy, err := snapshotExactDNS(b)
+	occupancy, err := s.usage(b)
 	if err != nil {
 		return err
 	}
-	desired := make(map[exactIPKey]struct{}, len(before)+len(addKeys))
-	for key := range before {
-		desired[key] = struct{}{}
-	}
+	wanted := make(map[exactIPKey]bool, len(removeKeys)+len(addKeys))
 	for _, key := range removeKeys {
-		delete(desired, key)
+		wanted[key] = false
 	}
 	for _, key := range addKeys {
-		desired[key] = struct{}{}
+		wanted[key] = true
 	}
-	var final4, final6 uint64
-	for key := range desired {
+	keys := make([]exactIPKey, 0, len(wanted))
+	for key := range wanted {
+		keys = append(keys, key)
+	}
+	sortExactIPKeys(keys)
+	changes := make([]exactChange, 0, len(keys))
+	final4, final6 := int64(occupancy.IPv4Entries), int64(occupancy.IPv6Entries)
+	for _, key := range keys {
+		before, err := b.contains(key)
+		if err != nil {
+			return fmt.Errorf("looking up DNS exact allow %s: %w", key.ip(), err)
+		}
+		after := wanted[key]
+		if before == after {
+			continue
+		}
+		changes = append(changes, exactChange{key, before, after})
+		delta := int64(-1)
+		if after {
+			delta = 1
+		}
 		if key.family == exactIPv4 {
-			final4++
+			final4 += delta
 		} else {
-			final6++
+			final6 += delta
 		}
 	}
-	if final4 > uint64(occupancy.IPv4Capacity) {
-		return fmt.Errorf("%w: replacement would use %d/%d IPv4 entries", ErrDNSAllowCapacity, final4, occupancy.IPv4Capacity)
+	if final4 < 0 || final6 < 0 {
+		s.initialized = false
+		return fmt.Errorf("DNS exact occupancy changed outside the filter owner")
 	}
-	if final6 > uint64(occupancy.IPv6Capacity) {
-		return fmt.Errorf("%w: replacement would use %d/%d IPv6 entries", ErrDNSAllowCapacity, final6, occupancy.IPv6Capacity)
+	if final4 > int64(occupancy.IPv4Capacity) || final6 > int64(occupancy.IPv6Capacity) {
+		return fmt.Errorf("%w: replacement uses IPv4 %d/%d, IPv6 %d/%d", ErrDNSAllowCapacity, final4, occupancy.IPv4Capacity, final6, occupancy.IPv6Capacity)
 	}
-
-	for _, key := range removeKeys {
-		if _, existed := before[key]; !existed {
-			continue
-		}
-		if _, keep := desired[key]; keep {
-			continue
-		}
-		if err := b.delete(key); err != nil {
-			return exactMutationFailure(b, before, fmt.Errorf("removing DNS exact allow %s during replacement: %w", key.ip(), err))
+	// Delete first so replacements fit a full map; overlap/survivors are untouched.
+	for _, adding := range []bool{false, true} {
+		for _, change := range changes {
+			if change.after != adding {
+				continue
+			}
+			if adding {
+				err = b.put(change.key)
+			} else {
+				err = b.delete(change.key)
+			}
+			if err != nil {
+				mutationErr := fmt.Errorf("mutating DNS exact allow %s: %w", change.key.ip(), err)
+				if rollbackErr := restoreExactChanges(b, changes); rollbackErr != nil {
+					s.initialized = false
+					return errors.Join(mutationErr, fmt.Errorf("%w: %w", ErrDNSAllowRollback, rollbackErr))
+				}
+				return mutationErr
+			}
 		}
 	}
-	for _, key := range addKeys {
-		if _, existed := before[key]; existed {
-			continue
-		}
-		if err := b.put(key); err != nil {
-			return exactMutationFailure(b, before, fmt.Errorf("adding DNS exact allow %s during replacement: %w", key.ip(), err))
-		}
-	}
+	s.occupancy.IPv4Entries, s.occupancy.IPv6Entries = uint32(final4), uint32(final6)
 	return nil
 }
 
-func exactMutationFailure(b exactDNSBackend, before map[exactIPKey]struct{}, mutationErr error) error {
-	if rollbackErr := restoreExactDNSSnapshot(b, before); rollbackErr != nil {
-		return errors.Join(mutationErr, fmt.Errorf("%w: caller must fail closed/quarantine until exact-tier reconciliation: %w", ErrDNSAllowRollback, rollbackErr))
-	}
-	return mutationErr
-}
-
-// restoreExactDNSSnapshot restores the whole exact tier, not just successful
-// syscalls recorded by the caller. That also covers an ambiguous failing
-// syscall which may have reached the kernel before returning an error.
-func restoreExactDNSSnapshot(b exactDNSBackend, want map[exactIPKey]struct{}) error {
-	current, err := currentExactDNSKeys(b)
-	if err != nil {
-		return err
-	}
+// Every syscall can affect only its named key. Restore all changed preimages,
+// including the failing syscall's key; verify actual membership rather than
+// interpreting intermediate errno values. Unrelated keys never need a snapshot.
+func restoreExactChanges(b exactDNSBackend, changes []exactChange) error {
 	var errs []error
-	var residual []exactIPKey
-	for key := range current {
-		if _, keep := want[key]; keep {
-			continue
-		}
-		residual = append(residual, key)
-	}
-	sortExactIPKeys(residual)
-	for _, key := range residual {
-		if err := b.delete(key); err != nil {
-			errs = append(errs, fmt.Errorf("deleting residual %s: %w", key.ip(), err))
-		}
-	}
-	var missing []exactIPKey
-	for key := range want {
-		if _, present := current[key]; present {
-			continue
-		}
-		missing = append(missing, key)
-	}
-	sortExactIPKeys(missing)
-	for _, key := range missing {
-		if err := b.put(key); err != nil {
-			errs = append(errs, fmt.Errorf("restoring removed %s: %w", key.ip(), err))
+	for _, restoring := range []bool{false, true} {
+		for _, change := range changes {
+			if change.before != restoring {
+				continue
+			}
+			present, err := b.contains(change.key)
+			if err == nil && present == change.before {
+				continue
+			}
+			if restoring {
+				err = b.put(change.key)
+			} else {
+				err = b.delete(change.key)
+			}
+			if err != nil {
+				errs = append(errs, err)
+			}
 		}
 	}
-	got, verifyErr := currentExactDNSKeys(b)
-	if verifyErr == nil && exactSnapshotsEqual(want, got) {
-		// A syscall may report an ambiguous failure after the kernel completed
-		// it. The authoritative post-rollback snapshot, not the intermediate
-		// errno, decides whether the pre-state is proven restored.
+	proven := true
+	for _, change := range changes {
+		present, err := b.contains(change.key)
+		if err != nil || present != change.before {
+			proven = false
+			errs = append(errs, fmt.Errorf("rollback cannot prove pre-state for %s: present=%t want=%t error=%v", change.key.ip(), present, change.before, err))
+		}
+	}
+	if proven {
 		return nil
 	}
-	if verifyErr != nil {
-		errs = append(errs, fmt.Errorf("verifying rollback snapshot: %w", verifyErr))
-	} else {
-		errs = append(errs, fmt.Errorf("rollback snapshot differs: want %d keys, got %d", len(want), len(got)))
-	}
 	return errors.Join(errs...)
-}
-
-func currentExactDNSKeys(b exactDNSBackend) (map[exactIPKey]struct{}, error) {
-	current := make(map[exactIPKey]struct{})
-	for _, family := range []exactIPFamily{exactIPv4, exactIPv6} {
-		keys, err := b.keys(family)
-		if err != nil {
-			return nil, fmt.Errorf("listing DNS exact IPv%d allows: %w", family, err)
-		}
-		for _, key := range keys {
-			current[key] = struct{}{}
-		}
-	}
-	return current, nil
-}
-
-func exactSnapshotsEqual(a, b map[exactIPKey]struct{}) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for key := range a {
-		if _, ok := b[key]; !ok {
-			return false
-		}
-	}
-	return true
 }
 
 func listExactDNSIPs(b exactDNSBackend) ([]net.IP, error) {
@@ -334,9 +266,4 @@ func listExactDNSIPs(b exactDNSBackend) ([]net.IP, error) {
 		ips = append(ips, key.ip())
 	}
 	return ips, nil
-}
-
-func exactDNSOccupancy(b exactDNSBackend) (DNSAllowOccupancy, error) {
-	_, occupancy, err := snapshotExactDNS(b)
-	return occupancy, err
 }

@@ -440,6 +440,31 @@ func TestCgroupKill9KeepsEnforcing(t *testing.T) {
 	d2.term(t)
 }
 
+func TestCgroupSecondDaemonAndWrongStorePreservePinnedEnforcement(t *testing.T) {
+	env := setupKill9Env(t, "startup-ownership", true, false, 34810)
+	other := t.TempDir()
+	dataDir := filepath.Join(other, "new-store")
+	otherSocket := filepath.Join(other, "other.sock")
+	cfg := writeDaemonConfig(t, other, daemonConfig{socket: otherSocket, dataDir: dataDir, pinRoot: env.pinRoot, portMin: 34810, portMax: 34820})
+	attempt := func() string {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		out, err := exec.CommandContext(ctx, env.bin, "start", "--config", cfg).CombinedOutput()
+		require.Error(t, err, "second/wrong-store startup must fail")
+		require.NoError(t, ctx.Err(), "startup should fail promptly")
+		return string(out)
+	}
+	require.Contains(t, attempt(), "host daemon lock")
+	require.NoDirExists(t, dataDir, "lock collision precedes storage creation")
+	require.NoFileExists(t, otherSocket)
+	require.Equal(t, 1, connect4ProgCount(t, env.cgroup))
+	env.daemon.kill9(t)
+	require.Contains(t, attempt(), "no matching attachment")
+	require.DirExists(t, env.pinDir())
+	require.Equal(t, 1, connect4ProgCount(t, env.cgroup), "missing database must not detach pins")
+	require.False(t, runInCgroup(env.cgroup, kill9BlockedIP+" 53"))
+}
+
 // TestCgroupKill9NegativeVerifyPre3A re-runs the kill-9 flow with pinning
 // DISABLED (bpf_pin_dir: "") — the pre-3A behavior — and inverts the
 // headline assertions to prove the kill-9 test actually bites: with fd-bound

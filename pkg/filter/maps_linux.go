@@ -350,3 +350,20 @@ func sumPerCPUCounter(m *ebpf.Map, key uint32) (uint64, error) {
 	}
 	return total, nil
 }
+
+func (b bpfExactDNSBackend) contains(key exactIPKey) (bool, error) {
+	m, err := b.mapFor(key.family)
+	if err != nil {
+		return false, err
+	}
+	var value uint8
+	if key.family == exactIPv4 {
+		err = m.Lookup([4]byte(key.addr[:4]), &value)
+	} else {
+		err = m.Lookup(key.addr, &value)
+	}
+	if errors.Is(err, ebpf.ErrKeyNotExist) {
+		return false, nil
+	}
+	return err == nil, err
+}

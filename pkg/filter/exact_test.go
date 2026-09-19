@@ -369,3 +369,18 @@ func TestExactDNSReplaceResidualIsRollbackAmbiguity(t *testing.T) {
 		t.Fatalf("residual replacement must be ambiguous, got %v", err)
 	}
 }
+
+// One-shot helpers keep transaction tests independent of cache lifetime tests.
+func addExactDNSIPs(b exactDNSBackend, ips []net.IP) error {
+	return (&exactDNSState{}).replace(b, nil, ips)
+}
+func removeExactDNSIPs(b exactDNSBackend, ips []net.IP) error {
+	return (&exactDNSState{}).replace(b, ips, nil)
+}
+func replaceExactDNSIPs(b exactDNSBackend, remove, add []net.IP) error {
+	return (&exactDNSState{}).replace(b, remove, add)
+}
+func (b *fakeExactBackend) contains(key exactIPKey) (bool, error) {
+	_, ok := b.entries[key]
+	return ok, nil
+}

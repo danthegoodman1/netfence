@@ -39,7 +39,7 @@ const (
 )
 
 // ttlKey identifies one tracked filter entry. cidr is the canonical (masked)
-// string form produced by (*net.IPNet).String(), so equal control-plane
+// family-preserving form produced by filter.CIDRString, so equal control-plane
 // networks written differently collapse to one key.
 type ttlKey struct {
 	cidr string
@@ -123,7 +123,7 @@ func (r *ttlRegistry) needsPhysicalAdd(cidr *net.IPNet, list ruleList) bool {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	entry, ok := r.entries[ttlKey{cidr: cidr.String(), list: list}]
+	entry, ok := r.entries[ttlKey{cidr: filter.CIDRString(cidr), list: list}]
 	return !ok || !entry.registryPresent
 }
 
@@ -138,9 +138,12 @@ func (r *ttlRegistry) addSystem(f filter.Filter, cidr *net.IPNet, list ruleList)
 // CP aliases survive; the physical entry is removed only when system was its
 // sole owner. On removal failure the source-less entry remains for retry.
 func (r *ttlRegistry) removeSystem(f filter.Filter, cidr *net.IPNet, list ruleList) error {
+	if _, err := filter.CIDRPrefix(cidr); err != nil {
+		return err
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	key := ttlKey{cidr: cidr.String(), list: list}
+	key := ttlKey{cidr: filter.CIDRString(cidr), list: list}
 	entry, ok := r.entries[key]
 	if !ok || !entry.system {
 		return nil
@@ -156,7 +159,10 @@ func (r *ttlRegistry) removeSystem(f filter.Filter, cidr *net.IPNet, list ruleLi
 // addLocked publishes only after success; an errored syscall leaves registry
 // and aggregate state pre-call even when its physical effect occurred.
 func (r *ttlRegistry) addLocked(f filter.Filter, cidr *net.IPNet, list ruleList, cp bool, ttl time.Duration, now time.Time) error {
-	key := ttlKey{cidr: cidr.String(), list: list}
+	if _, err := filter.CIDRPrefix(cidr); err != nil {
+		return err
+	}
+	key := ttlKey{cidr: filter.CIDRString(cidr), list: list}
 	entry, ok := r.entries[key]
 	if !ok {
 		entry = protectedEntry{cidr: cidr}
@@ -252,10 +258,10 @@ func (r *ttlRegistry) seedAdopted(allowed, denied []*net.IPNet) error {
 	seeded := make(map[ttlKey]protectedEntry, len(allowed)+len(denied))
 	seedList := func(list ruleList, cidrs []*net.IPNet) error {
 		for _, cidr := range cidrs {
-			if cidr == nil {
-				return fmt.Errorf("adopted %s inventory contains a nil CIDR", list)
+			if _, err := filter.CIDRPrefix(cidr); err != nil {
+				return fmt.Errorf("adopted %s inventory: %w", list, err)
 			}
-			key := ttlKey{cidr: cidr.String(), list: list}
+			key := ttlKey{cidr: filter.CIDRString(cidr), list: list}
 			if _, exists := seeded[key]; exists {
 				continue
 			}
@@ -304,7 +310,7 @@ func (r *ttlRegistry) reconcileAuthoritative(f filter.Filter, mode filter.Policy
 	}
 	projectList := func(list ruleList, desired []parsedCIDR) {
 		for _, d := range desired {
-			key := ttlKey{cidr: d.cidr.String(), list: list}
+			key := ttlKey{cidr: filter.CIDRString(d.cidr), list: list}
 			entry, exists := projected[key]
 			if !exists {
 				entry = protectedEntry{cidr: d.cidr}
@@ -332,8 +338,8 @@ func (r *ttlRegistry) reconcileAuthoritative(f filter.Filter, mode filter.Policy
 			denied = append(denied, entry.cidr)
 		}
 	}
-	sort.Slice(allowed, func(i, j int) bool { return allowed[i].String() < allowed[j].String() })
-	sort.Slice(denied, func(i, j int) bool { return denied[i].String() < denied[j].String() })
+	sort.Slice(allowed, func(i, j int) bool { return filter.CIDRString(allowed[i]) < filter.CIDRString(allowed[j]) })
+	sort.Slice(denied, func(i, j int) bool { return filter.CIDRString(denied[i]) < filter.CIDRString(denied[j]) })
 
 	if err := f.ReplaceProtectedRules(allowed, denied, mode); err != nil {
 		r.recordMapFullLocked(err, true)
@@ -455,10 +461,13 @@ func (r *ttlRegistry) protectedStatsWarningAllowed(now time.Time) bool {
 // remove drops CP ownership, preserving a system alias. Failure retains prior
 // CP exactly; unlike clear/expiry/system teardown it creates no janitor retry.
 func (r *ttlRegistry) remove(f filter.Filter, cidr *net.IPNet, list ruleList) error {
+	if _, err := filter.CIDRPrefix(cidr); err != nil {
+		return err
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	key := ttlKey{cidr: cidr.String(), list: list}
+	key := ttlKey{cidr: filter.CIDRString(cidr), list: list}
 	entry, ok := r.entries[key]
 	if !ok {
 		return nil
@@ -493,7 +502,7 @@ func (r *ttlRegistry) needsPhysicalRemove(cidr *net.IPNet, list ruleList) bool {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	entry, ok := r.entries[ttlKey{cidr: cidr.String(), list: list}]
+	entry, ok := r.entries[ttlKey{cidr: filter.CIDRString(cidr), list: list}]
 	return ok && !entry.system && entry.registryPresent
 }
 

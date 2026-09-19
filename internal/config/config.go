@@ -28,10 +28,17 @@ type Config struct {
 }
 
 type DNSConfig struct {
-	ListenAddr string `mapstructure:"listen_addr"`
-	PortMin    int    `mapstructure:"port_min"`
-	PortMax    int    `mapstructure:"port_max"`
-	Upstream   string `mapstructure:"upstream"`
+	// Zero selects the defaults: 128/4096 active queries and 32/1024
+	// accepted TCP connections per attachment/daemon, with a 5s query deadline.
+	MaxConcurrentQueries    int           `mapstructure:"max_concurrent_queries"`
+	MaxGlobalQueries        int           `mapstructure:"max_global_queries"`
+	MaxTCPConnections       int           `mapstructure:"max_tcp_connections"`
+	MaxGlobalTCPConnections int           `mapstructure:"max_global_tcp_connections"`
+	QueryTimeout            time.Duration `mapstructure:"query_timeout"`
+	ListenAddr              string        `mapstructure:"listen_addr"`
+	PortMin                 int           `mapstructure:"port_min"`
+	PortMax                 int           `mapstructure:"port_max"`
+	Upstream                string        `mapstructure:"upstream"`
 	// MinFilterTTL is the minimum lifetime a DNS-resolved IP stays in the
 	// eBPF filter, regardless of a smaller DNS record TTL (the filter
 	// deadline is max(record TTL, this floor)). Prevents tiny record TTLs
@@ -167,6 +174,7 @@ func Load(configPath string) (*Config, error) {
 	v.SetDefault("dns.port_max", 11500)
 	v.SetDefault("dns.upstream", "8.8.8.8:53")
 	v.SetDefault("log_level", "info")
+	v.SetDefault("data_dir", "/var/lib/netfence")
 	v.SetDefault("socket", "/var/run/netfence.sock")
 	v.SetDefault("socket_group", "")
 	v.SetDefault("dns.min_filter_ttl", 60*time.Second)
@@ -206,6 +214,9 @@ func Load(configPath string) (*Config, error) {
 }
 
 func (c *Config) Validate() error {
+	if c.Filter.BPFPinDir != "" && c.DataDir == "" {
+		return fmt.Errorf("data_dir must be durable when filter.bpf_pin_dir is enabled; disable pinning explicitly for ephemeral operation")
+	}
 	if c.DNS.PortMin > c.DNS.PortMax {
 		return fmt.Errorf("dns.port_min (%d) must be <= dns.port_max (%d)", c.DNS.PortMin, c.DNS.PortMax)
 	}
@@ -221,10 +232,17 @@ func (c *Config) Validate() error {
 	if c.DNS.ChurnWindow < 0 {
 		return fmt.Errorf("dns.churn_window must not be negative")
 	}
+	if c.DNS.QueryTimeout < 0 {
+		return fmt.Errorf("dns.query_timeout must not be negative")
+	}
 	for _, field := range []struct {
 		name  string
 		value int
 	}{
+		{"dns.max_concurrent_queries", c.DNS.MaxConcurrentQueries},
+		{"dns.max_global_queries", c.DNS.MaxGlobalQueries},
+		{"dns.max_tcp_connections", c.DNS.MaxTCPConnections},
+		{"dns.max_global_tcp_connections", c.DNS.MaxGlobalTCPConnections},
 		{"dns.max_ips_per_family", c.DNS.MaxIPsPerFamily},
 		{"dns.max_ips_per_response", c.DNS.MaxIPsPerResponse},
 		{"dns.max_ips_per_policy_domain", c.DNS.MaxIPsPerPolicyDomain},

@@ -49,6 +49,48 @@ struct {                                           \
 EXACT_MAP(dns_allowed_ipv4, 4);
 EXACT_MAP(dns_allowed_ipv6, 16);
 
+// Per-workload resolver identity. This restriction precedes packet policy and
+// carve-outs, including DISABLED. Zero family is the standalone-library default.
+struct resolver_endpoint_config {
+    __u8 addr[16];
+    __u16 port_min;
+    __u16 port_max;
+    __u16 own_port;
+    __u16 family;
+};
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct resolver_endpoint_config);
+} resolver_endpoint SEC(".maps");
+
+static __always_inline struct resolver_endpoint_config *resolver_config(void)
+{
+    __u32 key = 0;
+    return bpf_map_lookup_elem(&resolver_endpoint, &key);
+}
+
+static __always_inline int resolver_address4(const struct resolver_endpoint_config *g, const __u8 *addr)
+{
+    return g && g->family == 4 && __builtin_memcmp(g->addr, addr, 4) == 0;
+}
+
+static __always_inline int resolver_address6(const struct resolver_endpoint_config *g, const __u8 *addr)
+{
+    if (!g) return 0;
+    if (g->family == 6) return __builtin_memcmp(g->addr, addr, 16) == 0;
+    // IPv4-mapped connect6 destinations must obey the IPv4 endpoint guard.
+    const __u8 mapped[12] = {0,0,0,0,0,0,0,0,0,0,255,255};
+    return g->family == 4 && __builtin_memcmp(addr, mapped, 12) == 0 &&
+           __builtin_memcmp(g->addr, addr + 12, 4) == 0;
+}
+
+static __always_inline int resolver_wrong_port(const struct resolver_endpoint_config *g, __u16 port)
+{
+    return port >= g->port_min && port <= g->port_max && port != g->own_port;
+}
+
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 1);

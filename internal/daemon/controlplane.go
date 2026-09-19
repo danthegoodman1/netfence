@@ -1187,12 +1187,21 @@ func (s *Server) applyPreparedRules(id string, prepared *preparedBulkUpdate) err
 		}
 	}
 
-	// ReconcileCIDRs owns the mode write too, sandwiching it between the
-	// two list reconciles (new mode's list first) so no mode pair opens a
-	// transient allow/block window — see its doc comment.
 	degradedActivationHeld, holdErr := s.holdAuthoritativeRecoveryIfNeededAdmitted(id, state)
 	if holdErr != nil {
 		return s.finishDNSMutation(state, done, fmt.Errorf("preparing authoritative BLOCK_ALL recovery hold: %w", holdErr))
+	}
+	s.mu.RLock()
+	dnsFirst := !degradedActivationHeld && update.Mode == apiv1.PolicyMode_POLICY_MODE_ALLOWLIST && state.info.Mode != apiv1.PolicyMode_POLICY_MODE_ALLOWLIST.String()
+	s.mu.RUnlock()
+	// Exact DNS allows are inert outside ALLOWLIST. Revoke obsolete keys
+	// before activating that tier, including across a crash between stages.
+	// Within ALLOWLIST, install protected survivors first: removing an exact
+	// owner before its replacement CIDR exists would interrupt surviving traffic.
+	if dnsFirst {
+		if err := s.replaceDNSPreparedAdmitted(id, state, preparedDNS); err != nil {
+			return s.finishDNSMutation(state, done, fmt.Errorf("reconciling DNS before activating allowlist: %w", err))
+		}
 	}
 	degradedActivationHeld, reconcileErr := s.stageAuthoritativeCIDRsAdmitted(id, state, update.Mode, allowCIDRs, denyCIDRs, degradedActivationHeld)
 	if reconcileErr != nil {
@@ -1211,14 +1220,10 @@ func (s *Server) applyPreparedRules(id string, prepared *preparedBulkUpdate) err
 	// remaps owners when rule precedence changes, and promptly removes keys
 	// whose queries no longer have an authorizing policy owner.
 	var dnsErr error
-	if update.Dns == nil {
+	if !dnsFirst {
 		if dnsErr = s.replaceDNSPreparedAdmitted(id, state, preparedDNS); dnsErr != nil {
-			s.logger.Error().Err(dnsErr).Str("id", id).Msg("failed to clear DNS rules in bulk update")
-			dnsErr = fmt.Errorf("clearing DNS rules: %w", dnsErr)
+			dnsErr = fmt.Errorf("replacing DNS rules: %w", dnsErr)
 		}
-	} else if dnsErr = s.replaceDNSPreparedAdmitted(id, state, preparedDNS); dnsErr != nil {
-		s.logger.Error().Err(dnsErr).Str("id", id).Msg("failed to replace DNS rules in bulk update")
-		dnsErr = fmt.Errorf("replacing DNS rules: %w", dnsErr)
 	}
 	if dnsErr != nil && degradedActivationHeld {
 		// The pre-existing durable marker and effective BLOCK_ALL intentionally
@@ -1318,7 +1323,7 @@ func (s *Server) parseDesiredCIDRs(id, list string, entries []*apiv1.CIDREntry) 
 				Msg("failed to parse CIDR in full desired state")
 			return nil, fmt.Errorf("parsing %s CIDR %q: %w", list, entry.Cidr, err)
 		}
-		canonical := cidr.String()
+		canonical := filter.CIDRString(cidr)
 		if _, duplicate := seen[canonical]; duplicate {
 			return nil, fmt.Errorf("duplicate %s CIDR %q (canonical %s)", list, entry.Cidr, canonical)
 		}
