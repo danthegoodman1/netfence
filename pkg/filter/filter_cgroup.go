@@ -389,7 +389,7 @@ func loadPinnedCgroupFilter(cgroupPath, pinDir string, originalCarveouts *Carveo
 		return f, nil
 	}
 	if originalCarveouts == nil {
-		return nil, fmt.Errorf("%w: cgroup pin set %s has no committed current schema marker", ErrPinnedSchemaUpgradeRequired, pinDir)
+		return nil, fmt.Errorf("%w: cgroup pin set %s has no committed current schema marker; supply the original carve-outs with LoadPinnedCgroupFilterWithOptions", ErrPinnedSchemaUpgradeRequired, pinDir)
 	}
 	if err := f.migratePinnedSchema(*originalCarveouts, opts, markerPresent, exact4Present, exact6Present, migrationOps); err != nil {
 		return nil, err
