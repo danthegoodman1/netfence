@@ -534,39 +534,35 @@ func TestCgroupDetachOnStopStopsEnforcing(t *testing.T) {
 	}), "traffic must be unfiltered after detach_on_stop stop")
 }
 
-// TestCgroupKill9RecreatedTargetNotAdopted: a kernel bpf_link binds to the
-// cgroup OBJECT, not its path. If the cgroup is destroyed and recreated at
-// the same path while the daemon is down (a routine container restart), the
-// pinned links are defunct: adopting them would leave the RECREATED cgroup
-// completely unfiltered while the daemon reports an enforcing attachment.
-// Restore must detect the reincarnation, discard the pins, and fall back to
-// a FRESH attachment on the new cgroup in the persisted mode — fail-closed
-// (empty allowlist), never fail-open.
+// A deleted cgroup can lose its link target ID asynchronously. Once identity
+// is gone, startup must preserve the pins and fail instead of reporting that
+// the new object at the same path is filtered. Proven nonzero mismatches are
+// covered by the filter adapter and the daemon's recreation tests.
 func TestCgroupKill9RecreatedTargetNotAdopted(t *testing.T) {
 	env := setupKill9Env(t, "reincarnate", true, false, 23500)
-
 	env.daemon.kill9(t)
-
-	// Destroy and recreate the cgroup at the SAME path while the daemon is
-	// dead.
-	require.NoError(t, os.Remove(env.cgroup), "removing cgroup (must be empty)")
-	require.NoError(t, os.MkdirAll(env.cgroup, 0o755))
-
+	require.NoError(t, os.Remove(env.cgroup))
+	require.NoError(t, os.MkdirAll(env.cgroup, 0755))
 	env.stopCP()
-	d2 := startDaemon(t, env.bin, env.cfgPath, env.socket, env.logPath)
-	defer d2.term(t)
-
-	// A fresh program set must be attached to the RECREATED cgroup (the
-	// defunct pinned links target the dead cgroup and enforce nothing here).
-	assert.Equal(t, 1, connect4ProgCount(t, env.cgroup),
-		"recreated target must get a fresh attachment, not a defunct adopted link")
-	// Fail-closed, not fail-open: the persisted allowlist mode is enforced
-	// with an empty rule set (the rules belonged to the dead cgroup's life;
-	// the control plane resyncs them), so BOTH destinations are blocked.
-	assert.False(t, runInCgroup(env.cgroup, kill9BlockedIP+" 53"),
-		"recreated target must NOT be fail-open: blocked IP must not connect")
-	assert.False(t, runInCgroup(env.cgroup, kill9AllowedIP+" 53"),
-		"recreated target enforces the persisted allowlist mode empty (fail-closed) until CP resync")
+	pinned, err := link.LoadPinnedLink(filepath.Join(env.pinDir(), "link_connect4"), nil)
+	require.NoError(t, err)
+	defer pinned.Close()
+	require.True(t, waitForCondition(5*time.Second, func() bool {
+		info, err := pinned.Info()
+		return err == nil && info.Cgroup() != nil && info.Cgroup().CgroupId == 0
+	}), "fixture requires the kernel to finish releasing the deleted cgroup identity")
+	before, err := os.ReadDir(env.pinDir())
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, env.bin, "start", "--config", env.cfgPath).CombinedOutput()
+	require.Error(t, err)
+	require.NoError(t, ctx.Err(), "identity ambiguity must fail promptly")
+	require.Contains(t, string(out), "exposes no cgroup target identity")
+	after, err := os.ReadDir(env.pinDir())
+	require.NoError(t, err)
+	require.Len(t, after, len(before), "unknown pins must be preserved")
+	assert.Zero(t, connect4ProgCount(t, env.cgroup), "startup must not claim that the defunct link protects this new cgroup")
 }
 
 // TestCgroupPinnedRestoreSubscribedAckReconciles: after a kill-9 restart the

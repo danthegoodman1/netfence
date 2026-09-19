@@ -4,12 +4,32 @@ package filter
 
 import (
 	"net/netip"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
 
+	"github.com/cilium/ebpf"
 	"github.com/stretchr/testify/require"
 )
+
+func TestCgroupPinnedKnownTargetMismatchPreservesPins(t *testing.T) {
+	root := pinTestRoot(t)
+	oldPath, newPath := "/sys/fs/cgroup/nf-known-old", "/sys/fs/cgroup/nf-known-new"
+	for _, path := range []string{oldPath, newPath} {
+		require.NoError(t, os.Mkdir(path, 0755))
+		t.Cleanup(func() { os.Remove(path) })
+	}
+	pins := filepath.Join(root, "attachment")
+	f, err := NewCgroupFilterWithOptions(oldPath, ModeAllowlist, DefaultCarveouts(), Options{PinDir: pins})
+	require.NoError(t, err)
+	t.Cleanup(func() { f.Detach() })
+	_, err = LoadPinnedCgroupFilter(newPath, pins)
+	require.ErrorIs(t, err, ErrPinnedTargetMismatch)
+	require.FileExists(t, filepath.Join(pins, pinLinkConnect4))
+	require.Equal(t, 1, queryCgroupProgCount(t, oldPath, ebpf.AttachCGroupInet4Connect))
+	require.Zero(t, queryCgroupProgCount(t, newPath, ebpf.AttachCGroupInet4Connect))
+}
 
 func TestResolverEndpointPinnedRestoreAndSchemaOnePreservation(t *testing.T) {
 	root := pinTestRoot(t)
