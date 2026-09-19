@@ -1,5 +1,3 @@
- Container netfence-bench-run-392009e323f1 Creating 
- Container netfence-bench-run-392009e323f1 Created 
 ?   	github.com/danthegoodman1/netfence/cmd/netfenced	[no test files]
 PASS
 ok  	github.com/danthegoodman1/netfence/cmd/netfenced/cmd	0.004s
