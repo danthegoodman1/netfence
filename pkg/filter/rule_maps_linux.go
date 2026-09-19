@@ -15,8 +15,9 @@ import (
 // the cgroup and TC programs. Concrete filters own attachment and pin
 // lifecycles; this core owns every rule, mode, inventory, and stats operation.
 type ruleMapCore struct {
-	mu   sync.Mutex
-	maps ruleMapHandles
+	mu    sync.Mutex
+	maps  ruleMapHandles
+	exact exactDNSState
 }
 
 type ruleMapHandles struct {
@@ -28,9 +29,10 @@ type ruleMapHandles struct {
 	exact6   *ebpf.Map
 	mode     *ebpf.Map
 	stats    *ebpf.Map
+	resolver *ebpf.Map
 }
 
-func (c *ruleMapCore) setRuleMaps(m ruleMapHandles) { c.maps = m }
+func (c *ruleMapCore) setRuleMaps(m ruleMapHandles) { c.maps = m; c.exact = exactDNSState{} }
 
 func (c *ruleMapCore) protectedBackendLocked() (protectedRuleBackend, error) {
 	m := c.maps
@@ -76,24 +78,31 @@ func (c *ruleMapCore) GetMode() (PolicyMode, error) {
 }
 
 func (c *ruleMapCore) putCIDR(cidr *net.IPNet, v4, v6 *ebpf.Map) error {
+	prefix, err := CIDRPrefix(cidr)
+	if err != nil {
+		return err
+	}
 	if v4 == nil || v6 == nil {
 		return fmt.Errorf("filter handles are closed")
 	}
-	if cidr.IP.To4() != nil {
-		return v4.Put(ipv4CIDRToKey(cidr), uint8(1))
+	if prefix.Addr().Is4() {
+		return v4.Put(IPv4LPMKey{Prefixlen: uint32(prefix.Bits()), Addr: prefix.Addr().As4()}, uint8(1))
 	}
-	return v6.Put(ipv6CIDRToKey(cidr), uint8(1))
+	return v6.Put(IPv6LPMKey{Prefixlen: uint32(prefix.Bits()), Addr: prefix.Addr().As16()}, uint8(1))
 }
 
 func (c *ruleMapCore) deleteCIDR(cidr *net.IPNet, v4, v6 *ebpf.Map) error {
+	prefix, err := CIDRPrefix(cidr)
+	if err != nil {
+		return err
+	}
 	if v4 == nil || v6 == nil {
 		return fmt.Errorf("filter handles are closed")
 	}
-	var err error
-	if cidr.IP.To4() != nil {
-		err = v4.Delete(ipv4CIDRToKey(cidr))
+	if prefix.Addr().Is4() {
+		err = v4.Delete(IPv4LPMKey{Prefixlen: uint32(prefix.Bits()), Addr: prefix.Addr().As4()})
 	} else {
-		err = v6.Delete(ipv6CIDRToKey(cidr))
+		err = v6.Delete(IPv6LPMKey{Prefixlen: uint32(prefix.Bits()), Addr: prefix.Addr().As16()})
 	}
 	if errors.Is(err, ebpf.ErrKeyNotExist) {
 		return nil
@@ -152,7 +161,7 @@ func (c *ruleMapCore) AddDNSAllowedIPs(ips []net.IP) error {
 	if err != nil {
 		return err
 	}
-	return addExactDNSIPs(b, ips)
+	return c.exact.replace(b, nil, ips)
 }
 
 func (c *ruleMapCore) RemoveDNSAllowedIPs(ips []net.IP) error {
@@ -162,7 +171,7 @@ func (c *ruleMapCore) RemoveDNSAllowedIPs(ips []net.IP) error {
 	if err != nil {
 		return err
 	}
-	return removeExactDNSIPs(b, ips)
+	return c.exact.replace(b, ips, nil)
 }
 
 func (c *ruleMapCore) ReplaceDNSAllowedIPs(remove, add []net.IP) error {
@@ -172,7 +181,7 @@ func (c *ruleMapCore) ReplaceDNSAllowedIPs(remove, add []net.IP) error {
 	if err != nil {
 		return err
 	}
-	return replaceExactDNSIPs(b, remove, add)
+	return c.exact.replace(b, remove, add)
 }
 
 func (c *ruleMapCore) DNSAllowedIPs() ([]net.IP, error) {
@@ -192,7 +201,7 @@ func (c *ruleMapCore) DNSAllowOccupancy() (DNSAllowOccupancy, error) {
 	if err != nil {
 		return DNSAllowOccupancy{}, err
 	}
-	return exactDNSOccupancy(b)
+	return c.exact.usage(b)
 }
 
 // ClearRules removes every protected LPM and DNS exact-tier rule while
@@ -216,6 +225,7 @@ func (c *ruleMapCore) ClearRules() error {
 	if err := clearMap[IPv6LPMKey](m.denied6); err != nil {
 		return fmt.Errorf("clearing denied IPv6 rules: %w", err)
 	}
+	c.exact.initialized = false
 	if err := clearMap[[4]byte](m.exact4); err != nil {
 		return fmt.Errorf("clearing DNS exact IPv4 rules: %w", err)
 	}

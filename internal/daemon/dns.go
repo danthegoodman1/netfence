@@ -16,6 +16,7 @@ import (
 	"github.com/miekg/dns"
 	"github.com/rs/zerolog"
 
+	"github.com/danthegoodman1/netfence/internal/config"
 	"github.com/danthegoodman1/netfence/pkg/filter"
 	apiv1 "github.com/danthegoodman1/netfence/v1"
 )
@@ -69,22 +70,25 @@ type DNSServer struct {
 	churnLimits    dnsChurnLimits
 	churnCeiling   dnsChurnLimits
 
-	serverMu      sync.Mutex
-	udp           *dns.Server
-	tcp           *dns.Server
-	udpConn       net.PacketConn
-	tcpLn         net.Listener
-	running       bool
-	stopRequested bool
-	stopping      bool
-	stopState     *dnsStopState
-	serveDone     chan struct{}
-	startResult   chan error
-	fatalErr      error
-	shutdownOnce  sync.Once
-	shutdownErr   error
-	queryCtx      context.Context
-	cancelQueries context.CancelFunc
+	serverMu        sync.Mutex
+	udp             *dns.Server
+	tcp             *dns.Server
+	udpConn         net.PacketConn
+	tcpLn           net.Listener
+	running         bool
+	stopRequested   bool
+	stopping        bool
+	stopState       *dnsStopState
+	serveDone       chan struct{}
+	startResult     chan error
+	fatalErr        error
+	shutdownOnce    sync.Once
+	shutdownErr     error
+	queryCtx        context.Context
+	cancelQueries   context.CancelFunc
+	resources       dnsResources
+	globalResources dnsResources
+	queryTimeout    time.Duration
 
 	queriesAllowed atomic.Uint64
 	queriesBlocked atomic.Uint64
@@ -123,8 +127,19 @@ func NewDNSServer(attachmentID, listenAddr, upstream string, logger zerolog.Logg
 		churnLimits:     churnCeiling,
 		churnCeiling:    churnCeiling,
 	}
+	var resourceConfig config.DNSConfig
 	if concrete, ok := sink.(*dnsFilterSink); ok {
+		resourceConfig = concrete.server.cfg.DNS
+		server.globalResources = *concrete.server.dnsResources
 		concrete.bindDNS(server)
+	}
+	server.resources = dnsResources{
+		queries:     make(chan struct{}, defaultPositive(resourceConfig.MaxConcurrentQueries, 128)),
+		connections: make(chan struct{}, defaultPositive(resourceConfig.MaxTCPConnections, 32)),
+	}
+	server.queryTimeout = resourceConfig.QueryTimeout
+	if server.queryTimeout <= 0 {
+		server.queryTimeout = dnsExchangeTimeout
 	}
 	return server
 }
@@ -203,7 +218,7 @@ func (s *DNSServer) Serve() error {
 		},
 	}
 	s.tcp = &dns.Server{
-		Listener:     &dnsWriteDeadlineListener{Listener: s.tcpLn, timeout: dnsClientIOTimeout},
+		Listener:     &dnsWriteDeadlineListener{Listener: s.tcpLn, timeout: dnsClientIOTimeout, local: s.resources.connections, global: s.globalResources.connections, rejected: &s.queriesErrors},
 		Handler:      dns.HandlerFunc(s.handleDNS),
 		ReadTimeout:  dnsClientIOTimeout,
 		WriteTimeout: dnsClientIOTimeout,
@@ -254,20 +269,44 @@ func (c *dnsWriteDeadlinePacketConn) WriteTo(payload []byte, addr net.Addr) (int
 
 type dnsWriteDeadlineListener struct {
 	net.Listener
-	timeout time.Duration
+	timeout       time.Duration
+	local, global chan struct{}
+	rejected      *atomic.Uint64
 }
 
 func (l *dnsWriteDeadlineListener) Accept() (net.Conn, error) {
-	conn, err := l.Listener.Accept()
-	if err != nil {
-		return nil, err
+	for {
+		conn, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		if l.local != nil && !acquireDNSSlots(l.local, l.global) {
+			conn.Close()
+			if l.rejected != nil {
+				l.rejected.Add(1)
+			}
+			continue
+		}
+		return &dnsWriteDeadlineConn{Conn: conn, timeout: l.timeout, local: l.local, global: l.global}, nil
 	}
-	return &dnsWriteDeadlineConn{Conn: conn, timeout: l.timeout}, nil
 }
 
 type dnsWriteDeadlineConn struct {
 	net.Conn
-	timeout time.Duration
+	timeout       time.Duration
+	local, global chan struct{}
+	closeOnce     sync.Once
+	closeErr      error
+}
+
+func (c *dnsWriteDeadlineConn) Close() error {
+	c.closeOnce.Do(func() {
+		c.closeErr = c.Conn.Close()
+		if c.local != nil {
+			releaseDNSSlots(c.local, c.global)
+		}
+	})
+	return c.closeErr
 }
 
 func (c *dnsWriteDeadlineConn) Write(payload []byte) (int, error) {
@@ -803,6 +842,14 @@ func (s *DNSServer) snapshotQuery(domain string) (dnsQuerySnapshot, bool, error)
 }
 
 func (s *DNSServer) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
+	if !acquireDNSSlots(s.resources.queries, s.globalResources.queries) {
+		s.queriesErrors.Add(1)
+		// Do no response I/O on overload: even a SERVFAIL could retain another
+		// blocked writer outside the admitted-work limit.
+		w.Close()
+		return
+	}
+	defer releaseDNSSlots(s.resources.queries, s.globalResources.queries)
 	if len(req.Question) != 1 {
 		s.writeOutcome(w, req, servFailResponse(req), dnsOutcomeError)
 		return
@@ -816,6 +863,8 @@ func (s *DNSServer) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 	if queryCtx == nil {
 		queryCtx = context.Background()
 	}
+	queryCtx, cancel := context.WithTimeout(queryCtx, s.queryTimeout)
+	defer cancel()
 
 	snapshot, shouldResolve, err := s.snapshotQuery(domain)
 	if err != nil {
@@ -1087,6 +1136,9 @@ func exchangeUpstreams(ctx context.Context, req *dns.Msg, upstreams []string) (*
 	}
 	var errs []error
 	for _, upstream := range upstreams {
+		if err := ctx.Err(); err != nil {
+			return nil, errors.Join(append(errs, err)...)
+		}
 		udpClient := &dns.Client{Net: "udp", Timeout: dnsExchangeTimeout}
 		resp, err := exchangeDNSContext(ctx, udpClient, req.Copy(), upstream)
 		if err != nil {

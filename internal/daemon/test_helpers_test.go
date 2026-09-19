@@ -123,6 +123,8 @@ func (f *fakeFilter) blockSetMode(entered chan struct{}, release <-chan struct{}
 	f.setModeRelease = release
 }
 
+func (f *fakeFilter) SetResolverEndpoint(filter.ResolverEndpoint) error { return nil }
+
 func (f *fakeFilter) AllowIP(cidr *net.IPNet) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -130,12 +132,12 @@ func (f *fakeFilter) AllowIP(cidr *net.IPNet) error {
 		f.mutationsAfterClose++
 	}
 	f.allowCalls++
-	f.events = append(f.events, "allow "+cidr.String())
+	f.events = append(f.events, "allow "+filter.CIDRString(cidr))
 	if f.allowErr != nil {
 		return f.allowErr
 	}
 	// Upsert, matching the real BPF map's set semantics on re-add.
-	f.allowed = appendUnique(f.allowed, cidr.String())
+	f.allowed = appendUnique(f.allowed, filter.CIDRString(cidr))
 	return nil
 }
 
@@ -163,12 +165,12 @@ func (f *fakeFilter) DenyIP(cidr *net.IPNet) error {
 	if f.closeCalls > 0 {
 		f.mutationsAfterClose++
 	}
-	f.events = append(f.events, "deny "+cidr.String())
+	f.events = append(f.events, "deny "+filter.CIDRString(cidr))
 	f.denyCalls++
 	if f.denyErr != nil {
 		return f.denyErr
 	}
-	f.denied = appendUnique(f.denied, cidr.String())
+	f.denied = appendUnique(f.denied, filter.CIDRString(cidr))
 	return nil
 }
 
@@ -190,12 +192,12 @@ func (f *fakeFilter) RemoveAllowedIP(cidr *net.IPNet) error {
 	if f.closeCalls > 0 {
 		f.mutationsAfterClose++
 	}
-	f.events = append(f.events, "remove-allow "+cidr.String())
-	f.removedAllowed = append(f.removedAllowed, cidr.String())
+	f.events = append(f.events, "remove-allow "+filter.CIDRString(cidr))
+	f.removedAllowed = append(f.removedAllowed, filter.CIDRString(cidr))
 	if f.removeAllowErr != nil {
 		return f.removeAllowErr
 	}
-	f.allowed = removeString(f.allowed, cidr.String())
+	f.allowed = removeString(f.allowed, filter.CIDRString(cidr))
 	return nil
 }
 
@@ -205,12 +207,12 @@ func (f *fakeFilter) RemoveDeniedIP(cidr *net.IPNet) error {
 	if f.closeCalls > 0 {
 		f.mutationsAfterClose++
 	}
-	f.events = append(f.events, "remove-deny "+cidr.String())
-	f.removedDenied = append(f.removedDenied, cidr.String())
+	f.events = append(f.events, "remove-deny "+filter.CIDRString(cidr))
+	f.removedDenied = append(f.removedDenied, filter.CIDRString(cidr))
 	if f.removeDenyErr != nil {
 		return f.removeDenyErr
 	}
-	f.denied = removeString(f.denied, cidr.String())
+	f.denied = removeString(f.denied, filter.CIDRString(cidr))
 	return nil
 }
 
@@ -223,7 +225,7 @@ func (f *fakeFilter) ReplaceProtectedRules(allowed, denied []*net.IPNet, mode fi
 	canonical := func(cidrs []*net.IPNet) []string {
 		seen := make(map[string]struct{}, len(cidrs))
 		for _, cidr := range cidrs {
-			seen[cidr.String()] = struct{}{}
+			seen[filter.CIDRString(cidr)] = struct{}{}
 		}
 		out := make([]string, 0, len(seen))
 		for raw := range seen {

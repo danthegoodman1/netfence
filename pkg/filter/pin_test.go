@@ -735,8 +735,14 @@ func TestCgroupPinnedLinkReincarnationRejected(t *testing.T) {
 		n := queryCgroupProgCount(t, cgroupPath, ebpf.AttachCGroupInet4Connect)
 		t.Fatalf("LoadPinnedCgroupFilter adopted a defunct link for a recreated cgroup (err=nil, connect4 programs on RECREATED cgroup=%d) — the recreated cgroup is unfiltered while the daemon believes it is enforcing", n)
 	}
-	if !errors.Is(err, ErrPinnedTargetMismatch) {
-		t.Fatalf("expected typed pinned-target mismatch, got %v", err)
+	if !errors.Is(err, ErrPinnedTargetMismatch) && !errors.Is(err, ErrPinnedSchemaIncompatible) {
+		t.Fatalf("expected proven target mismatch or preserved unknown identity, got %v", err)
+	}
+	if n := queryCgroupProgCount(t, cgroupPath, ebpf.AttachCGroupInet4Connect); n != 0 {
+		t.Fatalf("rejected adoption attached %d programs to the replacement", n)
+	}
+	if _, statErr := os.Stat(filepath.Join(pinDir, pinLinkConnect4)); statErr != nil {
+		t.Fatalf("rejected adoption removed pins: %v", statErr)
 	}
 	t.Logf("correctly refused defunct link: %v", err)
 }

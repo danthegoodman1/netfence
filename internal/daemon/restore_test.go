@@ -851,9 +851,8 @@ func TestRestoreDiscardsPinsWhenTargetGone(t *testing.T) {
 	assert.Empty(t, rows, "store row for a gone target must be deleted")
 }
 
-// TestRestoreRemovesOrphanPinDirs: a pin dir with no store row (crash
-// between pinning and the store save) is unowned state and must be removed.
-func TestRestoreRemovesOrphanPinDirs(t *testing.T) {
+// Missing storage does not establish that pinned enforcement is obsolete.
+func TestRestorePreservesOrphanPinDirs(t *testing.T) {
 	env := newRestoreEnv(t, 12304, apiv1.PolicyMode_POLICY_MODE_ALLOWLIST)
 	env.adopted = &fakeFilter{mode: filter.ModeAllowlist}
 	env.mkPinDir(t)
@@ -862,11 +861,30 @@ func TestRestoreRemovesOrphanPinDirs(t *testing.T) {
 	require.NoError(t, os.MkdirAll(orphan, 0o700))
 	require.NoError(t, os.WriteFile(filepath.Join(orphan, "allowed_ipv4"), []byte{}, 0o600))
 
+	require.ErrorContains(t, env.server.Start(), "no matching attachment")
+
+	assert.DirExists(t, orphan, "orphaned enforcement must be preserved")
+	assert.DirExists(t, filepath.Join(env.pinRoot, env.id), "live attachment's pin dir must be kept")
+}
+
+func TestRestoreRecreatedFilterStaysBlockedUntilResolverIsReady(t *testing.T) {
+	env := newRestoreEnv(t, 12367, apiv1.PolicyMode_POLICY_MODE_DISABLED)
+	var created *fakeFilter
+	env.server.newFilter = func(_, _ string, _ apiv1.AttachmentType, mode apiv1.PolicyMode, _ apiv1.TcDirection, _ uint32) (filter.Filter, error) {
+		require.Equal(t, apiv1.PolicyMode_POLICY_MODE_BLOCK_ALL, mode)
+		created = &fakeFilter{mode: filter.ModeBlockAll}
+		return created, nil
+	}
+	serve := env.server.serveDNSServer
+	env.server.serveDNSServer = func(dns *DNSServer) error {
+		mode, _, _, _ := created.snapshot()
+		require.Equal(t, filter.ModeBlockAll, mode)
+		return serve(dns)
+	}
 	require.NoError(t, env.server.Start())
 	t.Cleanup(env.server.Stop)
-
-	assert.NoDirExists(t, orphan, "orphaned pin dir must be removed")
-	assert.DirExists(t, filepath.Join(env.pinRoot, env.id), "live attachment's pin dir must be kept")
+	mode, _, _, _ := created.snapshot()
+	require.Equal(t, filter.ModeDisabled, mode)
 }
 
 func TestRestoreDurableCleanupUsesPersistedPinPathAcrossConfigChanges(t *testing.T) {
@@ -1342,45 +1360,17 @@ func TestRestoreAmbiguousTargetStateNeverCleansOrRecreates(t *testing.T) {
 }
 
 func TestRestoreOrphanScanFailuresAbortStartup(t *testing.T) {
-	tests := []struct {
-		name       string
-		failRead   bool
-		failRemove bool
-	}{
-		{name: "read_failure", failRead: true},
-		{name: "remove_failure", failRemove: true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			env := newRestoreEnv(t, 12342, apiv1.PolicyMode_POLICY_MODE_ALLOWLIST)
-			env.adopted = &fakeFilter{mode: filter.ModeAllowlist}
-			env.mkPinDir(t)
-			env.persistPinIdentity(t, filepath.Join(env.pinRoot, env.id), false)
-			orphan := filepath.Join(env.pinRoot, "orphan")
-			require.NoError(t, os.MkdirAll(orphan, 0o700))
-			if tt.failRead {
-				env.server.readPinRoot = func(string) ([]os.DirEntry, error) { return nil, syscall.EIO }
-			}
-			if tt.failRemove {
-				env.server.removePinDir = func(path string) error {
-					if path == orphan {
-						return syscall.EIO
-					}
-					return os.RemoveAll(path)
-				}
-			}
-
-			err := env.server.Start()
-			require.Error(t, err)
-			assert.Contains(t, err.Error(), "orphan")
-			assert.DirExists(t, filepath.Join(env.pinRoot, env.id))
-			assert.DirExists(t, orphan)
-			_, getErr := env.st.GetAttachment(env.id)
-			require.NoError(t, getErr)
-			assert.Equal(t, 1, env.adopted.closeCallCount(), "aborted startup must close, not detach, adopted handles")
-			assert.Zero(t, env.adopted.detachCallCount())
-		})
-	}
+	env := newRestoreEnv(t, 12342, apiv1.PolicyMode_POLICY_MODE_ALLOWLIST)
+	env.adopted = &fakeFilter{mode: filter.ModeAllowlist}
+	env.mkPinDir(t)
+	env.persistPinIdentity(t, filepath.Join(env.pinRoot, env.id), false)
+	env.server.readPinRoot = func(string) ([]os.DirEntry, error) { return nil, syscall.EIO }
+	require.ErrorIs(t, env.server.Start(), syscall.EIO)
+	assert.DirExists(t, filepath.Join(env.pinRoot, env.id))
+	_, err := env.st.GetAttachment(env.id)
+	require.NoError(t, err)
+	assert.Equal(t, 1, env.adopted.closeCallCount())
+	assert.Zero(t, env.adopted.detachCallCount())
 }
 
 func TestRestorePreservesUncommittedCrashPartialOrphan(t *testing.T) {
@@ -1406,7 +1396,7 @@ func TestRestorePreservesUncommittedCrashPartialOrphan(t *testing.T) {
 
 	err := env.server.Start()
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "uncommitted schema marker")
+	assert.Contains(t, err.Error(), "no matching attachment")
 	assert.Zero(t, removeCalls, "possible live partial enforcement must never be unpinned")
 	assert.DirExists(t, orphan)
 	assert.Equal(t, 1, env.adopted.closeCallCount(), "startup abort closes adopted handles but retains pins")
@@ -1427,11 +1417,10 @@ func TestRestoreSameIDCurrentRootDirectoryIsOrphanWhenLiveRowOwnsOldRoot(t *test
 		return os.RemoveAll(path)
 	}
 
-	require.NoError(t, env.server.Start())
-	t.Cleanup(env.server.Stop)
-	assert.Equal(t, []string{currentSameIDDir}, removed)
+	require.ErrorContains(t, env.server.Start(), "no matching attachment")
+	assert.Empty(t, removed)
 	assert.DirExists(t, oldPinDir)
-	assert.NoDirExists(t, currentSameIDDir)
+	assert.DirExists(t, currentSameIDDir)
 	loadPinned, newFilter := env.counts()
 	assert.Equal(t, 1, loadPinned)
 	assert.Zero(t, newFilter)

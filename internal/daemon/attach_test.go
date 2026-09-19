@@ -879,6 +879,10 @@ func TestCommittedAttachmentDNSListenerDeathQuarantinesBlockAll(t *testing.T) {
 		defer env.server.mu.RUnlock()
 		return state.mutationsClosed
 	}, time.Second, time.Millisecond)
+	// Closing admission starts quarantine; the watcher still holds reconcileMu
+	// while forcing the filter and persisting BLOCK_ALL. Wait for that commit.
+	state.reconcileMu.Lock()
+	state.reconcileMu.Unlock()
 	row, err := env.st.GetAttachment(resp.Id)
 	require.NoError(t, err)
 	assert.Equal(t, apiv1.PolicyMode_POLICY_MODE_BLOCK_ALL.String(), row.Mode)

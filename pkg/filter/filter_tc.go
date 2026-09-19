@@ -69,6 +69,7 @@ func (f *TCFilter) syncRuleMaps() {
 		exact6:   f.objs.DnsAllowedIpv6,
 		mode:     f.objs.PolicyMode,
 		stats:    f.objs.Stats,
+		resolver: f.objs.ResolverEndpoint,
 	})
 }
 
@@ -229,11 +230,11 @@ func loadPinnedTCFilter(ifaceName string, direction TCDirection, pinDir string, 
 	}
 	if committed {
 		if err := validatePinnedDirectorySet(pinDir,
-			append(append([]string{}, legacyRequired...), pinDNSAllowedIPv4, pinDNSAllowedIPv6, pinSchemaVersion), nil); err != nil {
+			append(append([]string{}, legacyRequired...), pinDNSAllowedIPv4, pinDNSAllowedIPv6, pinSchemaVersion, pinResolverEndpoint), nil); err != nil {
 			return nil, err
 		}
 	} else if err := validatePinnedDirectorySet(pinDir, legacyRequired,
-		[]string{pinDNSAllowedIPv4, pinDNSAllowedIPv6, pinSchemaVersion}); err != nil {
+		[]string{pinDNSAllowedIPv4, pinDNSAllowedIPv6, pinSchemaVersion, pinResolverEndpoint}); err != nil {
 		return nil, err
 	}
 
@@ -246,6 +247,7 @@ func loadPinnedTCFilter(ifaceName string, direction TCDirection, pinDir string, 
 		pinStats:       &f.objs.Stats,
 	}
 	if committed {
+		requiredMaps[pinResolverEndpoint] = &f.objs.ResolverEndpoint
 		requiredMaps[pinDNSAllowedIPv4] = &f.objs.DnsAllowedIpv4
 		requiredMaps[pinDNSAllowedIPv6] = &f.objs.DnsAllowedIpv6
 		err = loadCommittedPinnedMaps(pinDir, requiredMaps)
@@ -256,6 +258,12 @@ func loadPinnedTCFilter(ifaceName string, direction TCDirection, pinDir string, 
 		return nil, err
 	}
 
+	if !committed {
+		f.objs.ResolverEndpoint, _, err = loadOptionalPinnedMap(pinDir, pinResolverEndpoint)
+		if err != nil {
+			return nil, err
+		}
+	}
 	exact4Present, exact6Present := committed, committed
 	if !committed {
 		f.objs.DnsAllowedIpv4, exact4Present, err = loadOptionalPinnedMap(pinDir, pinDNSAllowedIPv4)
@@ -273,15 +281,16 @@ func loadPinnedTCFilter(ifaceName string, direction TCDirection, pinDir string, 
 			return nil, fmt.Errorf("loading current TC spec to validate committed pins: %w", err)
 		}
 		if err := validatePinnedMapsAgainstSpec(spec, map[string]*ebpf.Map{
-			pinAllowedIPv4:    f.objs.AllowedIpv4,
-			pinAllowedIPv6:    f.objs.AllowedIpv6,
-			pinDeniedIPv4:     f.objs.DeniedIpv4,
-			pinDeniedIPv6:     f.objs.DeniedIpv6,
-			pinDNSAllowedIPv4: f.objs.DnsAllowedIpv4,
-			pinDNSAllowedIPv6: f.objs.DnsAllowedIpv6,
-			pinPolicyMode:     f.objs.PolicyMode,
-			pinStats:          f.objs.Stats,
-			pinSchemaVersion:  f.objs.PinSchemaVersion,
+			pinAllowedIPv4:      f.objs.AllowedIpv4,
+			pinAllowedIPv6:      f.objs.AllowedIpv6,
+			pinDeniedIPv4:       f.objs.DeniedIpv4,
+			pinDeniedIPv6:       f.objs.DeniedIpv6,
+			pinDNSAllowedIPv4:   f.objs.DnsAllowedIpv4,
+			pinDNSAllowedIPv6:   f.objs.DnsAllowedIpv6,
+			pinPolicyMode:       f.objs.PolicyMode,
+			pinStats:            f.objs.Stats,
+			pinSchemaVersion:    f.objs.PinSchemaVersion,
+			pinResolverEndpoint: f.objs.ResolverEndpoint,
 		}); err != nil {
 			return nil, err
 		}
@@ -328,6 +337,7 @@ func loadPinnedTCFilter(ifaceName string, direction TCDirection, pinDir string, 
 		pinStats:       f.objs.Stats,
 	}
 	if committed {
+		linkMaps[pinResolverEndpoint] = f.objs.ResolverEndpoint
 		linkMaps[pinDNSAllowedIPv4] = f.objs.DnsAllowedIpv4
 		linkMaps[pinDNSAllowedIPv6] = f.objs.DnsAllowedIpv6
 	}
@@ -345,7 +355,7 @@ func loadPinnedTCFilter(ifaceName string, direction TCDirection, pinDir string, 
 		return f, nil
 	}
 	if originalCarveouts == nil {
-		return nil, fmt.Errorf("%w: TC pin set %s has no committed current schema marker", ErrPinnedSchemaUpgradeRequired, pinDir)
+		return nil, fmt.Errorf("%w: TC pin set %s has no committed current schema marker; supply the original carve-outs with LoadPinnedTCFilterWithOptions", ErrPinnedSchemaUpgradeRequired, pinDir)
 	}
 	if err := f.migratePinnedSchema(*originalCarveouts, opts, markerPresent, exact4Present, exact6Present, migrationOps); err != nil {
 		return nil, err
@@ -377,6 +387,9 @@ func (f *TCFilter) migratePinnedSchema(carveouts Carveouts, opts Options, marker
 		pinDeniedIPv6:  f.objs.DeniedIpv6,
 		pinPolicyMode:  f.objs.PolicyMode,
 		pinStats:       f.objs.Stats,
+	}
+	if f.objs.ResolverEndpoint != nil {
+		replacements[pinResolverEndpoint] = f.objs.ResolverEndpoint
 	}
 	if exact4Present {
 		replacements[pinDNSAllowedIPv4] = f.objs.DnsAllowedIpv4
@@ -410,6 +423,9 @@ func (f *TCFilter) migratePinnedSchema(carveouts Carveouts, opts Options, marker
 		return err
 	}
 	if err := pinMigrationMapIfMissing(ops, f.pinDir, pinDNSAllowedIPv6, exact6Present, upgraded.DnsAllowedIpv6); err != nil {
+		return err
+	}
+	if err := pinMigrationMapIfMissing(ops, f.pinDir, pinResolverEndpoint, f.objs.ResolverEndpoint != nil, upgraded.ResolverEndpoint); err != nil {
 		return err
 	}
 	if err := pinMigrationMapIfMissing(ops, f.pinDir, pinSchemaVersion, markerPresent, upgraded.PinSchemaVersion); err != nil {
@@ -446,16 +462,17 @@ func (f *TCFilter) migratePinnedSchema(carveouts Carveouts, opts Options, marker
 // survive the process, keyed by pin file name.
 func (f *TCFilter) pinnables() map[string]pinner {
 	return map[string]pinner{
-		pinAllowedIPv4:    f.objs.AllowedIpv4,
-		pinAllowedIPv6:    f.objs.AllowedIpv6,
-		pinDeniedIPv4:     f.objs.DeniedIpv4,
-		pinDeniedIPv6:     f.objs.DeniedIpv6,
-		pinDNSAllowedIPv4: f.objs.DnsAllowedIpv4,
-		pinDNSAllowedIPv6: f.objs.DnsAllowedIpv6,
-		pinPolicyMode:     f.objs.PolicyMode,
-		pinStats:          f.objs.Stats,
-		pinSchemaVersion:  f.objs.PinSchemaVersion,
-		pinLinkTCX:        f.tcLink,
+		pinAllowedIPv4:      f.objs.AllowedIpv4,
+		pinAllowedIPv6:      f.objs.AllowedIpv6,
+		pinDeniedIPv4:       f.objs.DeniedIpv4,
+		pinDeniedIPv6:       f.objs.DeniedIpv6,
+		pinDNSAllowedIPv4:   f.objs.DnsAllowedIpv4,
+		pinDNSAllowedIPv6:   f.objs.DnsAllowedIpv6,
+		pinPolicyMode:       f.objs.PolicyMode,
+		pinStats:            f.objs.Stats,
+		pinSchemaVersion:    f.objs.PinSchemaVersion,
+		pinResolverEndpoint: f.objs.ResolverEndpoint,
+		pinLinkTCX:          f.tcLink,
 	}
 }
 

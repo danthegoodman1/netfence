@@ -16,6 +16,8 @@ import (
 	"testing"
 	"time"
 
+	"context"
+	"github.com/miekg/dns"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -81,6 +83,56 @@ func TestHelperUDPFlood(t *testing.T) {
 		}
 	}
 	fmt.Printf("sent=%d errors=%d canary_blocked=%v first=%q\n", sent, sendErrors, canaryBlocked, firstErr)
+}
+
+func TestCgroupBulkTransitionNeverAllowsDeniedCanary(t *testing.T) {
+	const canary = "203.0.113.10"
+	upstream := startWorkloadDNSUpstream(t, canary)
+	srv := newDNSWorkloadDaemon(t, "127.0.0.1", 34830, 34830, upstream.addr)
+	cgroup, cleanup := setupTestCgroup(t, "nf-bulk-canary")
+	t.Cleanup(cleanup)
+	attachment, err := srv.Attach(context.Background(), &apiv1.AttachRequest{Target: &apiv1.AttachRequest_CgroupPath{CgroupPath: cgroup}})
+	require.NoError(t, err)
+	t.Cleanup(func() { srv.Detach(context.Background(), &apiv1.DetachRequest{Id: attachment.Id}) })
+	old := &apiv1.BulkUpdate{Mode: apiv1.PolicyMode_POLICY_MODE_DENYLIST,
+		DenyCidrs: []*apiv1.CIDREntry{{Cidr: canary + "/32"}},
+		Dns:       &apiv1.DnsConfig{Mode: apiv1.DnsMode_DNS_MODE_ALLOWLIST, AllowDomains: []*apiv1.DomainEntry{{Domain: "old.example"}}}}
+	updated := &apiv1.BulkUpdate{Mode: apiv1.PolicyMode_POLICY_MODE_ALLOWLIST, Dns: &apiv1.DnsConfig{Mode: apiv1.DnsMode_DNS_MODE_ALLOWLIST}}
+	require.NoError(t, srv.ApplyRules(attachment.Id, old))
+	cmd := exec.Command(os.Args[0], "-test.run=^TestHelperUDPFlood$", "-test.count=1")
+	cmd.Env = append(os.Environ(), "NETFENCE_UDP_FLOOD_TARGET="+canary+":33999")
+	stdin, err := cmd.StdinPipe()
+	require.NoError(t, err)
+	stdout, err := cmd.StdoutPipe()
+	require.NoError(t, err)
+	require.NoError(t, cmd.Start())
+	defer cmd.Process.Kill()
+	require.NoError(t, os.WriteFile(filepath.Join(cgroup, "cgroup.procs"), []byte(strconv.Itoa(cmd.Process.Pid)), 0644))
+	_, err = io.WriteString(stdin, "go\n")
+	require.NoError(t, err)
+	request := new(dns.Msg)
+	request.SetQuestion("old.example.", dns.TypeA)
+	client := &dns.Client{Timeout: time.Second}
+	for i := 0; i < 80; i++ {
+		require.NoError(t, srv.ApplyRules(attachment.Id, old))
+		response, _, err := client.Exchange(request, attachment.DnsAddress)
+		require.NoError(t, err)
+		require.Equal(t, dns.RcodeSuccess, response.Rcode)
+		require.NoError(t, srv.ApplyRules(attachment.Id, updated))
+	}
+	require.NoError(t, stdin.Close())
+	out, err := io.ReadAll(stdout)
+	require.NoError(t, err)
+	require.NoError(t, cmd.Wait(), "%s", out)
+	m := udpFloodResultRe.FindStringSubmatch(string(out))
+	require.NotNil(t, m, "%s", out)
+	sent, err := strconv.Atoi(m[1])
+	require.NoError(t, err)
+	blocked, err := strconv.Atoi(m[2])
+	require.NoError(t, err)
+	require.Zero(t, sent, "destination denied before and after each update was transiently permitted")
+	require.Greater(t, blocked, 1000, "probe must overlap updates")
+	t.Logf("80 complete transitions: allowed=%d blocked=%d", sent, blocked)
 }
 
 var udpFloodResultRe = regexp.MustCompile(`sent=(\d+) errors=(\d+) canary_blocked=(true|false) first=(".*")`)

@@ -20,15 +20,16 @@ import (
 // names; links get a "link_" prefix. These are a persistence format: changing
 // them orphans state pinned by earlier daemon versions.
 const (
-	pinAllowedIPv4    = "allowed_ipv4"
-	pinAllowedIPv6    = "allowed_ipv6"
-	pinDeniedIPv4     = "denied_ipv4"
-	pinDeniedIPv6     = "denied_ipv6"
-	pinDNSAllowedIPv4 = "dns_allowed_ipv4"
-	pinDNSAllowedIPv6 = "dns_allowed_ipv6"
-	pinPolicyMode     = "policy_mode"
-	pinStats          = "stats"
-	pinSchemaVersion  = "pin_schema_version"
+	pinAllowedIPv4      = "allowed_ipv4"
+	pinAllowedIPv6      = "allowed_ipv6"
+	pinDeniedIPv4       = "denied_ipv4"
+	pinDeniedIPv6       = "denied_ipv6"
+	pinDNSAllowedIPv4   = "dns_allowed_ipv4"
+	pinDNSAllowedIPv6   = "dns_allowed_ipv6"
+	pinPolicyMode       = "policy_mode"
+	pinStats            = "stats"
+	pinSchemaVersion    = "pin_schema_version"
+	pinResolverEndpoint = "resolver_endpoint"
 
 	pinLinkConnect4 = "link_connect4"
 	pinLinkConnect6 = "link_connect6"
@@ -37,10 +38,10 @@ const (
 	pinLinkTCX      = "link_tcx"
 )
 
-const currentPinSchemaVersion uint32 = 1
+const currentPinSchemaVersion uint32 = 2
 
 // InspectPinnedSchema classifies a pin directory without loading links or
-// mutating anything. It is used before orphan cleanup so a crash-partial
+// mutating anything. It is used before owned stale-target cleanup so a crash-partial
 // marker-absent/zero pin set is never blindly removed. Future/unknown or
 // inconsistent committed schemas return a non-discardable error.
 func InspectPinnedSchema(pinDir string) (_ PinnedSchemaState, retErr error) {
@@ -79,7 +80,7 @@ func inspectCompleteCommittedPinSet(pinDir string, marker *ebpf.Map) (_ PinnedSc
 	}()
 	for _, name := range []string{
 		pinAllowedIPv4, pinAllowedIPv6, pinDeniedIPv4, pinDeniedIPv6,
-		pinDNSAllowedIPv4, pinDNSAllowedIPv6, pinPolicyMode, pinStats,
+		pinDNSAllowedIPv4, pinDNSAllowedIPv6, pinPolicyMode, pinStats, pinResolverEndpoint,
 	} {
 		loaded, err := ebpf.LoadPinnedMap(filepath.Join(pinDir, name), nil)
 		if err != nil {
@@ -117,7 +118,7 @@ func inspectCompleteCommittedPinSet(pinDir string, marker *ebpf.Map) (_ PinnedSc
 	}
 	expectedNames := map[string]struct{}{
 		pinAllowedIPv4: {}, pinAllowedIPv6: {}, pinDeniedIPv4: {}, pinDeniedIPv6: {},
-		pinDNSAllowedIPv4: {}, pinDNSAllowedIPv6: {}, pinPolicyMode: {}, pinStats: {}, pinSchemaVersion: {},
+		pinDNSAllowedIPv4: {}, pinDNSAllowedIPv6: {}, pinPolicyMode: {}, pinStats: {}, pinSchemaVersion: {}, pinResolverEndpoint: {},
 	}
 	if hasTC {
 		expectedNames[pinLinkTCX] = struct{}{}
@@ -171,7 +172,7 @@ func inspectCompleteCommittedPinSet(pinDir string, marker *ebpf.Map) (_ PinnedSc
 			pinAllowedIPv4: maps[pinAllowedIPv4], pinAllowedIPv6: maps[pinAllowedIPv6],
 			pinDeniedIPv4: maps[pinDeniedIPv4], pinDeniedIPv6: maps[pinDeniedIPv6],
 			pinDNSAllowedIPv4: maps[pinDNSAllowedIPv4], pinDNSAllowedIPv6: maps[pinDNSAllowedIPv6],
-			pinPolicyMode: maps[pinPolicyMode], pinStats: maps[pinStats],
+			pinPolicyMode: maps[pinPolicyMode], pinStats: maps[pinStats], pinResolverEndpoint: maps[pinResolverEndpoint],
 		}); err != nil {
 			return PinnedSchemaUncommitted, err
 		}
@@ -201,7 +202,7 @@ func inspectCompleteCommittedPinSet(pinDir string, marker *ebpf.Map) (_ PinnedSc
 			} else if cg.CgroupId != coherentCgroupID {
 				return PinnedSchemaUncommitted, fmt.Errorf("%w: committed cgroup links identify mixed targets (%d and %d)", ErrPinnedSchemaIncompatible, coherentCgroupID, cg.CgroupId)
 			}
-			expected := map[string]*ebpf.Map{pinPolicyMode: maps[pinPolicyMode], pinStats: maps[pinStats]}
+			expected := map[string]*ebpf.Map{pinPolicyMode: maps[pinPolicyMode], pinStats: maps[pinStats], pinResolverEndpoint: maps[pinResolverEndpoint]}
 			if item.ipv6 {
 				expected[pinAllowedIPv6], expected[pinDeniedIPv6], expected[pinDNSAllowedIPv6] = maps[pinAllowedIPv6], maps[pinDeniedIPv6], maps[pinDNSAllowedIPv6]
 			} else {
@@ -344,6 +345,8 @@ func classifyPinnedSchema(marker *ebpf.Map, markerPresent bool) (committed bool,
 	switch version {
 	case 0:
 		return false, nil
+	case 1:
+		return false, fmt.Errorf("%w: schema 1 has no resolver isolation; preserve enforcement and explicitly recreate attachments during a controlled upgrade", ErrPinnedSchemaUpgradeRequired)
 	case currentPinSchemaVersion:
 		return true, nil
 	default:

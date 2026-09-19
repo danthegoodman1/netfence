@@ -20,11 +20,10 @@ var (
 	// is otherwise discardable, callers must preserve pins when this marker is
 	// present because userspace no longer knows which references remain live.
 	ErrPinnedStateCloseFailed = errors.New("closing partially loaded pinned filter state failed")
-	// ErrPinnedSchemaUpgradeRequired means a legacy pin set needs a program
-	// migration but the caller did not provide the original load-time
-	// carve-outs. Guessing them could loosen enforcement, so callers must use
-	// LoadPinned*Cgroup/TCFilterWithOptions and supply the known posture.
-	ErrPinnedSchemaUpgradeRequired = errors.New("pinned filter schema upgrade requires explicit original carve-outs")
+	// ErrPinnedSchemaUpgradeRequired preserves old pins that need an explicit
+	// upgrade step. Legacy migration requires original load-time carve-outs;
+	// schema 1 requires controlled recreation to add resolver isolation.
+	ErrPinnedSchemaUpgradeRequired = errors.New("pinned filter schema upgrade requires explicit migration or recreation")
 	// ErrPinnedSchemaIncompatible marks a pin set written by a newer or
 	// otherwise unsupported schema. It is intentionally not discardable:
 	// callers must preserve the pins and abort rather than replacing live,

@@ -182,10 +182,14 @@ Attach returns the concrete `dns_address`; configure that exact address as the
 workload's resolver. Netfence installs a protected, non-expiring `/32` or
 `/128` allow entry for the listener IP so allowlist mode can bootstrap without
 a control-plane DNS-IP rule. The current filters enforce IP prefixes, not
-destination ports, so that protected entry permits every port at the listener
-IP (not only its DNS port); this is especially important for cgroup attachment
-threat models. Use a dedicated listener IP when that broader reachability is
-not acceptable.
+general destination ports. A separate resolver guard restricts TCP/UDP ports in
+`dns.port_min..dns.port_max` at that IP to the workload's assigned port, before
+carve-outs and every packet policy mode (including disabled). A workload cannot
+query a sibling resolver. Unrelated services outside that reserved range remain
+reachable through the bootstrap IP allow; use a dedicated listener IP if needed.
+TC rejects fragments and unsupported IPv6 extension chains addressed to the
+resolver IP because it cannot prove their destination port. Cgroup enforcement
+retains its established-socket and raw-packet limitations described above.
 
 The assigned endpoint serves both UDP and TCP. UDP replies are truncated to a
 legacy client's 512-byte limit or its advertised EDNS size and carry `TC` when
@@ -199,6 +203,23 @@ attachment. Entries use `host:port` syntax (bracket IPv6 literals), are
 canonicalized and de-duplicated in first-seen order, and are limited to eight
 unique servers. An empty list selects the global fallback.
 
+Resolver resources are bounded independently of DNS map ownership:
+
+```yaml
+dns:
+  max_concurrent_queries: 128        # per attachment
+  max_global_queries: 4096           # across this daemon
+  max_tcp_connections: 32            # per attachment, including idle connections
+  max_global_tcp_connections: 1024
+  query_timeout: 5s                  # shared across proxy and upstream attempts
+```
+
+Zero/unset selects these defaults. Admission never waits for capacity: overload
+drops a UDP query or closes a TCP connection. The existing `dns_queries_errors`
+counter also includes these rejections (including TCP accept rejection before a
+query exists). Shutdown cancels active queries and releases connection slots.
+Client socket writes retain their separate five-second bound.
+
 In filtering modes, Netfence strips `ipv4hint` and `ipv6hint` parameters from
 HTTPS/SVCB answers, including their corresponding `mandatory` references,
 because hinted addresses have not independently passed filter admission.
@@ -208,7 +229,7 @@ DNS query counters are mutually exclusive: `dns_queries_allowed` counts
 successfully answered policy-allowed queries (including NXDOMAIN),
 `dns_queries_blocked` counts policy `REFUSED` responses, and
 `dns_queries_errors` counts resolver, proxy, filter-admission, response-write,
-and other error paths. A query increments exactly one bucket.
+and other error paths. A processed query increments exactly one bucket.
 
 Every address-bearing response in a filtering DNS mode is admitted to the
 attachment's exact IPv4/IPv6 HASH tier as one transaction before any A/AAAA
@@ -395,14 +416,25 @@ socket_group: netfence-admin
 `NETFENCE_SOCKET` and `NETFENCE_SOCKET_GROUP` are the equivalent environment
 variables. At startup the daemon binds the socket in a private staging
 directory, sets its group and mode `0660` while it is unreachable, and then
-publishes it atomically. The daemon removes any pre-existing Unix socket at the
-configured target—it does not distinguish a stale socket from one owned by
-another live daemon—so exactly one daemon must own a socket path. It refuses to
-remove a non-socket target. On Linux, no-replace rename prevents overwriting a
+publishes it atomically. Before opening storage or touching enforcement, the
+daemon takes a nonblocking lifetime lock at `/run/netfence.lock`. Only one daemon
+per host is supported, even with different socket or data paths. Container
+deployments must bind-mount the same host lock file; never remove that file while
+a daemon may be running. A live socket or a non-socket target also fails startup.
+Only a socket that refuses connections is removed. No-replace rename prevents overwriting a
 new path created after that removal; shutdown removes the published path only
 while it still identifies the daemon's own socket inode. An invalid group,
 ownership/mode failure, or non-socket target fails startup without publishing a
 permissive endpoint.
+
+`data_dir` defaults to `/var/lib/netfence`, created with mode `0700`. Back up its
+`netfence.db` together with the attachment configuration. An explicitly empty
+`data_dir` uses ephemeral storage and requires `filter.bpf_pin_dir: ''`. Startup
+preserves orphan pin directories and fails rather than removing enforcement when
+the database has no matching attachment. Restore the matching database first;
+otherwise inspect the pinned programs and targets and explicitly remove only
+state you have established is obsolete. Normal detach and persisted cleanup
+tombstones still remove their owned pins.
 
 ### Control-plane transport security (TLS / mTLS / bearer token)
 
@@ -537,6 +569,15 @@ generations enforce the same authoritative LPM policy during that bounded
 mixed state, so migration never unpins or recreates a viable filter. Unknown,
 incomplete, or unverifiable pin sets are preserved and abort startup for
 inspection instead of being guessed away.
+
+Schema 2 adds the pinned resolver guard. Committed schema-1 attachments are
+preserved and require a controlled upgrade: quiesce their workloads, detach them
+using the previous daemon, upgrade, then recreate attachments and apply policy
+before resuming workloads. The new daemon will not silently detach old programs
+or claim they provide resolver isolation. The listener IP, assigned port, and
+reserved port range are immutable for an attachment; changing them likewise
+requires controlled recreation. Compatible schema-2 restart verifies and reuses
+the guard without rewriting it.
 
 Notes on re-adopted state:
 - Every successfully restored attachment is marked for authoritative

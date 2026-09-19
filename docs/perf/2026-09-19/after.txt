@@ -1,0 +1,97 @@
+?   	github.com/danthegoodman1/netfence/cmd/netfenced	[no test files]
+PASS
+ok  	github.com/danthegoodman1/netfence/cmd/netfenced/cmd	0.004s
+PASS
+ok  	github.com/danthegoodman1/netfence/internal/config	0.003s
+goos: linux
+goarch: amd64
+pkg: github.com/danthegoodman1/netfence/internal/daemon
+cpu: Intel(R) Core(TM) Ultra 9 285
+BenchmarkDNSOwnershipPhysicalPressure-4   	     319	   3701249 ns/op	 4226248 B/op	    4336 allocs/op
+BenchmarkDNSOwnershipPhysicalPressure-4   	     316	   3747370 ns/op	 4226245 B/op	    4336 allocs/op
+BenchmarkDNSOwnershipPhysicalPressure-4   	     322	   3779186 ns/op	 4226246 B/op	    4336 allocs/op
+BenchmarkDNSOwnershipPhysicalPressure-4   	     321	   3724826 ns/op	 4226244 B/op	    4336 allocs/op
+BenchmarkDNSOwnershipPhysicalPressure-4   	     319	   3794519 ns/op	 4226250 B/op	    4336 allocs/op
+BenchmarkDNSProxyQueryWarm-4              	   63213	     17852 ns/op	    3585 B/op	      60 allocs/op
+BenchmarkDNSProxyQueryWarm-4              	   65122	     17664 ns/op	    3585 B/op	      60 allocs/op
+BenchmarkDNSProxyQueryWarm-4              	   64696	     17887 ns/op	    3585 B/op	      60 allocs/op
+BenchmarkDNSProxyQueryWarm-4              	   64447	     17928 ns/op	    3585 B/op	      60 allocs/op
+BenchmarkDNSProxyQueryWarm-4              	   63872	     17993 ns/op	    3585 B/op	      60 allocs/op
+BenchmarkDNSAllowlistQueryWarm-4          	   35847	     31463 ns/op	    7055 B/op	     114 allocs/op
+BenchmarkDNSAllowlistQueryWarm-4          	   36594	     32151 ns/op	    7054 B/op	     114 allocs/op
+BenchmarkDNSAllowlistQueryWarm-4          	   36013	     31734 ns/op	    7054 B/op	     114 allocs/op
+BenchmarkDNSAllowlistQueryWarm-4          	   35242	     31873 ns/op	    7054 B/op	     114 allocs/op
+BenchmarkDNSAllowlistQueryWarm-4          	   35521	     31726 ns/op	    7054 B/op	     114 allocs/op
+BenchmarkDNSKernelQuery/entries_0/cold_false-4         	   35281	     31943 ns/op	         0 fixture-reset-ns/op	     31233 p50-ns/query	     38912 p95-ns/query	     60033 p99-ns/query	     31306 queries/s	    7032 B/op	     113 allocs/op
+BenchmarkDNSKernelQuery/entries_0/cold_false-4         	   35589	     32240 ns/op	         0 fixture-reset-ns/op	     31430 p50-ns/query	     39298 p95-ns/query	     63421 p99-ns/query	     31018 queries/s	    7032 B/op	     113 allocs/op
+BenchmarkDNSKernelQuery/entries_0/cold_false-4         	   35716	     32123 ns/op	         0 fixture-reset-ns/op	     31219 p50-ns/query	     39395 p95-ns/query	     62340 p99-ns/query	     31130 queries/s	    7032 B/op	     113 allocs/op
+BenchmarkDNSKernelQuery/entries_0/cold_false-4         	   34892	     32194 ns/op	         0 fixture-reset-ns/op	     31280 p50-ns/query	     39526 p95-ns/query	     63965 p99-ns/query	     31062 queries/s	    7032 B/op	     113 allocs/op
+BenchmarkDNSKernelQuery/entries_0/cold_false-4         	   35580	     31976 ns/op	         0 fixture-reset-ns/op	     31169 p50-ns/query	     39055 p95-ns/query	     61261 p99-ns/query	     31273 queries/s	    7032 B/op	     113 allocs/op
+BenchmarkDNSKernelQuery/entries_0/cold_true-4          	   29932	     37190 ns/op	      1494 fixture-reset-ns/op	     35804 p50-ns/query	     45282 p95-ns/query	     69185 p99-ns/query	     26889 queries/s	    7472 B/op	     135 allocs/op
+BenchmarkDNSKernelQuery/entries_0/cold_true-4          	   29929	     37057 ns/op	      1495 fixture-reset-ns/op	     35622 p50-ns/query	     45321 p95-ns/query	     65991 p99-ns/query	     26986 queries/s	    7472 B/op	     135 allocs/op
+BenchmarkDNSKernelQuery/entries_0/cold_true-4          	   29422	     37129 ns/op	      1480 fixture-reset-ns/op	     35729 p50-ns/query	     45399 p95-ns/query	     66456 p99-ns/query	     26933 queries/s	    7472 B/op	     135 allocs/op
+BenchmarkDNSKernelQuery/entries_0/cold_true-4          	   30289	     36923 ns/op	      1475 fixture-reset-ns/op	     35450 p50-ns/query	     44769 p95-ns/query	     69634 p99-ns/query	     27083 queries/s	    7472 B/op	     135 allocs/op
+BenchmarkDNSKernelQuery/entries_0/cold_true-4          	   30607	     37118 ns/op	      1458 fixture-reset-ns/op	     35823 p50-ns/query	     44978 p95-ns/query	     65478 p99-ns/query	     26941 queries/s	    7472 B/op	     135 allocs/op
+BenchmarkDNSKernelQuery/entries_4095/cold_false-4      	   35191	     32359 ns/op	         0 fixture-reset-ns/op	     31381 p50-ns/query	     39492 p95-ns/query	     63846 p99-ns/query	     30903 queries/s	    7033 B/op	     113 allocs/op
+BenchmarkDNSKernelQuery/entries_4095/cold_false-4      	   35026	     32151 ns/op	         0 fixture-reset-ns/op	     31355 p50-ns/query	     38876 p95-ns/query	     56999 p99-ns/query	     31103 queries/s	    7029 B/op	     113 allocs/op
+BenchmarkDNSKernelQuery/entries_4095/cold_false-4      	   35028	     32494 ns/op	         0 fixture-reset-ns/op	     31480 p50-ns/query	     39614 p95-ns/query	     62450 p99-ns/query	     30775 queries/s	    7029 B/op	     113 allocs/op
+BenchmarkDNSKernelQuery/entries_4095/cold_false-4      	   35139	     32208 ns/op	         0 fixture-reset-ns/op	     31369 p50-ns/query	     39400 p95-ns/query	     57834 p99-ns/query	     31048 queries/s	    7029 B/op	     113 allocs/op
+BenchmarkDNSKernelQuery/entries_4095/cold_false-4      	   35250	     32304 ns/op	         0 fixture-reset-ns/op	     31482 p50-ns/query	     38996 p95-ns/query	     58728 p99-ns/query	     30956 queries/s	    7030 B/op	     113 allocs/op
+BenchmarkDNSKernelQuery/entries_4095/cold_true-4       	   29522	     38038 ns/op	      1522 fixture-reset-ns/op	     36412 p50-ns/query	     46290 p95-ns/query	     73182 p99-ns/query	     26290 queries/s	    7474 B/op	     135 allocs/op
+BenchmarkDNSKernelQuery/entries_4095/cold_true-4       	   30009	     37231 ns/op	      1479 fixture-reset-ns/op	     35777 p50-ns/query	     44992 p95-ns/query	     64918 p99-ns/query	     26860 queries/s	    7470 B/op	     135 allocs/op
+BenchmarkDNSKernelQuery/entries_4095/cold_true-4       	   29875	     37769 ns/op	      1529 fixture-reset-ns/op	     36446 p50-ns/query	     45916 p95-ns/query	     65656 p99-ns/query	     26477 queries/s	    7470 B/op	     135 allocs/op
+BenchmarkDNSKernelQuery/entries_4095/cold_true-4       	   29620	     37702 ns/op	      1519 fixture-reset-ns/op	     36210 p50-ns/query	     45658 p95-ns/query	     66720 p99-ns/query	     26524 queries/s	    7470 B/op	     135 allocs/op
+BenchmarkDNSKernelQuery/entries_4095/cold_true-4       	   29779	     37638 ns/op	      1507 fixture-reset-ns/op	     36309 p50-ns/query	     45352 p95-ns/query	     63271 p99-ns/query	     26569 queries/s	    7470 B/op	     135 allocs/op
+PASS
+ok  	github.com/danthegoodman1/netfence/internal/daemon	60.702s
+PASS
+ok  	github.com/danthegoodman1/netfence/internal/store	0.002s
+goos: linux
+goarch: amd64
+pkg: github.com/danthegoodman1/netfence/pkg/filter
+cpu: Intel(R) Core(TM) Ultra 9 285
+BenchmarkDNSExactKernel/batch_1/entries_0-4         	  761208	      1582 ns/op	      1459 p50-ns/pair	      2194 p95-ns/pair	      3684 p99-ns/pair	   1264078 transactions/s	     200 B/op	      17 allocs/op
+BenchmarkDNSExactKernel/batch_1/entries_0-4         	  672288	      1562 ns/op	      1458 p50-ns/pair	      1811 p95-ns/pair	      3649 p99-ns/pair	   1280297 transactions/s	     200 B/op	      17 allocs/op
+BenchmarkDNSExactKernel/batch_1/entries_0-4         	  669638	      1572 ns/op	      1452 p50-ns/pair	      2330 p95-ns/pair	      3696 p99-ns/pair	   1272040 transactions/s	     200 B/op	      17 allocs/op
+BenchmarkDNSExactKernel/batch_1/entries_0-4         	  765766	      1570 ns/op	      1467 p50-ns/pair	      1798 p95-ns/pair	      3681 p99-ns/pair	   1273624 transactions/s	     200 B/op	      17 allocs/op
+BenchmarkDNSExactKernel/batch_1/entries_0-4         	  776935	      1571 ns/op	      1458 p50-ns/pair	      2015 p95-ns/pair	      3684 p99-ns/pair	   1273359 transactions/s	     200 B/op	      17 allocs/op
+BenchmarkDNSExactKernel/batch_1/entries_1024-4      	  741349	      1580 ns/op	      1459 p50-ns/pair	      2238 p95-ns/pair	      3700 p99-ns/pair	   1265494 transactions/s	     200 B/op	      17 allocs/op
+BenchmarkDNSExactKernel/batch_1/entries_1024-4      	  668654	      1569 ns/op	      1460 p50-ns/pair	      2191 p95-ns/pair	      3676 p99-ns/pair	   1274808 transactions/s	     200 B/op	      17 allocs/op
+BenchmarkDNSExactKernel/batch_1/entries_1024-4      	  773822	      1588 ns/op	      1462 p50-ns/pair	      2187 p95-ns/pair	      3653 p99-ns/pair	   1259572 transactions/s	     200 B/op	      17 allocs/op
+BenchmarkDNSExactKernel/batch_1/entries_1024-4      	  709408	      1571 ns/op	      1466 p50-ns/pair	      1752 p95-ns/pair	      3686 p99-ns/pair	   1272959 transactions/s	     200 B/op	      17 allocs/op
+BenchmarkDNSExactKernel/batch_1/entries_1024-4      	  780688	      1564 ns/op	      1457 p50-ns/pair	      1805 p95-ns/pair	      3657 p99-ns/pair	   1279032 transactions/s	     200 B/op	      17 allocs/op
+BenchmarkDNSExactKernel/batch_1/entries_4095-4      	  755383	      1559 ns/op	      1457 p50-ns/pair	      1780 p95-ns/pair	      3667 p99-ns/pair	   1283207 transactions/s	     200 B/op	      17 allocs/op
+BenchmarkDNSExactKernel/batch_1/entries_4095-4      	  793141	      1575 ns/op	      1460 p50-ns/pair	      2109 p95-ns/pair	      3678 p99-ns/pair	   1269580 transactions/s	     200 B/op	      17 allocs/op
+BenchmarkDNSExactKernel/batch_1/entries_4095-4      	  776194	      1562 ns/op	      1461 p50-ns/pair	      1723 p95-ns/pair	      3677 p99-ns/pair	   1280262 transactions/s	     200 B/op	      17 allocs/op
+BenchmarkDNSExactKernel/batch_1/entries_4095-4      	  779112	      1575 ns/op	      1466 p50-ns/pair	      1890 p95-ns/pair	      3660 p99-ns/pair	   1269850 transactions/s	     200 B/op	      17 allocs/op
+BenchmarkDNSExactKernel/batch_1/entries_4095-4      	  767106	      1572 ns/op	      1456 p50-ns/pair	      2022 p95-ns/pair	      3689 p99-ns/pair	   1272347 transactions/s	     200 B/op	      17 allocs/op
+BenchmarkDNSExactKernel/batch_16/entries_0-4        	   52290	     23743 ns/op	     21540 p50-ns/pair	     45294 p95-ns/pair	     54355 p99-ns/pair	     84236 transactions/s	    3952 B/op	     194 allocs/op
+BenchmarkDNSExactKernel/batch_16/entries_0-4        	   53142	     23458 ns/op	     21470 p50-ns/pair	     39517 p95-ns/pair	     53992 p99-ns/pair	     85259 transactions/s	    3952 B/op	     194 allocs/op
+BenchmarkDNSExactKernel/batch_16/entries_0-4        	   49038	     23259 ns/op	     21468 p50-ns/pair	     32269 p95-ns/pair	     53703 p99-ns/pair	     85990 transactions/s	    3952 B/op	     194 allocs/op
+BenchmarkDNSExactKernel/batch_16/entries_0-4        	   51021	     22929 ns/op	     21485 p50-ns/pair	     28312 p95-ns/pair	     53596 p99-ns/pair	     87228 transactions/s	    3952 B/op	     194 allocs/op
+BenchmarkDNSExactKernel/batch_16/entries_0-4        	   51730	     23202 ns/op	     21543 p50-ns/pair	     33941 p95-ns/pair	     53255 p99-ns/pair	     86199 transactions/s	    3952 B/op	     194 allocs/op
+BenchmarkDNSExactKernel/batch_16/entries_1024-4     	   51091	     23427 ns/op	     21607 p50-ns/pair	     35677 p95-ns/pair	     54157 p99-ns/pair	     85371 transactions/s	    3952 B/op	     194 allocs/op
+BenchmarkDNSExactKernel/batch_16/entries_1024-4     	   51043	     23733 ns/op	     21851 p50-ns/pair	     37032 p95-ns/pair	     54787 p99-ns/pair	     84270 transactions/s	    3952 B/op	     194 allocs/op
+BenchmarkDNSExactKernel/batch_16/entries_1024-4     	   50923	     23476 ns/op	     21555 p50-ns/pair	     40138 p95-ns/pair	     54078 p99-ns/pair	     85194 transactions/s	    3952 B/op	     194 allocs/op
+BenchmarkDNSExactKernel/batch_16/entries_1024-4     	   50526	     23596 ns/op	     21656 p50-ns/pair	     39335 p95-ns/pair	     54061 p99-ns/pair	     84761 transactions/s	    3952 B/op	     194 allocs/op
+BenchmarkDNSExactKernel/batch_16/entries_1024-4     	   49480	     23768 ns/op	     21640 p50-ns/pair	     46446 p95-ns/pair	     54599 p99-ns/pair	     84148 transactions/s	    3952 B/op	     194 allocs/op
+BenchmarkDNSExactKernel/batch_16/entries_4080-4     	   49761	     23178 ns/op	     21742 p50-ns/pair	     29201 p95-ns/pair	     53854 p99-ns/pair	     86288 transactions/s	    3952 B/op	     194 allocs/op
+BenchmarkDNSExactKernel/batch_16/entries_4080-4     	   51990	     23475 ns/op	     21763 p50-ns/pair	     35918 p95-ns/pair	     54651 p99-ns/pair	     85198 transactions/s	    3952 B/op	     194 allocs/op
+BenchmarkDNSExactKernel/batch_16/entries_4080-4     	   50336	     23736 ns/op	     21852 p50-ns/pair	     36284 p95-ns/pair	     54854 p99-ns/pair	     84262 transactions/s	    3952 B/op	     194 allocs/op
+BenchmarkDNSExactKernel/batch_16/entries_4080-4     	   51610	     23566 ns/op	     21814 p50-ns/pair	     36612 p95-ns/pair	     54550 p99-ns/pair	     84867 transactions/s	    3952 B/op	     194 allocs/op
+BenchmarkDNSExactKernel/batch_16/entries_4080-4     	   52561	     23656 ns/op	     21618 p50-ns/pair	     42354 p95-ns/pair	     54576 p99-ns/pair	     84545 transactions/s	    3952 B/op	     194 allocs/op
+BenchmarkTCResolverPacket/own_dns-4                 	68712850	        17.00 ns/op	       0 B/op	       0 allocs/op
+BenchmarkTCResolverPacket/own_dns-4                 	69886394	        17.00 ns/op	       0 B/op	       0 allocs/op
+BenchmarkTCResolverPacket/own_dns-4                 	65272188	        16.00 ns/op	       0 B/op	       0 allocs/op
+BenchmarkTCResolverPacket/own_dns-4                 	66662952	        17.00 ns/op	       0 B/op	       0 allocs/op
+BenchmarkTCResolverPacket/own_dns-4                 	63093018	        17.00 ns/op	       0 B/op	       0 allocs/op
+BenchmarkTCResolverPacket/ordinary_allow-4          	100000000	        10.00 ns/op	       0 B/op	       0 allocs/op
+BenchmarkTCResolverPacket/ordinary_allow-4          	100000000	        10.00 ns/op	       0 B/op	       0 allocs/op
+BenchmarkTCResolverPacket/ordinary_allow-4          	100000000	        10.00 ns/op	       0 B/op	       0 allocs/op
+BenchmarkTCResolverPacket/ordinary_allow-4          	100000000	        10.00 ns/op	       0 B/op	       0 allocs/op
+BenchmarkTCResolverPacket/ordinary_allow-4          	100000000	        10.00 ns/op	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/danthegoodman1/netfence/pkg/filter	51.169s
+PASS
+ok  	github.com/danthegoodman1/netfence/tests/integration	0.004s
+?   	github.com/danthegoodman1/netfence/v1	[no test files]

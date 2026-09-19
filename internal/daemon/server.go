@@ -77,6 +77,7 @@ type Server struct {
 	// dnsChurnCeiling bounds the rolling per-attachment exact admission/LRU
 	// budget. Its window is immutable for this daemon generation.
 	dnsChurnCeiling dnsChurnLimits
+	dnsResources    *dnsResources
 
 	// pinRoot is the bpffs directory attachment BPF state is pinned under
 	// (config filter.bpf_pin_dir; "" disables pinning). detachOnStop selects
@@ -522,6 +523,7 @@ func NewServer(cfg *config.Config, st *store.Store, logger zerolog.Logger, versi
 		maxDNSRuleEntries:    maxDNSRuleEntries,
 		dnsAdmissionCeilings: dnsAdmissionCeilings,
 		dnsChurnCeiling:      dnsChurnCeiling,
+		dnsResources:         newGlobalDNSResources(cfg.DNS),
 		pinRoot:              pinRoot,
 		detachOnStop:         cfg.Filter.DetachOnStop,
 		newFilter: func(pinDir, target string, attachType apiv1.AttachmentType, mode apiv1.PolicyMode, direction apiv1.TcDirection, maxRules uint32) (filter.Filter, error) {
@@ -700,10 +702,6 @@ func (s *Server) Start() error {
 			pinDir = validatedPinDir
 		}
 		attachType := parseAttachmentType(state.info.Type)
-		mode := parsePolicyMode(state.info.Mode)
-		if state.info.PolicyDegradedReason != "" {
-			mode = apiv1.PolicyMode_POLICY_MODE_BLOCK_ALL
-		}
 		direction := parseTcDirection(state.info.Direction)
 		expectedIdentity, err := s.targetIdentity(attachType, state.info.Target)
 		if err != nil {
@@ -721,7 +719,7 @@ func (s *Server) Start() error {
 			continue
 		}
 
-		ebpfFilter, adopted, err := s.restoreFilter(id, pinDir, state.info.Target, attachType, mode, direction)
+		ebpfFilter, adopted, err := s.restoreFilter(id, pinDir, state.info.Target, attachType, direction)
 		if err != nil {
 			var abort *restoreAbortError
 			if errors.As(err, &abort) {
@@ -790,6 +788,11 @@ func (s *Server) Start() error {
 			}
 		}
 		canonicalDNSAddress, bootstrapCIDR, setupErr := canonicalDNSListenerAddress(resource.originalDNSAddress, s.resolveDNSListenIP)
+		if setupErr == nil {
+			if err := s.configureResolverEndpoint(ebpfFilter, canonicalDNSAddress); err != nil {
+				return abortStart(fmt.Errorf("configuring restored resolver isolation for %s: %w", id, err))
+			}
+		}
 		var proxyFunc DnsProxyFunc
 		if cpClient := s.cpClient.Load(); cpClient != nil {
 			proxyFunc = cpClient.MakeProxyFunc(id)
@@ -879,6 +882,14 @@ func (s *Server) Start() error {
 		if err := dnsServerSetupError(resource.dns); err != nil {
 			return abortStart(fmt.Errorf("DNS listener exited before restore commit for attachment %s: %w", resource.id, err))
 		}
+		if !resource.adopted {
+			// A recreated filter starts BLOCK_ALL until its resolver guard and
+			// bootstrap are ready, exactly like a fresh attachment. A crash before
+			// this point must not pin an active mode with an unconfigured guard.
+			if err := setAndProveFilterMode(resource.filter, apiModeToFilterMode(parsePolicyMode(state.info.Mode))); err != nil {
+				return abortStart(fmt.Errorf("activating recreated attachment %s: %w", resource.id, err))
+			}
+		}
 		state.info.DnsAddress = resource.canonicalDNSAddress
 		state.watch = resource.watch
 		state.filter = resource.filter
@@ -933,11 +944,8 @@ func (s *Server) Start() error {
 		}
 	}
 
-	// Reconcile orphaned pin dirs: bpffs state with no surviving store row
-	// (e.g. a crash between pinning and the store save, or a row dropped just
-	// above) is removable only after the schema inspector proves a complete,
-	// current, coherent set. Uncommitted/future/incompatible state is preserved
-	// and aborts startup rather than being guessed away.
+	// A schema describes structure, not ownership. Missing store rows can mean
+	// a lost/wrong database; never unpin possibly live enforcement on that basis.
 	if s.pinRoot != "" {
 		entries, err := s.readPinRoot(s.pinRoot)
 		if err != nil {
@@ -958,17 +966,7 @@ func (s *Server) Start() error {
 			if owned {
 				continue
 			}
-			schemaState, err := s.inspectPinSchema(orphan)
-			if err != nil {
-				return abortStart(fmt.Errorf("classifying orphaned BPF pin dir %s before cleanup: %w", orphan, err))
-			}
-			if schemaState != filter.PinnedSchemaCurrent {
-				return abortStart(fmt.Errorf("orphaned BPF pin dir %s has an uncommitted schema marker; preserving possible live enforcement for retry/inspection", orphan))
-			}
-			if err := s.removePinDir(orphan); err != nil {
-				return abortStart(fmt.Errorf("removing orphaned BPF pin dir %s: %w", orphan, err))
-			}
-			s.logger.Info().Str("pin_dir", orphan).Msg("removed orphaned BPF pin dir (no matching attachment)")
+			return abortStart(fmt.Errorf("orphaned BPF pin dir %s has no matching attachment; preserving possible live enforcement: restore the matching database or inspect and explicitly remove obsolete pins", orphan))
 		}
 	}
 	s.mu.Unlock()
@@ -1109,7 +1107,7 @@ func (s *Server) provePinnedStateSafeForStaleCleanup(pinDir string) error {
 // after a detach_on_stop run or on data from a pre-pinning daemon — and the
 // caller's log line records which path was taken. adopted reports whether
 // the pinned path was used.
-func (s *Server) restoreFilter(id, pinDir, target string, attachType apiv1.AttachmentType, mode apiv1.PolicyMode, direction apiv1.TcDirection) (_ filter.Filter, adopted bool, _ error) {
+func (s *Server) restoreFilter(id, pinDir, target string, attachType apiv1.AttachmentType, direction apiv1.TcDirection) (_ filter.Filter, adopted bool, _ error) {
 	if pinDir != "" {
 		_, statErr := os.Stat(pinDir)
 		if statErr != nil && !os.IsNotExist(statErr) {
@@ -1184,7 +1182,7 @@ func (s *Server) restoreFilter(id, pinDir, target string, attachType apiv1.Attac
 		}
 	}
 
-	f, err := s.newFilter(pinDir, target, attachType, mode, direction, s.maxRuleEntries)
+	f, err := s.newFilter(pinDir, target, attachType, apiv1.PolicyMode_POLICY_MODE_BLOCK_ALL, direction, s.maxRuleEntries)
 	if err != nil {
 		if f != nil {
 			if cleanupErr := f.Detach(); cleanupErr != nil {
@@ -1854,6 +1852,9 @@ func (s *Server) Attach(ctx context.Context, req *apiv1.AttachRequest) (resp *ap
 	ebpfFilter, err = s.newFilter(s.pinDirFor(id), target, attachType, apiv1.PolicyMode_POLICY_MODE_BLOCK_ALL, direction, s.maxRuleEntries)
 	if err != nil {
 		return nil, fmt.Errorf("creating eBPF filter: %w", err)
+	}
+	if err := s.configureResolverEndpoint(ebpfFilter, dnsAddr); err != nil {
+		return nil, fmt.Errorf("configuring resolver isolation: %w", err)
 	}
 	if err := s.validateTargetIdentity(attachType, target, expectedIdentity); err != nil {
 		return nil, err
@@ -3064,6 +3065,9 @@ func (s *Server) commitAuthoritativePolicyAdmitted(id string, state *attachmentS
 // entry permanent, and a permanent entry is never demoted by a later TTL'd
 // re-add. Use RemoveAllowedCIDR to drop an entry early.
 func (s *Server) AllowCIDR(id string, cidr *net.IPNet, ttl time.Duration) error {
+	if _, err := filter.CIDRPrefix(cidr); err != nil {
+		return err
+	}
 	state, ebpfFilter, reg, done, err := s.filterAndRegistry(id)
 	if err != nil {
 		return err
@@ -3078,6 +3082,9 @@ func (s *Server) AllowCIDR(id string, cidr *net.IPNet, ttl time.Duration) error 
 // DenyCIDR adds the CIDR to the attachment's denylist. TTL semantics match
 // AllowCIDR.
 func (s *Server) DenyCIDR(id string, cidr *net.IPNet, ttl time.Duration) error {
+	if _, err := filter.CIDRPrefix(cidr); err != nil {
+		return err
+	}
 	state, ebpfFilter, reg, done, err := s.filterAndRegistry(id)
 	if err != nil {
 		return err
@@ -3101,6 +3108,9 @@ func (s *Server) DenyCIDR(id string, cidr *net.IPNet, ttl time.Duration) error {
 }
 
 func (s *Server) RemoveAllowedCIDR(id string, cidr *net.IPNet) error {
+	if _, err := filter.CIDRPrefix(cidr); err != nil {
+		return err
+	}
 	state, ebpfFilter, reg, done, err := s.filterAndRegistry(id)
 	if err != nil {
 		return err
@@ -3124,6 +3134,9 @@ func (s *Server) RemoveAllowedCIDR(id string, cidr *net.IPNet) error {
 }
 
 func (s *Server) RemoveDeniedCIDR(id string, cidr *net.IPNet) error {
+	if _, err := filter.CIDRPrefix(cidr); err != nil {
+		return err
+	}
 	state, ebpfFilter, reg, done, err := s.filterAndRegistry(id)
 	if err != nil {
 		return err

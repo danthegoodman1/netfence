@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/rs/zerolog"
 	"github.com/spf13/cobra"
@@ -52,6 +53,18 @@ func runStart(cmd *cobra.Command, args []string) error {
 	}
 
 	logger := setupLogger(cfg.LogLevel)
+	// Ownership must precede storage migration, pinned-state adoption and
+	// socket publication, regardless of which paths this instance configures.
+	lock, err := acquireDaemonLock("/run/netfence.lock")
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	if cfg.DataDir != "" {
+		if err := os.MkdirAll(cfg.DataDir, 0700); err != nil {
+			return fmt.Errorf("creating data directory: %w", err)
+		}
+	}
 
 	logger.Info().
 		Str("version", Version).
@@ -265,6 +278,16 @@ func removeStaleSocket(path string) error {
 	}
 	if info.Mode()&os.ModeSocket == 0 {
 		return fmt.Errorf("refusing to remove non-socket path %q", path)
+	}
+	// Also protect a live endpoint from older daemons that did not take the
+	// host lock. Only ECONNREFUSED proves the socket has no listener.
+	conn, dialErr := net.DialTimeout("unix", path, time.Second)
+	if dialErr == nil {
+		conn.Close()
+		return fmt.Errorf("daemon socket %q is already listening", path)
+	}
+	if !errors.Is(dialErr, syscall.ECONNREFUSED) {
+		return fmt.Errorf("cannot prove socket %q is stale: %w", path, dialErr)
 	}
 	return os.Remove(path)
 }
