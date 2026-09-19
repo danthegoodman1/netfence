@@ -41,7 +41,7 @@ const (
 const currentPinSchemaVersion uint32 = 2
 
 // InspectPinnedSchema classifies a pin directory without loading links or
-// mutating anything. It is used before orphan cleanup so a crash-partial
+// mutating anything. It is used before owned stale-target cleanup so a crash-partial
 // marker-absent/zero pin set is never blindly removed. Future/unknown or
 // inconsistent committed schemas return a non-discardable error.
 func InspectPinnedSchema(pinDir string) (_ PinnedSchemaState, retErr error) {

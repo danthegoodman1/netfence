@@ -133,8 +133,8 @@ int filter_egress(struct __sk_buff *skb)
     }
 
 unidentified:
-    // Unidentified traffic is closed only in allowlist; denylist blocks only
-    // identified IP destinations present in its deny maps.
+    // Allowlist rejects unidentified traffic. An active resolver guard also
+    // rejects ambiguous IP/VLAN packets in other modes to prevent port bypass.
     if (*mode == 1 || (g && g->family &&
         (proto == ETH_P_IP || proto == ETH_P_IPV6 ||
          proto == ETH_P_8021Q || proto == ETH_P_8021AD))) {
